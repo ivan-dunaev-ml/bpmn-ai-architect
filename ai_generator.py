@@ -219,6 +219,38 @@ def _structure_issues(diagram: BPMNDiagramBuilder) -> List[str]:
     return issues
 
 
+def _insert_missing_gateways(diagram: BPMNDiagramBuilder) -> List[str]:
+    """Задача с несколькими выходами → вставляем шлюз между задачей и ветками.
+
+    Частая ошибка LLM на сложных регламентах: «Анализировать телеметрию» сразу ведёт в две
+    задачи с подписями условий. Это не повод отбрасывать весь ответ и падать в эмулятор:
+    подписанные ветки → exclusive-шлюз (вопрос — по подписи первой ветки), без подписей →
+    parallel-шлюз. Смысл модели сохраняется, схема становится корректной.
+    """
+    actions: List[str] = []
+    subprocess_ids = {n.id for n in diagram.nodes.values() if n.kind == "subProcess"}
+    for node in list(diagram.nodes.values()):
+        if node.kind not in WORK_KINDS | {"subProcess"}:
+            continue
+        outs = [l for l in diagram.links if l.source_id == node.id]
+        if len({l.target_id for l in outs}) < 2:
+            continue
+        labels = [l.condition_name.strip() for l in outs if l.condition_name.strip()]
+        parent = node.owner_id if node.owner_id in subprocess_ids else (node.lane_id or node.owner_id)
+        if labels:
+            question = labels[0].rstrip("?.! ") + "?"
+            gw = diagram.add_exclusive_gateway(question[:70], parent)
+            kind = "шлюз-развилка"
+        else:
+            gw = diagram.add_parallel_gateway("Параллельно", parent)
+            kind = "параллельный шлюз"
+        for link in outs:
+            link.source_id = gw
+        diagram.add_link(node.id, gw)
+        actions.append(f"После «{node.name}» добавлен {kind}: у задачи было {len(outs)} выхода без шлюза")
+    return actions
+
+
 def _quality_report(
     structure_issues: List[str],
     audit: Dict[str, Any],
@@ -377,6 +409,7 @@ def execute_generated_code(
             return "", {}, _UNRECOGNIZED_PROCESS
 
         sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
+        diagram.healed.extend(_insert_missing_gateways(diagram))
         diagram.heal_graph()
         _complete_return_edges(diagram, regulation_text)
         structure_issues = _structure_issues(diagram)
@@ -1307,6 +1340,11 @@ def _match_inverted_role(text: str) -> Optional[Tuple[str, str, str]]:
         return None
     head = action.split()[0].lower().strip("«»\"'")
     if any(rx.search(head) for rx, _ in _ROLE_RE):
+        return None
+    # Прямой порядок «Ремонтная бригада готовит СИЗ…»: роль из нескольких слов стоит до глагола —
+    # это не инверсия, иначе объект после глагола («СИЗ») становится ролью.
+    lead = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", action.lower())
+    if any(rx.match(lead) for rx, _ in _ROLE_RE):
         return None
     role: Optional[str] = None
     for regex, name in _ROLE_RE:
