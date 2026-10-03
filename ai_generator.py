@@ -2821,6 +2821,15 @@ def _fh(hours: float) -> str:
     return f"{hours:.0f} ч (≈ {hours / 8:.0f} раб. дн.)"
 
 
+def _fh_exact(hours: float) -> str:
+    """Часы без округления до десятых: 12.55 остаётся 12.55 (на карточке то же число округлено)."""
+    if hours < 1:
+        return f"{hours * 60:.0f} мин"
+    if hours < 48:
+        return f"{hours:.2f}".rstrip("0").rstrip(".") + " ч"
+    return _fh(hours)
+
+
 def process_facts(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[dict] = None) -> Dict[str, Any]:
     """Единый набор цифр для копайлота и сайдбара: КП, срок с возвратами, циклы, bus-factor, To-Be."""
     data = audit or {}
@@ -3388,27 +3397,34 @@ def _analysis_sla(ctx: Dict[str, Any]) -> str:
     sla, target = ctx["sla"], ctx.get("sla_target_hours")
     if not sla:
         return "Данных аудита пока нет: сгенерируйте диаграмму."
+    # Числа только с карточки: голый путь, путь с возвратами, циклы. Новых часов не считаем.
+    facts = ctx.get("facts") or {}
     base, total = float(sla["critical_path_hours"]), float(sla["with_rework_hours"])
-    out = [f"**Критический путь — {_fh(base)}**" + (f" при цели {_fh(float(target))}" if target else "") + "."]
+    loops_n = int(facts.get("loops_before") if facts.get("loops_before") is not None else len(ctx["rework_loops"]))
+    card_total = float(facts.get("rw_before") if facts.get("rw_before") is not None else total)
+    shown_total = _fh_exact(total) + (f" (на карточке {_fh(card_total)})" if _fh(card_total) != _fh_exact(total) else "")
+    out = [
+        f"**Голый критический путь — {_fh_exact(base)}**" + (f" при цели {_fh(float(target))}" if target else "")
+        + f"; путь с возвратами — {shown_total}; циклов возврата: {loops_n}."
+    ]
     if sla.get("breach"):
         if target and base > float(target):
-            out.append(f"🔴 Срыв SLA заложен в самом процессе: даже без возвратов путь длиннее цели на {_fh(base - float(target))}.")
+            out.append("🔴 Срыв SLA заложен в самом процессе: даже без возвратов путь длиннее цели.")
         else:
-            out.append(f"🔴 Без возвратов процесс укладывается в срок, но **с худшим циклом возврата** — {_fh(total)}: срыв из-за доработок.")
+            out.append("🔴 Без возвратов процесс укладывается в срок, но с худшим циклом возврата путь выходит за цель: срыв из-за доработок.")
     elif float(sla.get("rework_share", 0)) > 0.25:
-        out.append(f"🟠 В срок укладываемся, но худший возврат добавляет {float(sla['rework_share']):.0%} ({_fh(total)} с возвратом) — запас съедается.")
+        out.append(f"🟠 В срок укладываемся, но худший возврат добавляет {float(sla['rework_share']):.0%} к пути — запас съедается.")
     else:
         out.append("🟢 Процесс укладывается в срок, риски умеренные.")
     heavy = sorted(ctx["critical_path"], key=lambda c: -float(c["hours"]))[:3]
     if heavy and base > 0:
         out.append("Что занимает больше всего времени на критическом пути:")
-        out += [f"- «{c['name']}» ({c['role']}) — {_fh(float(c['hours']))}, {float(c['hours']) / base:.0%} пути" for c in heavy]
+        out += [f"- «{c['name']}» ({c['role']}) — {_fh(float(c['hours']))}" for c in heavy]
     loops = sorted(ctx["rework_loops"], key=lambda l: -float(l["cycle_hours"]))
     if loops:
         l0 = loops[0]
-        out.append(f"Самый дорогой возврат — «{l0['label']}» ({l0['from']} → {l0['to']}): {_fh(float(l0['cycle_hours']))}.")
-    out.append("Что делать: сократить самые долгие шаги пути, вынести независимые шаги в параллель, ужесточить входной контроль, "
-               "чтобы реже возвращать на доработку.")
+        out.append(f"Самый дорогой возврат — «{l0['label']}» ({l0['from']} → {l0['to']}).")
+    out.append("Что делать: сократить самые долгие шаги пути и ужесточить входной контроль, чтобы реже возвращать на доработку.")
     return "\n".join(out)
 
 
@@ -3487,6 +3503,11 @@ def _analysis_speedup(ctx: Dict[str, Any]) -> str:
     steps = ctx["steps"]
     for a, b in zip(steps, steps[1:]):
         if a["role"] != b["role"] and not a["decision"] and not b["parallel"] and not b["decision"]:
+            # Стоп-лист ОТ: допуск, наряд, инструктаж, напряжение, заземления, отключение и ремонт в параллель не предлагаем.
+            step_a = Step(idx=0, num=a["num"], role=a["role"], title=a["title"])
+            step_b = Step(idx=1, num=b["num"], role=b["role"], title=b["title"])
+            if _forbid_parallel(step_a, step_b) or _ot_sensitive(step_a) or _ot_sensitive(step_b):
+                continue
             pairs.append((a, b))
     if pairs:
         a, b = max(pairs, key=lambda p: (p[1]["hours"] or 0))

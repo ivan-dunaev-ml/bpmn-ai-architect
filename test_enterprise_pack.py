@@ -1180,6 +1180,35 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     q_real = heuristic_analysis("Почему упал Quality Score?", build_process_context(text1, xml1, audit1, tobe_delta=delta1))
     assert f"{delta1['quality_before']} → {delta1['quality_after']}" in q_real and loops_card in q_real
 
+    # SLA, срок, срыв: числа только с карточки, без советов про параллель; охрана труда в параллель не предлагается.
+    for sla_q in ("почему срывается SLA", "какой срок процесса", "из-за чего срыв срока"):
+        sla_reply, sla_t, sla_x, sla_a = assistant_chat(sla_q, [], xml1, audit1, text1, use_llm=False)
+        assert sla_t is None and sla_x is None and sla_a is None, sla_q
+        assert "9.7" in sla_reply and "12.55" in sla_reply, sla_reply
+        assert f"циклов возврата: {facts1['loops_before']}" in sla_reply
+        assert "параллел" not in sla_reply.lower() and "Сделай шаги" not in sla_reply
+        assert "вынести независимые" not in sla_reply
+        assert not re.search(r"(?:ремонт|допуск|инструктаж|заземлен|напряжен)\w*[^.\n]{0,60}параллел", sla_reply, re.I)
+    ot_text = (
+        "Регламент: Допуск и ремонт\n"
+        "1. Диспетчер: Принять заявку (10 минут).\n"
+        "2. Начальник смены: Выдать допуск к работам (30 минут).\n"
+        "3. Ремонтная бригада: Выполнить ремонт оборудования (4 ч).\n"
+        "4. Диспетчер: Закрыть наряд (10 минут).\n"
+    )
+    ot_xml, ot_audit, ot_err = generate_bpmn_from_text(ot_text, use_llm=False)
+    assert not ot_err, ot_err
+    ot_ctx = build_process_context(ot_text, ot_xml, ot_audit)
+    for ot_q in ("почему срывается SLA", "срок процесса", "из-за чего срыв"):
+        ot_reply, ot_t, ot_x, _ = assistant_chat(ot_q, [], ot_xml, ot_audit, ot_text, use_llm=False)
+        assert ot_t is None and ot_x is None
+        assert "параллел" not in ot_reply.lower(), ot_reply
+    from ai_generator import _analysis_speedup
+
+    ot_speedup = _analysis_speedup(ot_ctx)
+    assert not re.search(r"шаги 2 и 3|шагов 2 и 3|шаги 1 и 2 паралл", ot_speedup), ot_speedup
+    assert "Сделай шаги 2 и 3" not in ot_speedup and "Сделай шаги 3 и 4" not in ot_speedup
+
     # «Кто перегружен» — разбор: роль и доля bus-factor с карточки, без рекомендаций и команд.
     text_proc = (Path(__file__).parent / "examples" / "example_2_equipment_procurement.txt").read_text(encoding="utf-8")
     xml_p, audit_p, _err_p = generate_bpmn_from_text(text_proc, use_llm=False)
