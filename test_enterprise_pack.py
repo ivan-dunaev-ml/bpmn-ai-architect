@@ -923,7 +923,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
         f"cloud={cloud_pack['memory']}/{cloud_pack['card']}/{cloud_paste}",
     )
 
-    from ai_generator import _reject_cloud_diagram, compare_asis_tobe
+    from ai_generator import _ctx_compare, _explicit_return_count, _reject_cloud_diagram, compare_asis_tobe
 
     # 1. Сравнение на примере 1: снятые возвраты и раскладка экономии сходятся с карточкой To-Be.
     cmp_text = (Path(__file__).resolve().parent / "examples" / "example_1_substation_repair.txt").read_text(
@@ -989,6 +989,83 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert sum(tenths(p["hours"]) for p in same_view["parts"]) == tenths(same_facts["rw_before"] - same_facts["rw_after"])
     only_same = compare_asis_tobe(same_before, same_before, {}, {}, same_facts)
     assert only_same["steps"] == [] and only_same["counts"] == {"added": 0, "removed": 0, "changed": 0}
+
+    # 2а. Переименованный шаг, переданный системе: одна пара, а не «исчез» + «появился».
+    ren_before = """Регламент: Передача системе
+1. Диспетчер: Принять заявку (2 ч).
+2. Бухгалтер: Фиксирует платежи контрагентов в журнале (3 ч).
+3. Мастер: Проводит проверку документов (2 ч).
+4. Мастер: Подписать акт (1 ч).
+"""
+    ren_after = """Регламент: Передача системе
+1. Диспетчер: Принять заявку (2 ч).
+2. Информационная система: Журнал платежей контрагентов ведётся автоматически (6 минут).
+3. Информационная система: Проверяет документы автоматически (6 минут).
+4. Менеджер: Журнал платежей контрагентов (1 ч).
+"""
+    ren_facts = dict(same_facts, rw_before=8.0, rw_after=3.0, cp_before=8.0, cp_after=3.0, rw_saved_pct=62)
+    ren_view = compare_asis_tobe(ren_before, ren_after, {}, {}, ren_facts)
+    ren_rows = {row["title"]: row for row in ren_view["steps"]}
+    pay = ren_rows["Журнал платежей контрагентов ведётся автоматически"]
+    assert pay["kind"] == "changed" and pay["label"] == "изменились роль и срок", pay
+    assert pay["role_before"] == "Бухгалтерия" and pay["role_after"] == "Информационная система"
+    assert ren_view["counts"]["changed"] >= 1
+    assert not any(r["kind"] == "removed" and "платежи" in r["title"].lower() for r in ren_view["steps"])
+    # Только общие глаголы и одно общее слово — не пара; роль To-Be не «Информационная система» — не пара.
+    assert ren_rows["Проверить документы автоматически"]["kind"] == "added"
+    assert ren_rows["Журнал платежей контрагентов"]["kind"] == "added"
+    assert any(r["kind"] == "removed" and r["title"].startswith("Провести проверку") for r in ren_view["steps"])
+    assert sum(1 for r in ren_view["steps"] if r["title"].startswith("Журнал платежей контрагентов ведётся")) == 1
+    auto_row = next(p for p in ren_view["parts"] if p["kind"] == "automation")
+    assert auto_row["hours"] > 0 and "Журнал платежей контрагентов ведётся" in auto_row["detail"]
+    assert sum(tenths(p["hours"]) for p in ren_view["parts"]) == tenths(ren_facts["rw_before"] - ren_facts["rw_after"])
+    # Один шаг входит только в одну пару: второй шаг To-Be с теми же корнями остаётся «появился».
+    dup_after = ren_after.replace("3. Информационная система: Проверяет документы автоматически (6 минут).",
+                                  "3. Информационная система: Платежи контрагентов в журнале (6 минут).")
+    dup_view = compare_asis_tobe(ren_before, dup_after, {}, {}, ren_facts)
+    dup_kinds = [r["kind"] for r in dup_view["steps"] if "латеж" in r["title"] and r["role_after"] == "Информационная система"]
+    assert sorted(dup_kinds) == ["added", "changed"], dup_view["steps"]
+    # Закупка: шаг сменил роль на «Информационная система» и сохранил предмет в названии — одна строка.
+    proc_ctx = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
+    proc_cmp = _ctx_compare(proc_ctx)
+    reg_rows = [r for r in proc_cmp["steps"] if "заявки участников" in r["title"]]
+    assert len(reg_rows) == 1 and reg_rows[0]["kind"] == "changed", proc_cmp["steps"]
+    assert reg_rows[0]["role_after"] == "Информационная система" and "роль" in reg_rows[0]["label"]
+    assert proc_cmp["counts"]["removed"] == 0 and proc_cmp["counts"]["added"] == 0
+    proc_auto = next(p for p in proc_cmp["parts"] if p["kind"] == "automation")
+    assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
+    assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
+
+    # 2б. Голый «вернуть на п.N» без «Если»: развилка с исключающим шлюзом, из задачи один выход.
+    for bare_text in (
+        "Регламент: Короткий\n1. Диспетчер: Принять заявку (2 ч).\n2. Мастер: Проверить комплект (3 ч). Вернуть на п.1.\n"
+        "3. Бухгалтер: Оплатить счёт (4 ч).\n",
+        "Регламент: Короткий\n1. Диспетчер: Принять заявку (2 ч).\n2. Мастер: Проверить комплект (3 ч), вернуть на п.1.\n"
+        "3. Бухгалтер: Оплатить счёт (4 ч).\n",
+    ):
+        bare_xml, bare_audit, bare_err = generate_bpmn_from_text(bare_text, use_llm=False)
+        assert not bare_err, bare_err
+        bare_q = bare_audit["quality"]
+        assert not [line for line in bare_q["critical"] + bare_q["issues"] if "ветвление без шлюза" in line], bare_q
+        assert bare_q["ok"] and not bare_q["critical"]
+        gateways = re.findall(r'<bpmn:exclusiveGateway id="([^"]+)"', bare_xml)
+        assert len(gateways) == 1, gateways
+        flows = re.findall(r'<bpmn:sequenceFlow id="([^"]+)"(?: name="([^"]*)")? sourceRef="([^"]+)" targetRef="([^"]+)"', bare_xml)
+        gate_out = [(name, dst) for _id, name, src, dst in flows if src == gateways[0]]
+        assert len(gate_out) == 2 and all(name for name, _ in gate_out), gate_out
+        tasks_b = re.findall(r'<bpmn:userTask id="([^"]+)"', bare_xml)
+        for task_id in tasks_b:
+            assert len([1 for _id, _n, src, _d in flows if src == task_id]) == 1, (task_id, flows)
+        task2_out = [dst for _id, _n, src, dst in flows if src == tasks_b[1]]
+        assert task2_out == gateways
+        assert [dst for name, dst in gate_out if name != "Дальше"] == [tasks_b[0]]
+        assert len(bare_audit["rework_loops"]) == _explicit_return_count(bare_text) == 1
+        assert [s.hours for s in parse_regulation(bare_text).steps] == [2.0, 3.0, 4.0]
+        assert bare_audit["sla"]["critical_path_hours"] == 9.0
+        task_names = re.findall(r'<bpmn:userTask id="[^"]+" name="([^"]*)"', bare_xml)
+        assert task_names == ["Принять заявку", "Проверить комплект", "Оплатить счёт"], task_names
+        assert not any("верну" in name.lower() or " ." in name or name.rstrip().endswith((",", ".")) for name in task_names)
+        assert [s.title for s in parse_regulation(bare_text).steps] == task_names
 
     # 3. Две разные цели у задачи после лечения: critical для повтора модели. Пример 1 не отклоняется.
     fork_code = """
@@ -1081,6 +1158,27 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
         assert "промпт" in secret_reply.lower() or "ключ" in secret_reply.lower()
         assert "Ты —" not in secret_reply and "sk-" not in secret_reply
         assert "не показываю" in secret_reply
+
+    # Ответ про Quality Score строится из цифр: оценки, циклы с карточки, ходы из действий To-Be.
+    ctx_q = dict(build_process_context(text1, xml1, audit1, tobe_delta=delta1))
+    assert ctx_q["rework_loops_as_is"] > 0 and ctx_q["tobe_ready"]
+    ctx_q.update(quality_score_as_is=100, quality_score_to_be=100)
+    loops_card = f"{ctx_q['rework_loops_as_is']} → {ctx_q['rework_loops_to_be']}"
+    kinds_q = {a.get("kind") for a in ctx_q["tobe_actions"]}
+    q_full = heuristic_analysis("Почему упал Quality Score?", ctx_q)
+    assert "100 → 100" in q_full and loops_card in q_full, q_full
+    assert "в оценку нотации" in q_full and "отдельное число" in q_full
+    assert ("параллельные шлюзы" in q_full) == ("parallel" in kinds_q)
+    assert ("входной контроль" in q_full) == ("zero_rework" in kinds_q)
+    ctx_none = dict(ctx_q, tobe_actions=[{"kind": "reengine", "detail": "Целевой регламент переписан."}])
+    q_none = heuristic_analysis("Почему упал Quality Score?", ctx_none)
+    assert "100 → 100" in q_none and loops_card in q_none
+    assert "параллельные шлюзы" not in q_none and "входной контроль" not in q_none and "добавлены" not in q_none
+    ctx_par = dict(ctx_q, tobe_actions=[{"kind": "parallel", "detail": "Добавлено параллельных веток: 1."}])
+    q_par = heuristic_analysis("Почему упал Quality Score?", ctx_par)
+    assert "параллельные шлюзы" in q_par and "входной контроль" not in q_par
+    q_real = heuristic_analysis("Почему упал Quality Score?", build_process_context(text1, xml1, audit1, tobe_delta=delta1))
+    assert f"{delta1['quality_before']} → {delta1['quality_after']}" in q_real and loops_card in q_real
 
     # «Кто перегружен» — разбор: роль и доля bus-factor с карточки, без рекомендаций и команд.
     text_proc = (Path(__file__).parent / "examples" / "example_2_equipment_procurement.txt").read_text(encoding="utf-8")

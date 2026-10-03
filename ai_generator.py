@@ -1631,6 +1631,21 @@ def _bare_return_ref(text: str) -> Optional[int]:
     return int(ref.group(1)) if ref else None
 
 
+_RETURN_TAIL_RE = re.compile(
+    r"\s*[.;,—–-]?\s*(?:и\s+)?(?:вернуть(?:ся)?|возвратить|возвращает(?:ся)?|возвращают(?:ся)?)\s*[.;,]?\s*$",
+    re.I,
+)
+
+
+def _strip_return_tail(text: str) -> str:
+    """Убирает с конца фразы глагол возврата, оставшийся после вырезанного «на п.N».
+
+    Если до него меньше двух слов («Мастер: Вернуть»), глагол — это и есть шаг, его не трогаем.
+    """
+    head = _RETURN_TAIL_RE.sub("", text or "").rstrip(" .;,:—–-")
+    return head if head != (text or "").strip() and len(head.split()) >= 2 else text
+
+
 def _decision_points_back(decision: Optional[Decision], step_num: int) -> bool:
     if decision is None:
         return False
@@ -1868,6 +1883,44 @@ def _pick_return_source(diagram: BPMNDiagramBuilder, target: Any, source: Option
     return None
 
 
+_GATE_FORWARD_LABEL = "Дальше"
+_GATE_QUESTION = "Результат шага принят?"
+
+
+def _split_exit_with_gateway(
+    diagram: BPMNDiagramBuilder, task: Any, target: Any, back_label: str,
+) -> Optional[Tuple[str, Any]]:
+    """Задача с одним выходом дальше + возврат на target: между ними исключающий шлюз.
+
+    Задача → шлюз; шлюз → прежний следующий узел («Дальше») и шлюз → target (подпись возврата).
+    Возвращает (id обратной связи, функция отката). None — задача не подходит, схема не тронута.
+    """
+    if task.kind in GATEWAY_KINDS or task.kind in ("startEvent", "endEvent"):
+        return None
+    outs = [link for link in diagram.links if link.source_id == task.id]
+    if len(outs) != 1 or outs[0].target_id == target.id:
+        return None
+    forward = outs[0]
+    saved_links = list(diagram.links)
+    saved_state = (forward.source_id, forward.condition_name)
+    gate_id = diagram.add_exclusive_gateway(_GATE_QUESTION, task.parent_id)
+    diagram.nodes[gate_id].sla_hours = 0.0  # шлюз не добавляет часов: сроки шагов и путь те же
+
+    def undo() -> None:
+        diagram.nodes.pop(gate_id, None)
+        diagram.links = saved_links
+        forward.source_id, forward.condition_name = saved_state
+
+    forward.source_id = gate_id
+    forward.condition_name = forward.condition_name or _GATE_FORWARD_LABEL
+    entered = diagram.add_link(task.id, gate_id)
+    back = diagram.add_link(gate_id, target.id, back_label or "Возврат")
+    if not entered or not back:
+        undo()
+        return None
+    return back, undo
+
+
 def _complete_return_edges(diagram: BPMNDiagramBuilder, regulation_text: str) -> None:
     """Недостающие явные возвраты дорисовываются в эту же схему, до analyze_bottlenecks.
 
@@ -1940,7 +1993,17 @@ def _complete_return_edges(diagram: BPMNDiagramBuilder, regulation_text: str) ->
         if picked is None:
             continue
         cp_before = _cp_hours()
-        linked = diagram.add_link(picked.id, target.id, str(spec.get("label") or "Возврат"))
+        label = str(spec.get("label") or "Возврат")
+        # Голый «вернуть на п.N»: у задачи уже есть путь дальше, значит второй выход рисуем развилкой.
+        split = _split_exit_with_gateway(diagram, picked, target, label)
+        if split is not None:
+            linked, undo = split
+            if _keep_link(linked, cp_before):
+                claimed.add(linked)
+                continue
+            undo()
+            continue
+        linked = diagram.add_link(picked.id, target.id, label)
         if _keep_link(linked, cp_before):
             claimed.add(linked)
             continue
@@ -2129,6 +2192,8 @@ def parse_regulation(text: str) -> ParsedRegulation:
             step.back_ref = bare_ref
         step.action = bool(action)
         source = action if action else t
+        if step.back_ref is not None:
+            source = _strip_return_tail(source)  # «…, вернуть» — след пометки возврата, не часть названия
         joint = _split_joint_role(source)
         inverted = None if joint else _match_inverted_role(source)
         if inverted is None and decision is not None and joint is None:
@@ -2927,6 +2992,35 @@ def _compare_hours_equal(left: Optional[float], right: Optional[float]) -> bool:
     return abs(float(left) - float(right)) < 1e-6
 
 
+_SYSTEM_ROLE_KEY = "информационная система"
+# Общие глаголы («проводит», «выполняет», «проверяет» …) корнями не считаются.
+_GENERIC_VERB_RE = re.compile(
+    r"^(?:провод|провер|выполн|осуществл|производ|совершает|делает|обеспеч|организу|принима)\w*?"
+    r"(?:ит|ет|ют|ут|ят|ат|ть|ти|ться|ется)$"
+)
+
+
+def _shared_title_roots(left: str, right: str) -> List[str]:
+    """Общие корни двух названий: слова от 5 букв, общий префикс от 5 букв, общие глаголы не в счёт."""
+    def words(title: str) -> List[str]:
+        out = []
+        for w in re.findall(r"[а-яёa-z]+", str(title or "").lower()):
+            w = w.replace("ё", "е")
+            if len(w) >= 5 and not _GENERIC_VERB_RE.match(w):
+                out.append(w)
+        return out
+
+    roots: List[str] = []
+    for a in words(left):
+        for b in words(right):
+            n = 0
+            while n < min(len(a), len(b)) and a[n] == b[n]:
+                n += 1
+            if n >= 5 and a[:5] not in roots:
+                roots.append(a[:5])
+    return roots
+
+
 def compare_asis_tobe(
     asis_text: str,
     tobe_text: str,
@@ -2970,6 +3064,21 @@ def compare_asis_tobe(
             pairs.append((i, hit))
             right_free.discard(hit)
     left_free -= {i for i, _ in pairs}
+    # Третье правило: шаг переименован при передаче системе. Пара — только если роль To-Be «Информационная система»,
+    # роль As-Is другая и в названиях минимум два общих корня от 5 букв. Один шаг входит только в одну пару.
+    candidates = []
+    for i in left_free:
+        for j in right_free:
+            if _compare_key(after[j].role) != _SYSTEM_ROLE_KEY or _compare_key(before[i].role) == _SYSTEM_ROLE_KEY:
+                continue
+            shared = _shared_title_roots(before[i].title, after[j].title)
+            if len(shared) >= 2:
+                candidates.append((-len(shared), abs(i - j), i, j))
+    for _, _, i, j in sorted(candidates):
+        if i in left_free and j in right_free:
+            pairs.append((i, j))
+            left_free.discard(i)
+            right_free.discard(j)
 
     rows: List[Dict[str, Any]] = []
     for i, j in sorted(pairs, key=lambda p: p[1]):
@@ -3053,7 +3162,8 @@ def compare_asis_tobe(
     par_h, par_titles = 0.0, []
     for i, j in pairs:
         old, new = before[i], after[j]
-        if "automation" in kinds and _compare_key(old.role) != _compare_key(new.role):
+        handed_to_system = _compare_key(new.role) == _SYSTEM_ROLE_KEY
+        if ("automation" in kinds or handed_to_system) and _compare_key(old.role) != _compare_key(new.role):
             if old.hours is not None and new.hours is not None and old.hours > new.hours:
                 auto_h += old.hours - new.hours
                 auto_titles.append(new.title)
@@ -3842,28 +3952,36 @@ def _analysis_quality_score(ctx: Dict[str, Any]) -> str:
     qa = int(ctx.get("quality_score_to_be") or now)
     naming = next((c for c in (meth.get("checks") or []) if c.get("key") == "naming"), None)
     if ctx.get("tobe_ready"):
-        if qa >= 100 and qb >= 100:
-            return (
-                f"**Quality Score нотации: {qb}% → {qa}%.** Стандарты соблюдены на 100%: "
-                "все задачи To-Be в форме «глагол в инфинитиве + объект», шлюзы подписаны. "
-                "Параллельные шлюзы и входной контроль добавлены без поломки Naming Compliance."
-            )
-        extra = f"\nNaming: {naming.get('detail')}" if naming else ""
-        if qa < qb:
-            return (
-                f"**Quality Score: {qb}% → {qa}%.** При реинжиниринге добавлены шлюзы параллелизации "
-                "и шаги входного контроля. Правило «глагол + объект» для задач сохранено; "
-                "расхождение даёт линтер на новых элементах, а не отказ от стандарта."
-                + extra
-            )
-        return (
-            f"**Quality Score: {qb}% → {qa}%.** Нотация не просела: глагол + объект сохранены, "
-            "добавлены только параллельные шлюзы и контроли."
+        # Циклы доработки — отдельное число с карточки To-Be, в оценку нотации они не входят.
+        loops_line = (
+            f"Циклы доработки — отдельное число, в оценку нотации они не входят: "
+            f"{int(ctx.get('rework_loops_as_is') or 0)} → {int(ctx.get('rework_loops_to_be') or 0)} (как на карточке To-Be)."
         )
+        # Про параллельные шлюзы и входной контроль пишем только если такие ходы есть в действиях To-Be.
+        kinds = {str(a.get("kind") or "") for a in (ctx.get("tobe_actions") or []) if isinstance(a, dict)}
+        added = [name for kind, name in (("parallel", "параллельные шлюзы"), ("zero_rework", "входной контроль")) if kind in kinds]
+        moves = f"В To-Be добавлены: {' и '.join(added)}." if added else ""
+        if qa >= 100 and qb >= 100:
+            head = (
+                f"**Качество нотации: {qb} → {qa} из 100.** Оценка не изменилась, стандарты соблюдены на 100%: "
+                "задачи в форме «глагол в инфинитиве + объект», шлюзы подписаны."
+            )
+        elif qa < qb:
+            extra = f" Naming: {naming.get('detail')}" if naming else ""
+            head = f"**Качество нотации: {qb} → {qa} из 100.** Оценка снизилась.{extra}"
+        elif qa > qb:
+            head = f"**Качество нотации: {qb} → {qa} из 100.** Оценка выросла" + (
+                ": стандарты соблюдены на 100%." if qa >= 100 else "."
+            )
+        else:
+            head = f"**Качество нотации: {qb} → {qa} из 100.** Оценка не изменилась."
+        return "\n".join(x for x in (head, moves, loops_line) if x)
+    loops_now = len(ctx.get("rework_loops") or [])
+    loops_note = f" Циклов доработки на схеме: {loops_now} — это отдельное число, в оценку нотации оно не входит."
     if now >= 100:
         return (
-            f"**Quality Score текущей схемы: {now}%.** Стандарты нотации соблюдены на 100% "
-            "(глагол в инфинитиве + объект)."
+            f"**Качество нотации текущей схемы: {now} из 100.** Стандарты соблюдены на 100% "
+            "(глагол в инфинитиве + объект)." + loops_note
         )
     return _analysis_readability(ctx)
 
