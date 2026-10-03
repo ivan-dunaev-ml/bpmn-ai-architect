@@ -2,7 +2,7 @@
 
 **Регламент на русском языке → валидный BPMN 2.0.2 → аудит бизнес-архитектуры. За секунды, без ручной доводки.**
 
-**🌐 Живое демо:** https://arkhitektor-bpmn-diagramm-aefqyewayke8vtx5fxsryn.streamlit.app — генерация через Groq GPT-OSS 120B за ~3–5 с.
+**🌐 Живое демо:** https://bpmn-arch-kirillhakaton2026.amvera.io — российский хостинг Amvera, открывается без VPN; генерация через Groq GPT-OSS 120B за ~3–5 с.
 
 Решение для трека «Архитектор BPMN-диаграмм» хакатона «ИИ-ассистенты для энергетики».
 Заказчик — Дирекция бизнес-архитектуры ПАО «Интер РАО».
@@ -38,7 +38,17 @@ python3 stress_test.py --llm              # то же через LLM
 
 ---
 
-## ☁️ Развёртывание (Streamlit Community Cloud)
+## ☁️ Развёртывание (Amvera Cloud — основное, доступ из России без VPN)
+
+Streamlit Cloud и Hugging Face из России без VPN не открываются, поэтому демо размещено на российском
+хостинге Amvera. Groq с серверов Amvera доступен.
+
+1. Ветка `amvera` = основной код + `amvera.yml` (сборка по Dockerfile, порт 8501).
+2. В проекте Amvera: переменные этапа «Запуск» — `OPENAI_*`, `FALLBACK*_*` (как в `.streamlit/secrets.toml.example`;
+   можно загрузить файлом .env), ключи отмечены как секреты.
+3. `git push amvera amvera:master` — Amvera соберёт образ; домен вида `https://<проект>-<логин>.amvera.io`.
+
+## ☁️ Развёртывание (Streamlit Community Cloud — резерв)
 
 1. Зеркало репозитория на GitHub (Streamlit Cloud подключается только к GitHub).
 2. https://share.streamlit.io → **Create app** → репозиторий, ветка `main`, файл `app.py`;
