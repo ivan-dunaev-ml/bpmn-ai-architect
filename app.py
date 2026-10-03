@@ -25,6 +25,7 @@ from ai_generator import (
     build_canvas_copilot,
     build_process_context,
     cloud_engine_status,
+    compare_asis_tobe,
     export_docx_passport,
     align_result_quality,
     generate_bpmn_from_text,
@@ -1106,10 +1107,12 @@ def viewer_html(
   function copilotAnswer(msg) {{
     const q = (msg || '').trim();
     if (!q) return 'Спросите про блок на схеме, SLA или As-Is/To-Be.';
+    const redirect = COPILOT.redirect || 'Этот вопрос задайте ассистенту слева';
     const low = q.toLowerCase();
-    if (/\b(добав\w*|вставь\w*|удал\w*|убер\w*|исключ\w*|сдела\w+\s+параллел)/.test(low)) {{
-      return 'Команду в сайдбар: «' + q.replace(/\s+/g, ' ').replace(/[.]+$/, '') + '»';
+    if (/\\b(добав\\w*|вставь\\w*|удал\\w*|убер\\w*|исключ\\w*|сдела\\w+\\s+параллел|переимен\\w*)/.test(low)) {{
+      return 'Команду в сайдбар: «' + q.replace(/\\s+/g, ' ').replace(/[.]+$/, '') + '»';
     }}
+    if (/инструкци|памятк|должностн|промпт|prompt|api.?key|токен/.test(low)) return redirect;
     const cardOpen = tip && tip.style.display === 'block';
     const sel = (cardOpen && selectedId && CATALOG[selectedId]) || null;
     if (sel && sel.copilot && /этот|выбран|блок|почему|критич|цикл|путь|возврат/.test(low)) {{
@@ -1119,18 +1122,16 @@ def viewer_html(
     const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
     if (exact) return exact.a;
     if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев|ускор|экономи/.test(low))
-      return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
-    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) {{
+      return chipBy('tobe') || COPILOT.compare || redirect;
+    if (/sla|срок|срыв|задерж|критич|длительн|путь/.test(low)) {{
       if (sel && sel.copilot) return sel.copilot;
-      return chipBy('sla') || COPILOT.fallback;
+      return chipBy('sla') || redirect;
     }}
     if (/цикл|возврат|доработ|rework/.test(low)) {{
       if (sel && sel.copilot) return sel.copilot;
-      return COPILOT.loops || COPILOT.fallback;
+      return COPILOT.loops || redirect;
     }}
-    if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
-    if (sel && sel.copilot) return sel.copilot;
-    return COPILOT.compare || COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — отвечу по схеме.';
+    return redirect;
   }}
   function ask(text) {{
     const q = (text || '').trim();
@@ -2076,6 +2077,72 @@ def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
     return asis_xml, asis_audit, asis_text
 
 
+def _compare_hours(hours: Optional[float]) -> str:
+    return "—" if hours is None else fmt_hours(float(hours))
+
+
+def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
+    """Сравнение шагов, снятые возвраты и раскладка экономии. Схемы друг на друга не накладываются."""
+    if not cmp.get("ready"):
+        return
+    st.markdown('<div class="ir-title" style="margin-top:8px">Сравнение As-Is и To-Be</div>', unsafe_allow_html=True)
+    counts = cmp.get("counts") or {}
+    st.caption(
+        f"Шаги сопоставлены по роли и названию: появилось {counts.get('added', 0)}, "
+        f"исчезло {counts.get('removed', 0)}, изменилось {counts.get('changed', 0)}. "
+        "Шаг «исчез» виден только на схеме As-Is, «появился» — только на схеме To-Be."
+    )
+    for row in cmp.get("steps") or []:
+        if row["kind"] == "changed":
+            bits = []
+            if row.get("role_changed"):
+                bits.append(f"роль: {row['role_before'] or '—'} → {row['role_after'] or '—'}")
+            if row.get("hours_changed"):
+                bits.append(f"срок: {_compare_hours(row['hours_before'])} → {_compare_hours(row['hours_after'])}")
+            detail = "; ".join(bits)
+        elif row["kind"] == "removed":
+            detail = f"{row['role_before'] or '—'} · {_compare_hours(row['hours_before'])} · схема As-Is"
+        else:
+            detail = f"{row['role_after'] or '—'} · {_compare_hours(row['hours_after'])} · схема To-Be"
+        st.markdown(
+            f'<div class="tobe-act"><b>{esc(row["label"])}</b>: «{esc(row["title"])}» — {esc(detail)}</div>',
+            unsafe_allow_html=True,
+        )
+    if not (cmp.get("steps") or []):
+        st.caption("Шагов с другой ролью, названием или сроком нет.")
+
+    n_removed = int(cmp.get("removed_returns_n") or 0)
+    st.markdown(
+        f'<div class="ir-title" style="margin-top:8px">Снятые возвраты: {n_removed} '
+        f'(циклы {int(cmp.get("loops_before") or 0)} → {int(cmp.get("loops_after") or 0)})</div>',
+        unsafe_allow_html=True,
+    )
+    for loop in cmp.get("removed_returns") or []:
+        st.markdown(
+            f'<div class="tobe-act">«{esc(loop["from"])}» → «{esc(loop["to"])}»'
+            f'{" — " + esc(loop["label"]) if loop.get("label") else ""}'
+            f' · цикл {fmt_hours(float(loop.get("cycle_hours") or 0))} · схема As-Is</div>',
+            unsafe_allow_html=True,
+        )
+
+    saved = float(cmp.get("saved_hours") or 0)
+    st.markdown(
+        f'<div class="ir-title" style="margin-top:8px">Экономия: {fmt_hours(saved)} '
+        f'(−{int(cmp.get("saved_pct") or 0)}%), путь с возвратами '
+        f'{fmt_hours(float(cmp.get("rw_before") or 0))} → {fmt_hours(float(cmp.get("rw_after") or 0))}</div>',
+        unsafe_allow_html=True,
+    )
+    for part in cmp.get("parts") or []:
+        hours = float(part.get("hours") or 0)
+        if abs(hours) < 0.05:
+            continue
+        extra = f" — {part['detail']}" if part.get("detail") else ""
+        st.markdown(
+            f'<div class="tobe-act"><b>{esc(part["label"])}</b>: {hours:+.1f} ч{esc(extra)}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def render_tobe_tab() -> None:
     st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
     st.caption("Переключатель As-Is / To-Be на холсте меняет схему. Карточка — эффект реинжиниринга.")
@@ -2138,6 +2205,16 @@ def render_tobe_tab() -> None:
 
     asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
+    if facts.get("show_steps") and pack.get("text"):
+        render_asis_tobe_compare(
+            compare_asis_tobe(
+                str(asis_audit.get("result_text") or st.session_state.get("reg_text") or ""),
+                str(pack.get("text") or ""),
+                asis_audit,
+                tobe_audit,
+                facts,
+            )
+        )
     if facts.get("show_steps") and (tobe_audit.get("lane_load") or tobe_audit.get("critical_path")):
         threshold = float(facts.get("bus_threshold") or 0.45)
         before_share = float(facts.get("bus_share") or 0)
