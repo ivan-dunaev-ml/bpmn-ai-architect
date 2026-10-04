@@ -25,6 +25,9 @@ from ai_generator import (
     build_canvas_copilot,
     build_process_context,
     cloud_engine_status,
+    compare_asis_tobe,
+    is_tobe_revert_request,
+    mark_changed_steps,
     export_docx_passport,
     align_result_quality,
     generate_bpmn_from_text,
@@ -483,6 +486,7 @@ def viewer_html(
     xml_tobe: str = "",
     catalog_tobe: Optional[Dict[str, Any]] = None,
     canvas_tobe: bool = False,
+    tobe_reason: str = "",
 ) -> str:
     js_tag, css_tag = _bpmn_js_tags()
     payload_asis = json.dumps(xml or "").replace("</", "<\\/")
@@ -493,7 +497,9 @@ def viewer_html(
     asis_on = " on" if not canvas_tobe else ""
     tobe_on = " on" if canvas_tobe else ""
     tobe_disabled = "" if xml_tobe else " disabled"
-    tobe_title = "Целевой оптимизированный" if xml_tobe else "To-Be ещё не готов"
+    why_text = "" if xml_tobe else html.escape(str(tobe_reason or "").strip(), quote=True)
+    tobe_title = "Целевой оптимизированный" if xml_tobe else (why_text or "To-Be ещё не готов")
+    tobe_why = f'<div class="tobe-why" id="tobe-why">{why_text}</div>' if why_text else ""
     return f"""
 <!doctype html><html><head><meta charset="utf-8">{css_tag}
 <style>
@@ -553,6 +559,12 @@ def viewer_html(
       box-shadow:0 4px 16px rgba(0,51,102,.06); }}
   #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
   .bjs-powered-by {{ opacity:.55; }}
+  .djs-element.ir-changed .djs-visual > :nth-child(1) {{
+    stroke:#7B1FA2 !important; stroke-width:3px !important;
+    fill:#F5ECFA !important; fill-opacity:1 !important;
+    vector-effect:non-scaling-stroke;
+  }}
+  #tip .chg {{ display:none; margin:8px 0 0 0; background:#F3E5F5; color:#4A148C; border-radius:8px; padding:6px 9px; font-weight:700; font-size:12.5px; }}
   .djs-element.ir-selected .djs-visual > :nth-child(1) {{
     stroke:#1565C0 !important; stroke-width:3px !important;
     filter:drop-shadow(0 0 6px rgba(21,101,192,.35));
@@ -581,6 +593,12 @@ def viewer_html(
   #tip .meta {{ color:#455A64; margin:3px 0; }}
   #tip .crit {{ display:none; margin:8px 0; background:#FFF3E0; color:#E65100; border-radius:8px; padding:5px 8px; font-weight:700; font-size:12px; }}
   #tip .ai {{ margin-top:8px; background:#E8F1FB; border-radius:10px; padding:8px 10px; color:#0D47A1; }}
+  .tobe-why {{
+    position:absolute; top:58px; right:12px; z-index:5; max-width:min(440px, calc(100% - 24px));
+    font-size:12px; line-height:1.3; color:#8D4E00; background:rgba(255,248,225,.92);
+    border:1px solid rgba(255,160,0,.35); border-radius:12px; padding:4px 10px;
+  }}
+  #wrap.pano .tobe-why {{ top:68px; left:16px; right:auto; z-index:1000003; }}
   #close {{
     display:none; position:absolute; top:16px; right:16px; z-index:1000004;
     border:1px solid rgba(255,255,255,.35); background:rgba(0,51,102,.62); color:#fff;
@@ -661,6 +679,7 @@ def viewer_html(
     <button id="fit" title="Вписать в окно">По размеру</button><button id="one" title="Масштаб 100%">100%</button>
     <button id="full" title="Панорама на весь экран (выход — Esc)">⛶ Панорама на весь экран</button>
   </div>
+  {tobe_why}
   <button id="close" title="Закрыть панораму (Esc)">✕ Закрыть панораму</button>
   <div id="canvas"></div><div id="err"></div>
   <div id="tip" class="inspector-card">
@@ -669,6 +688,7 @@ def viewer_html(
     <div class="name" id="t-name"></div>
     <div class="meta" id="t-role"></div>
     <div class="crit" id="t-crit">⚡ На критическом пути SLA</div>
+    <div class="chg" id="t-chg"></div>
     <div class="ai" id="t-ai"></div>
   </div>
   <div class="hint" id="hint"></div>
@@ -769,6 +789,10 @@ def viewer_html(
     document.getElementById('t-role').textContent = 'Роль: ' + (meta.role || '—');
     document.getElementById('t-crit').style.display = meta.critical ? 'block' : 'none';
     document.getElementById('t-ai').textContent = meta.comment || '';
+    const chgEl = document.getElementById('t-chg');
+    const chgText = (activeMode === 'tobe' && meta.change) ? meta.change : '';
+    chgEl.textContent = chgText;
+    chgEl.style.display = chgText ? 'block' : 'none';
     tip.style.display = 'block';
     placeTip(evt);
   }}
@@ -933,7 +957,16 @@ def viewer_html(
     if (errEl) errEl.style.display = 'none';
     return viewer.importXML(xml).then(() => {{
       emphasizeSubprocessTitles();
+      markChanged();
       fitSoon();
+    }});
+  }}
+  // Обводка шагов, изменившихся в сравнении As-Is / To-Be: только на схеме To-Be.
+  function markChanged() {{
+    if (activeMode !== 'tobe') return;
+    Object.keys(CATALOG || {{}}).forEach(id => {{
+      if (!(CATALOG[id] && CATALOG[id].changed)) return;
+      try {{ canvas().addMarker(id, 'ir-changed'); }} catch (e) {{}}
     }});
   }}
   function setCanvasMode(m) {{
@@ -1117,12 +1150,21 @@ def viewer_html(
   function copilotAnswer(msg) {{
     const q = (msg || '').trim();
     if (!q) return 'Спросите про блок на схеме, SLA или As-Is/To-Be.';
+    const redirect = COPILOT.redirect || 'Этот вопрос задайте ассистенту слева';
     const low = q.toLowerCase();
-    if (/\b(добав\w*|вставь\w*|удал\w*|убер\w*|исключ\w*|сдела\w+\s+параллел)/.test(low)) {{
-      return 'Команду в сайдбар: «' + q.replace(/\s+/g, ' ').replace(/[.]+$/, '') + '»';
+    if (/\\b(добав\\w*|вставь\\w*|удал\\w*|убер\\w*|исключ\\w*|сдела\\w+\\s+параллел|переимен\\w*|не\\s+(меняй|менять|заменяй|передавай|передавать)\\s|нет\\s+таких\\s+возможност|отмен\\w*\\s+(\\w+\\s+){{0,2}}(смен\\w+\\s+рол|передач))/.test(low)) {{
+      return 'Команду в сайдбар: «' + q.replace(/\\s+/g, ' ').replace(/[.]+$/, '') + '»';
     }}
+    if (/инструкци|памятк|должностн|промпт|prompt|api.?key|токен/.test(low)) return redirect;
     const cardOpen = tip && tip.style.display === 'block';
     const sel = (cardOpen && selectedId && CATALOG[selectedId]) || null;
+    // Подсвеченные шаги: ответ из сравнения As-Is / To-Be, тот же текст, что в фиолетовой строке карточки.
+    if (/подсвеч|подсветк|фиолетов|что\\s+изменилось\\s+в\\s+(этом\\s+|данном\\s+|выбранном\\s+)?шаг|чем\\s+(этот\\s+)?шаг\\s+(изменил\\w*|отличается)/.test(low)) {{
+      if (sel && /этот|выбран|почему|что\\s+изменилось/.test(low)) {{
+        return (sel.changed && sel.change) ? '**«' + sel.name + '»**: ' + sel.change : 'Этот шаг не подсвечен';
+      }}
+      return COPILOT.highlight || 'Подсвеченных шагов нет';
+    }}
     if (sel && sel.copilot && /этот|выбран|блок|почему|критич|цикл|путь|возврат/.test(low)) {{
       return sel.copilot;
     }}
@@ -1130,18 +1172,16 @@ def viewer_html(
     const exact = chips.find(c => c.q === q || (c.label && c.label.toLowerCase() === low));
     if (exact) return exact.a;
     if (/сравни|as-is|as is|to-be|tobe|до и после|до\\/после|целев|ускор|экономи/.test(low))
-      return chipBy('tobe') || COPILOT.compare || COPILOT.fallback;
-    if (/sla|срок|срыв|задерж|критич|длительн/.test(low)) {{
+      return chipBy('tobe') || COPILOT.compare || redirect;
+    if (/sla|срок|срыв|задерж|критич|длительн|путь/.test(low)) {{
       if (sel && sel.copilot) return sel.copilot;
-      return chipBy('sla') || COPILOT.fallback;
+      return chipBy('sla') || redirect;
     }}
     if (/цикл|возврат|доработ|rework/.test(low)) {{
       if (sel && sel.copilot) return sel.copilot;
-      return COPILOT.loops || COPILOT.fallback;
+      return COPILOT.loops || redirect;
     }}
-    if (/роль|нагруз|bus|риск|исполнител|диспетчер|загруж/.test(low)) return chipBy('roles') || COPILOT.fallback;
-    if (sel && sel.copilot) return sel.copilot;
-    return COPILOT.compare || COPILOT.fallback || COPILOT.greeting || 'Сгенерируйте диаграмму — отвечу по схеме.';
+    return redirect;
   }}
   function ask(text) {{
     const q = (text || '').trim();
@@ -1642,6 +1682,31 @@ def _tobe_accepted(facts: Dict[str, Any]) -> bool:
     return True
 
 
+def tobe_unavailable_reason(
+    audit: Optional[Dict[str, Any]], delta: Optional[Dict[str, Any]], facts: Optional[Dict[str, Any]], tobe_xml: str,
+) -> str:
+    """Одна строка: почему кнопка To-Be выключена. Только из уже посчитанных audit, delta и фактов."""
+    if not (audit or {}).get("sla"):
+        return "To-Be не строился: для этой схемы не посчитан срок (SLA)."
+    f = facts or {}
+    if tobe_xml and _tobe_accepted(f):
+        return ""
+    d = delta or {}
+    if f.get("tobe_ready"):
+        cp_before = float(f.get("cp_before") or 0)
+        cp_after = float(f.get("cp_after") if f.get("cp_after") is not None else cp_before)
+        if cp_after > cp_before + 1.0 / 60.0:
+            return f"Голый путь To-Be длиннее: {fmt_hours(cp_before)} → {fmt_hours(cp_after)}."
+        loops_before = int(f.get("loops_before") or 0)
+        loops_after = int(f.get("loops_after") or 0)
+        if loops_after > loops_before or (loops_before > 0 and loops_after >= loops_before):
+            return f"Циклы возврата не уменьшились: {loops_before} → {loops_after}."
+    q_before, q_after = d.get("quality_before"), d.get("quality_after")
+    if q_before is not None and q_after is not None and int(q_after) < int(q_before):
+        return f"Качество To-Be ниже: {int(q_before)} → {int(q_after)}."
+    return "Ни один ход оптимизации не прошёл проверку."
+
+
 def tobe_card_headline(facts: Dict[str, Any]) -> str:
     """Подпись карточки экономии. «Без ускорения» не используется, когда путь с возвратами короче."""
     if not facts.get("speedup_via_rework"):
@@ -1718,6 +1783,7 @@ def prepare_regulation(
     }
     if error or not audit.get("sla"):
         pack["facts"] = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
+        pack["tobe_reason"] = tobe_unavailable_reason(audit, {}, pack["facts"], "")
         return pack
     opt_text, delta = cached_optimize_to_be(
         _reg_hash(text or "", _audit_cache_slice(audit), "edges-v7"),
@@ -1735,6 +1801,7 @@ def prepare_regulation(
     if not accepted:
         pack["delta"] = delta or {}
         pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        pack["tobe_reason"] = tobe_unavailable_reason(audit, delta, facts, tobe_xml)
         return pack
     shown_tobe, tobe_view = align_result_quality(opt_text or "", tobe_xml, tobe_audit, bool(use_llm))
     paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
@@ -1757,6 +1824,53 @@ def prepare_regulation(
     return pack
 
 
+def retune_tobe(audit: Dict[str, Any], delta: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
+    """To-Be из обновлённого delta (после отмены хода): текст, схема, аудит, факты. Облако не вызывается.
+
+    Те же шаги, что в конце prepare_regulation; delta дополняется оценкой качества на месте.
+    """
+    delta = delta if isinstance(delta, dict) else {}
+    opt_text = str(delta.get("tobe_text") or "")
+    facts = process_facts(audit, delta)
+    tobe_audit = dict(delta.get("tobe_audit") or {})
+    tobe_xml = str(delta.get("tobe_xml") or "")
+    out: Dict[str, Any] = {"tobe_text": "", "tobe_xml": "", "tobe_audit": {}, "tobe_ok": False}
+    if not (_tobe_accepted(facts) and tobe_xml):
+        out["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        return out
+    shown_tobe, tobe_view = align_result_quality(opt_text, tobe_xml, tobe_audit, bool(use_llm))
+    paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
+    delta["quality_after"] = paste_after
+    delta["quality_before"] = int(((audit.get("methodology") or {}).get("score") or 0))
+    delta["quality_gain"] = max(0, paste_after - int(delta["quality_before"]))
+    facts = process_facts(audit, delta)
+    rebuilt_xml = str(tobe_view.get("result_xml") or "")
+    rebuilt_audit = tobe_view.get("result_audit") if isinstance(tobe_view.get("result_audit"), dict) else None
+    if rebuilt_xml and rebuilt_audit:
+        tobe_xml, tobe_audit = rebuilt_xml, rebuilt_audit
+    out.update(
+        tobe_text=shown_tobe or opt_text or "", tobe_xml=tobe_xml, tobe_audit=tobe_audit, tobe_ok=True,
+        facts=_annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True),
+    )
+    return out
+
+
+def _refresh_session_tobe() -> None:
+    """После отмены хода To-Be ассистентом: обновляет карточку, текст и схему To-Be в сессии."""
+    pack = st.session_state.get("tobe_pack")
+    result = st.session_state.get("result") or {}
+    if not pack or not isinstance(pack.get("delta"), dict):
+        return
+    rev = pack["delta"].get("tobe_rev")
+    if rev is None or rev == pack.get("tobe_rev_applied"):
+        return
+    new = retune_tobe(result.get("audit") or {}, pack["delta"], use_llm=False)
+    pack.update(text=new["tobe_text"], xml=new["tobe_xml"], audit=new["tobe_audit"],
+                tobe_ok=new["tobe_ok"], facts=new["facts"], tobe_rev_applied=rev)
+    pack["reason"] = "" if new["tobe_ok"] else tobe_unavailable_reason(
+        result.get("audit") or {}, pack["delta"], process_facts(result.get("audit") or {}, pack["delta"]), "")
+
+
 def _store_regulation_pack(pack: Dict[str, Any]) -> None:
     st.session_state["result"] = {
         "xml": pack.get("xml") or "",
@@ -1773,6 +1887,7 @@ def _store_regulation_pack(pack: Dict[str, Any]) -> None:
         "facts": pack.get("facts") or {},
         "tobe_ok": bool(pack.get("tobe_ok")),
         "asis_text": pack.get("asis_text") or "",
+        "reason": pack.get("tobe_reason") or "",
     }
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
@@ -2034,9 +2149,14 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
     text = st.session_state.get("reg_text") or ""
     audit = result.get("audit") or {}
     if not audit.get("sla"):
-        pack = prepare_regulation(text, use_llm=False)
-        _store_regulation_pack(pack)
-        return st.session_state.get("tobe_pack")
+        # Схему не пересобираем и облачный As-Is эмулятором не заменяем: только пометка, почему To-Be нет.
+        facts = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
+        st.session_state["tobe_pack"] = {
+            "source_xml": src, "text": "", "delta": {}, "xml": "", "audit": {}, "error": "",
+            "facts": facts, "tobe_ok": False, "asis_text": text,
+            "reason": tobe_unavailable_reason(audit, {}, facts, ""),
+        }
+        return st.session_state["tobe_pack"]
     opt_text, delta = cached_optimize_to_be(
         _reg_hash(text, _audit_cache_slice(audit), "edges-v7"),
         text,
@@ -2069,6 +2189,7 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
     else:
         pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
+        pack["tobe_reason"] = tobe_unavailable_reason(audit, delta, facts, tobe_xml)
     _store_regulation_pack(pack)
     return st.session_state.get("tobe_pack")
 
@@ -2085,6 +2206,67 @@ def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
     if pack.get("xml") and not pack.get("error"):
         return pack["xml"], pack.get("audit") or asis_audit, pack.get("text") or asis_text
     return asis_xml, asis_audit, asis_text
+
+
+def _compare_hours(hours: Optional[float]) -> str:
+    return "—" if hours is None else fmt_hours(float(hours))
+
+
+def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
+    """Сравнение шагов, снятые возвраты и раскладка экономии. Схемы друг на друга не накладываются."""
+    if not cmp.get("ready"):
+        return
+    st.markdown('<div class="ir-title" style="margin-top:8px">Сравнение As-Is и To-Be</div>', unsafe_allow_html=True)
+    counts = cmp.get("counts") or {}
+    # В подписи только числа. Шаги «исчез» и «появился» построчно не выводим: на длинном регламенте их десятки.
+    st.caption(
+        f"Шаги сопоставлены по роли и названию: появилось {counts.get('added', 0)}, "
+        f"исчезло {counts.get('removed', 0)}, изменилось {counts.get('changed', 0)}."
+    )
+    changed_rows = [row for row in (cmp.get("steps") or []) if row.get("kind") == "changed"]
+    for row in changed_rows:
+        bits = []
+        if row.get("role_changed"):
+            bits.append(f"роль: {row['role_before'] or '—'} → {row['role_after'] or '—'}")
+        if row.get("hours_changed"):
+            bits.append(f"срок: {_compare_hours(row['hours_before'])} → {_compare_hours(row['hours_after'])}")
+        st.markdown(
+            f'<div class="tobe-act"><b>{esc(row["label"])}</b>: «{esc(row["title"])}» — {esc("; ".join(bits))}</div>',
+            unsafe_allow_html=True,
+        )
+    if not changed_rows:
+        st.caption("Шагов со сменой роли или срока нет.")
+
+    n_removed = int(cmp.get("removed_returns_n") or 0)
+    st.markdown(
+        f'<div class="ir-title" style="margin-top:8px">Снятые возвраты: {n_removed} '
+        f'(циклы {int(cmp.get("loops_before") or 0)} → {int(cmp.get("loops_after") or 0)})</div>',
+        unsafe_allow_html=True,
+    )
+    for loop in cmp.get("removed_returns") or []:
+        st.markdown(
+            f'<div class="tobe-act">«{esc(loop["from"])}» → «{esc(loop["to"])}»'
+            f'{" — " + esc(loop["label"]) if loop.get("label") else ""}'
+            f' · цикл {fmt_hours(float(loop.get("cycle_hours") or 0))} · схема As-Is</div>',
+            unsafe_allow_html=True,
+        )
+
+    saved = float(cmp.get("saved_hours") or 0)
+    st.markdown(
+        f'<div class="ir-title" style="margin-top:8px">Экономия: {fmt_hours(saved)} '
+        f'(−{int(cmp.get("saved_pct") or 0)}%), путь с возвратами '
+        f'{fmt_hours(float(cmp.get("rw_before") or 0))} → {fmt_hours(float(cmp.get("rw_after") or 0))}</div>',
+        unsafe_allow_html=True,
+    )
+    for part in cmp.get("parts") or []:
+        hours = float(part.get("hours") or 0)
+        if abs(hours) < 0.05:
+            continue
+        extra = f" — {part['detail']}" if part.get("detail") else ""
+        st.markdown(
+            f'<div class="tobe-act"><b>{esc(part["label"])}</b>: {hours:+.1f} ч{esc(extra)}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_tobe_tab() -> None:
@@ -2149,6 +2331,16 @@ def render_tobe_tab() -> None:
 
     asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
+    if facts.get("show_steps") and pack.get("text"):
+        render_asis_tobe_compare(
+            compare_asis_tobe(
+                str(asis_audit.get("result_text") or st.session_state.get("reg_text") or ""),
+                str(pack.get("text") or ""),
+                asis_audit,
+                tobe_audit,
+                facts,
+            )
+        )
     if facts.get("show_steps") and (tobe_audit.get("lane_load") or tobe_audit.get("critical_path")):
         threshold = float(facts.get("bus_threshold") or 0.45)
         before_share = float(facts.get("bus_share") or 0)
@@ -2459,6 +2651,24 @@ def render_diagram(canvas_height: int) -> None:
             if xml_tobe
             else {}
         )
+        if xml_tobe and pack:
+            # Подсветка на текущей схеме: шаги, изменившиеся в сравнении (роль, срок). «Исчез» и «появился» не трогаем.
+            try:
+                tobe_facts = pack.get("facts") or process_facts(audit_asis, pack.get("delta"))
+                if tobe_facts.get("show_steps") and pack.get("text"):
+                    mark_changed_steps(
+                        catalog,
+                        catalog_tb,
+                        compare_asis_tobe(
+                            str(audit_asis.get("result_text") or text_asis),
+                            str(pack.get("text") or ""),
+                            audit_asis,
+                            pack.get("audit") or {},
+                            tobe_facts,
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 — подсветка не должна ломать холст
+                pass
         copilot = build_canvas_copilot(
             xml_asis,
             audit_asis,
@@ -2472,6 +2682,7 @@ def render_diagram(canvas_height: int) -> None:
             copilot,
             xml_tobe=xml_tobe,
             catalog_tobe=catalog_tb,
+            tobe_reason="" if xml_tobe else str((pack or {}).get("reason") or ""),
         )
         if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
             st.iframe(page, width="stretch", height=canvas_height + 16)
@@ -2490,7 +2701,7 @@ def _send_assistant(prompt: str) -> None:
     result = st.session_state.get("result") or {}
     low = prompt.lower()
     pack = st.session_state.get("tobe_pack")
-    if re.search(r"сравни|as-is|to-be|tobe|до и после|читаем|метро|сократ|почему|за сч[её]т|за счет|quality|объясни", low):
+    if re.search(r"сравни|as-is|to-be|tobe|до и после|читаем|метро|сократ|почему|за сч[её]т|за счет|quality|объясни|подсвеч|подсветк|фиолетов|что изменилось", low) or is_tobe_revert_request(prompt):
         pack = ensure_tobe_pack() or pack
     with st.spinner("Ассистент анализирует процесс…"):
         reply, new_text, new_xml, new_audit = assistant_chat(
@@ -2503,6 +2714,7 @@ def _send_assistant(prompt: str) -> None:
             tobe_delta=(pack or {}).get("delta"),
         )
     messages.append({"role": "assistant", "content": reply})
+    _refresh_session_tobe()
     if new_text and new_xml and new_audit:
         st.session_state["reg_text"] = new_text
         st.session_state["result"] = {"xml": new_xml, "audit": new_audit, "error": ""}
