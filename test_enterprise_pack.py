@@ -1036,6 +1036,36 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
+    # 2д. Четыре строки экономии: пересчёт пути без хода, обрезка остатком, сумма равна карточке в десятых.
+    part_h = {p["kind"]: p["hours"] for p in cmp_view["parts"]}
+    assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "rest"]
+    assert tenths(part_h["loops"]) == (tenths(cmp_facts["rw_before"]) - tenths(cmp_facts["cp_before"])) - (
+        tenths(cmp_facts["rw_after"]) - tenths(cmp_facts["cp_after"]))
+    assert all(tenths(v) >= 0 for v in part_h.values()), part_h
+    assert sum(tenths(v) for v in part_h.values()) == tenths(cmp_facts["rw_saved_hours"])
+    # Ход выключается и пересчитывается: без «Параллельно» путь длиннее на часы шага, автоматизация обрезается остатком.
+    what_facts = dict(same_facts, rw_before=9.0, rw_after=7.0, cp_before=9.0, cp_after=7.0, rw_saved_pct=22)
+    what_before = (
+        "Регламент: Пересчёт\n1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Проверить комплект (2 ч).\n"
+        "3. Бухгалтер: Зарегистрировать платёж в журнале (6 ч).\n"
+    )
+    what_after = (
+        "Регламент: Пересчёт\n1. Диспетчер: Принять заявку (1 ч).\n2. Параллельно: Мастер: Проверить комплект (2 ч).\n"
+        "3. Информационная система: Зарегистрировать платёж в журнале (5 минут).\n"
+    )
+    what_view = compare_asis_tobe(what_before, what_after, {}, {}, what_facts)
+    what_h = {p["kind"]: p["hours"] for p in what_view["parts"]}
+    assert what_h["parallel"] == 1.0 and what_h["automation"] == 1.0 and what_h["loops"] == 0.0, what_h
+    assert sum(tenths(v) for v in what_h.values()) == tenths(what_facts["rw_before"] - what_facts["rw_after"])
+    # Нет хода — строка 0, часы остаются в «остальное».
+    idle_view = compare_asis_tobe(what_before, what_before, {}, {}, what_facts)
+    idle_h = {p["kind"]: p["hours"] for p in idle_view["parts"]}
+    assert idle_h == {"loops": 0.0, "parallel": 0.0, "automation": 0.0, "rest": 2.0}, idle_h
+    # Прежний срок не длиннее — автоматизация 0.
+    short_after = what_after.replace("(5 минут)", "(7 ч)")
+    short_view = compare_asis_tobe(what_before, short_after, {}, {}, what_facts)
+    assert {p["kind"]: p["hours"] for p in short_view["parts"]}["automation"] == 0.0
+
     # 2г. Один шаг — одна строка: хвосты «иначе …» и «вернуть на п.N» отрезаются, начало названия — та же пара.
     assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 1}, cmp_view["counts"]
     assert round(float(cmp_view["saved_hours"]), 1) == 3.0

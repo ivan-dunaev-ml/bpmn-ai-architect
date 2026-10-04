@@ -43,6 +43,7 @@ import threading
 import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field, replace as _dc_replace
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
@@ -3054,6 +3055,56 @@ def _shared_title_roots(left: str, right: str) -> List[str]:
     return roots
 
 
+_PAR_MARK_RE = re.compile(r"^(?:параллельно|одновременно)\s*\*?\s*[:,—–-]?\s*", re.I)
+
+
+@lru_cache(maxsize=64)
+def _what_if_rw(text: str) -> Optional[float]:
+    """Путь с возвратами по тексту, собранный локальным эмулятором (без облака). None — пересчитать нельзя."""
+    try:
+        _xml, audit, err = generate_bpmn_from_text(text, use_llm=False)
+    except Exception:  # noqa: BLE001
+        return None
+    sla = (audit or {}).get("sla") or {}
+    if err or not sla:
+        return None
+    return float(sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0.0)
+
+
+def _hours_phrase_for_edit(hours: float) -> str:
+    return f"{round(hours * 60)} минут" if hours < 1 else f"{hours:g} ч"
+
+
+def _tobe_variant(tobe_text: str, mode: str, edits: Dict[int, float]) -> Optional[str]:
+    """Текст To-Be с выключенным ходом: без пометок «Параллельно» или с прежним сроком у шагов, переданных системе.
+
+    Нумерация и остальной текст те же. None — ход выключить нельзя или он ничего не меняет.
+    """
+    try:
+        header, steps = _split_steps(normalize_regulation(tobe_text or ""))
+    except Exception:  # noqa: BLE001
+        return None
+    changed = False
+    for index, step in enumerate(steps):
+        body = step["body"]
+        if mode == "no_parallel":
+            new_body = _PAR_MARK_RE.sub("", body)
+        elif mode == "old_hours" and index in edits:
+            phrase = f"({_hours_phrase_for_edit(float(edits[index]))})"
+            if _DUR_RE.search(body):
+                new_body = _DUR_RE.sub(phrase, body, count=1)
+            else:
+                new_body = body.rstrip(" .") + f" {phrase}."
+        else:
+            continue
+        if new_body != body:
+            step["body"] = new_body
+            changed = True
+    if not changed:
+        return None
+    return "\n".join([*header, "", *[f"{s['num']}. {s['body']}" for s in steps]]).strip() + "\n"
+
+
 def compare_asis_tobe(
     asis_text: str,
     tobe_text: str,
@@ -3200,27 +3251,37 @@ def compare_asis_tobe(
     rw_b, rw_a = tenth(f.get("rw_before")), tenth(f.get("rw_after"))
     cp_b, cp_a = tenth(f.get("cp_before")), tenth(f.get("cp_after"))
     saved_t = rw_b - rw_a
-    loops_t = ((rw_b - cp_b) - (rw_a - cp_a)) if removed_n > 0 else 0
+    # 1. Снятые возвраты: насколько путь с возвратами длиннее голого до оптимизации минус насколько длиннее после.
+    loops_t = max(0, min(saved_t, (rw_b - cp_b) - (rw_a - cp_a))) if removed_n > 0 else 0
     pool = max(0, saved_t - loops_t)
-    kinds = {str(a.get("kind") or "") for a in (f.get("tobe_actions") or []) if isinstance(a, dict)}
 
-    auto_h, auto_titles = 0.0, []
-    par_h, par_titles = 0.0, []
-    for i, j in pairs:
-        old, new = before[i], after[j]
-        handed_to_system = _compare_key(new.role) == _SYSTEM_ROLE_KEY
-        if ("automation" in kinds or handed_to_system) and _compare_key(old.role) != _compare_key(new.role):
-            if old.hours is not None and new.hours is not None and old.hours > new.hours:
-                auto_h += old.hours - new.hours
-                auto_titles.append(new.title)
-        if new.parallel and not old.parallel and j > 0:
-            neighbour = after[j - 1].hours
-            if new.hours is not None and neighbour is not None:
-                par_h += min(new.hours, neighbour)
-                par_titles.append(new.title)
-    auto_t = min(tenth(auto_h), pool)
-    par_t = min(tenth(par_h), pool - auto_t)
-    rest_t = saved_t - loops_t - auto_t - par_t
+    # 2-3. Параллель и автоматизация: путь To-Be пересчитывается без хода, берётся разница с настоящим путём To-Be.
+    par_titles = [s.title for s in after if s.parallel]
+    base_rw = _what_if_rw(tobe_text) if (par_titles or any(
+        _compare_key(after[j].role) == _SYSTEM_ROLE_KEY and _compare_key(before[i].role) != _compare_key(after[j].role)
+        for i, j in pairs)) else None
+    par_t = 0
+    if base_rw is not None and par_titles:
+        no_par = _tobe_variant(tobe_text, "no_parallel", {})
+        alt = _what_if_rw(no_par) if no_par else None
+        par_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
+    par_t = max(0, min(par_t, pool))
+
+    auto_edits = {
+        j: before[i].hours for i, j in pairs
+        if _compare_key(after[j].role) == _SYSTEM_ROLE_KEY and _compare_key(before[i].role) != _compare_key(after[j].role)
+        and before[i].hours is not None and after[j].hours is not None and before[i].hours > after[j].hours
+    }
+    auto_t = 0
+    if base_rw is not None and auto_edits:
+        old_hours = _tobe_variant(tobe_text, "old_hours", auto_edits)
+        alt = _what_if_rw(old_hours) if old_hours else None
+        auto_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
+    auto_t = max(0, min(auto_t, pool - par_t))
+    auto_titles = [after[j].title for j in sorted(auto_edits)] if auto_t else []
+    par_titles = par_titles if par_t else []
+    # 4. Всё, что не вошло, остаётся в «остальное»: сумма строк равна экономии карточки.
+    rest_t = saved_t - loops_t - par_t - auto_t
 
     def _h(t: int) -> float:
         return round(t / 10.0, 1)
