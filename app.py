@@ -2087,29 +2087,24 @@ def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
         return
     st.markdown('<div class="ir-title" style="margin-top:8px">Сравнение As-Is и To-Be</div>', unsafe_allow_html=True)
     counts = cmp.get("counts") or {}
+    # В подписи только числа. Шаги «исчез» и «появился» построчно не выводим: на длинном регламенте их десятки.
     st.caption(
         f"Шаги сопоставлены по роли и названию: появилось {counts.get('added', 0)}, "
-        f"исчезло {counts.get('removed', 0)}, изменилось {counts.get('changed', 0)}. "
-        "Шаг «исчез» виден только на схеме As-Is, «появился» — только на схеме To-Be."
+        f"исчезло {counts.get('removed', 0)}, изменилось {counts.get('changed', 0)}."
     )
-    for row in cmp.get("steps") or []:
-        if row["kind"] == "changed":
-            bits = []
-            if row.get("role_changed"):
-                bits.append(f"роль: {row['role_before'] or '—'} → {row['role_after'] or '—'}")
-            if row.get("hours_changed"):
-                bits.append(f"срок: {_compare_hours(row['hours_before'])} → {_compare_hours(row['hours_after'])}")
-            detail = "; ".join(bits)
-        elif row["kind"] == "removed":
-            detail = f"{row['role_before'] or '—'} · {_compare_hours(row['hours_before'])} · схема As-Is"
-        else:
-            detail = f"{row['role_after'] or '—'} · {_compare_hours(row['hours_after'])} · схема To-Be"
+    changed_rows = [row for row in (cmp.get("steps") or []) if row.get("kind") == "changed"]
+    for row in changed_rows:
+        bits = []
+        if row.get("role_changed"):
+            bits.append(f"роль: {row['role_before'] or '—'} → {row['role_after'] or '—'}")
+        if row.get("hours_changed"):
+            bits.append(f"срок: {_compare_hours(row['hours_before'])} → {_compare_hours(row['hours_after'])}")
         st.markdown(
-            f'<div class="tobe-act"><b>{esc(row["label"])}</b>: «{esc(row["title"])}» — {esc(detail)}</div>',
+            f'<div class="tobe-act"><b>{esc(row["label"])}</b>: «{esc(row["title"])}» — {esc("; ".join(bits))}</div>',
             unsafe_allow_html=True,
         )
-    if not (cmp.get("steps") or []):
-        st.caption("Шагов с другой ролью, названием или сроком нет.")
+    if not changed_rows:
+        st.caption("Шагов со сменой роли или срока нет.")
 
     n_removed = int(cmp.get("removed_returns_n") or 0)
     st.markdown(

@@ -1036,6 +1036,36 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
+    # 2в. Экран сравнения: шаги «исчез» и «появился» построчно не выводятся, только числа в подписи.
+    shown: list = []
+    real_md, real_cap = bpmn_app.st.markdown, bpmn_app.st.caption
+    bpmn_app.st.markdown = lambda body, *a, **k: shown.append(("md", str(body)))
+    bpmn_app.st.caption = lambda body, *a, **k: shown.append(("cap", str(body)))
+    try:
+        long_view = dict(cmp_view)
+        long_view["steps"] = list(cmp_view["steps"]) + [
+            {"kind": "removed", "label": "исчез", "title": f"Старый шаг {n}", "role_before": "Мастер", "role_after": "",
+             "hours_before": 1.0, "hours_after": None, "num_before": n, "num_after": None, "schemes": ["As-Is"]}
+            for n in range(1, 18)
+        ] + [
+            {"kind": "added", "label": "появился", "title": "Новый шаг", "role_before": "", "role_after": "Мастер",
+             "hours_before": None, "hours_after": 1.0, "num_before": None, "num_after": 99, "schemes": ["To-Be"]}
+        ]
+        long_view["counts"] = {"added": 1, "removed": 17, "changed": cmp_view["counts"]["changed"]}
+        bpmn_app.render_asis_tobe_compare(long_view)
+    finally:
+        bpmn_app.st.markdown, bpmn_app.st.caption = real_md, real_cap
+    screen = "\n".join(body for _, body in shown)
+    assert "Старый шаг" not in screen and "Новый шаг" not in screen
+    assert "<b>исчез</b>" not in screen and "<b>появился</b>" not in screen
+    assert "появилось 1, исчезло 17, изменилось" in screen
+    assert screen.count("<b>исчез") == 0
+    assert "Информационная система" in screen and "<b>изменилась роль</b>" in screen
+    assert f"циклы {cmp_view['loops_before']} → {cmp_view['loops_after']}" in screen
+    assert f"Экономия: {bpmn_app.fmt_hours(cmp_view['saved_hours'])}" in screen
+    shown_parts = [float(m) for m in re.findall(r"</b>: ([+-]\d+\.\d) ч", screen)]
+    assert round(sum(shown_parts), 1) == round(float(cmp_view["saved_hours"]), 1), (shown_parts, cmp_view["saved_hours"])
+
     # 2б. Голый «вернуть на п.N» без «Если»: развилка с исключающим шлюзом, из задачи один выход.
     for bare_text in (
         "Регламент: Короткий\n1. Диспетчер: Принять заявку (2 ч).\n2. Мастер: Проверить комплект (3 ч). Вернуть на п.1.\n"
