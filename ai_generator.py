@@ -44,7 +44,7 @@ import time
 import xml.etree.ElementTree as _ET
 from dataclasses import dataclass, field, replace as _dc_replace
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
 from validate_bpmn import xsd_errors_xml
@@ -3198,6 +3198,9 @@ def compare_asis_tobe(
                 "role_before": old.role, "role_after": new.role,
                 "hours_before": old.hours, "hours_after": new.hours,
                 "role_changed": role_changed, "hours_changed": hours_changed,
+                "title_before": old.title,
+                "became_parallel": bool(new.parallel and not old.parallel),
+                "to_system": bool(role_changed and _compare_key(new.role) == _SYSTEM_ROLE_KEY),
                 "num_before": old.num, "num_after": new.num,
                 "schemes": ["As-Is", "To-Be"],
             }
@@ -5281,6 +5284,13 @@ def assistant_chat(
         ctx = build_process_context(current_text, current_xml, audit, tobe_delta=tobe_delta)
         if not ctx["steps"] and not current_xml:
             return "Активного процесса пока нет: выберите регламент и нажмите «Сгенерировать BPMN 2.0».", None, None, None
+        # Подсвеченные шаги: ответ из сравнения As-Is и To-Be, облако не вызывается.
+        hl = highlight_answer(message, ctx)
+        if hl is not None:
+            return hl, None, None, None
+        # Отмена передачи шага системе: не удаление шага, To-Be пересобирается локально, As-Is не меняется.
+        if is_tobe_revert_request(message):
+            return revert_tobe_transfer(message, current_text, audit, ctx, tobe_delta), None, None, None
         intent = classify_intent(message)
         if intent == "instruction" and not re.search(r"инструкц|памятк|должностн", message, re.I):
             if _visible_answer(message, ctx):
@@ -5906,6 +5916,253 @@ def build_diagram_catalog(xml_str: str, audit_data: dict, regulation_text: str) 
     return catalog
 
 
+def _change_line(row: Dict[str, Any]) -> str:
+    """Одна строка для клика по подсвеченному шагу: роль, срок, «параллельным», «передан системе»."""
+    def hours(value: Any) -> str:
+        return "—" if value is None else _fh(float(value))
+
+    bits: List[str] = []
+    if row.get("role_changed"):
+        bits.append(f"Роль «{row.get('role_before') or '—'}» сменилась на «{row.get('role_after') or '—'}»")
+    if row.get("hours_changed"):
+        bits.append(f"срок {hours(row.get('hours_before'))} → {hours(row.get('hours_after'))}")
+    if row.get("became_parallel"):
+        bits.append("шаг стал параллельным")
+    if row.get("to_system"):
+        bits.append("шаг передан системе")
+    if not bits:
+        return ""
+    first = bits[0]
+    return (first[:1].upper() + first[1:] + ("; " + "; ".join(bits[1:]) if len(bits) > 1 else "") + ".")
+
+
+def _match_catalog_node(
+    catalog: Dict[str, Dict[str, Any]], title: str, role: str, used: set,
+) -> Optional[str]:
+    """Узел каталога холста для шага сравнения: по названию, при равенстве — с той же ролью."""
+    key = _compare_key(_strip_compare_tail(title))
+    cands = [
+        (nid, entry) for nid, entry in catalog.items()
+        if nid not in used and entry.get("kind") in _TASK_TAGS
+    ]
+    role_key = _compare_key(role)
+    exact = [c for c in cands if _compare_key(_strip_compare_tail(c[1].get("name"))) == key]
+    pool = exact or [
+        c for c in cands
+        if _compare_key(c[1].get("role")) == role_key and _sla_title_score(title, str(c[1].get("name") or "")) >= 2
+    ]
+    if not pool:
+        return None
+    pool.sort(key=lambda c: _compare_key(c[1].get("role")) != role_key)
+    return pool[0][0]
+
+
+def mark_changed_steps(
+    catalog_asis: Dict[str, Dict[str, Any]], catalog_tobe: Dict[str, Dict[str, Any]], cmp: Optional[Dict[str, Any]],
+) -> int:
+    """Помечает в каталогах холста шаги, изменившиеся в сравнении (роль, срок или оба).
+
+    «Исчез» и «появился» не помечаются. Схемы не склеиваются: каждая метка стоит на той схеме, где шаг есть.
+    Возвращает число размеченных шагов. Каталоги меняются на месте (changed, change).
+    """
+    if not (cmp or {}).get("ready"):
+        return 0
+    used_asis: set = set()
+    used_tobe: set = set()
+    marked = 0
+    for row in cmp.get("steps") or []:
+        if row.get("kind") != "changed":
+            continue
+        line = _change_line(row)
+        if not line:
+            continue
+        hit = False
+        for catalog, used, title, role in (
+            (catalog_asis, used_asis, row.get("title_before") or row.get("title"), row.get("role_before")),
+            (catalog_tobe, used_tobe, row.get("title"), row.get("role_after")),
+        ):
+            nid = _match_catalog_node(catalog or {}, str(title or ""), str(role or ""), used)
+            if nid:
+                used.add(nid)
+                catalog[nid]["changed"] = True
+                catalog[nid]["change"] = line
+                _drop_delay_claim(catalog[nid], row)
+                hit = True
+        marked += int(hit)
+    return marked
+
+
+def _drop_delay_claim(entry: Dict[str, Any], row: Dict[str, Any]) -> None:
+    """Срок шага стал короче: карточка не пишет, что задержка на нём сдвигает весь срок."""
+    before, after = row.get("hours_before"), row.get("hours_after")
+    if not row.get("hours_changed") or before is None or after is None or float(after) >= float(before):
+        return
+    sentences = re.split(r"(?<=[.!?])\s+", str(entry.get("comment") or "").strip())
+    kept = [s for s in sentences if s and "задержк" not in s.lower()]
+    kept.append(f"Срок шага сокращён: {_fh(float(before))} → {_fh(float(after))}.")
+    entry["comment"] = " ".join(kept)
+
+
+# --------------------------- ответы ассистентов про подсвеченные шаги --------------------------- #
+_HIGHLIGHT_Q_RE = re.compile(
+    r"подсвеч|подсветк|фиолетов|"
+    r"что\s+изменилось\s+в\s+(?:этом\s+|данном\s+|выбранном\s+)?шаг|"
+    r"чем\s+(?:этот\s+)?шаг\s+(?:изменил\w*|отличается)",
+    re.I,
+)
+_HIGHLIGHT_ONE_RE = re.compile(r"этот|выбран|почему|что\s+изменилось", re.I)
+HIGHLIGHT_NONE = "Подсвеченных шагов нет"
+
+
+def _light_catalog(xml_str: str) -> Dict[str, Dict[str, Any]]:
+    """Узлы схемы для сопоставления с шагами сравнения: имя, дорожка, тип (без комментариев карточки)."""
+    if not xml_str:
+        return {}
+    try:
+        struct = parse_bpmn_structure(xml_str)
+    except Exception:  # noqa: BLE001
+        return {}
+    clickable = _TASK_TAGS | _GATE_TAGS | {"startEvent", "endEvent", "subProcess"}
+    out: Dict[str, Dict[str, Any]] = {}
+    for nid, node in (struct.get("nodes") or {}).items():
+        kind = str(node.get("type") or "")
+        if kind not in clickable:
+            continue
+        out[nid] = {
+            "id": nid,
+            "name": str(node.get("name") or "").strip() or kind,
+            "kind": kind,
+            "role": str(node.get("lane") or "").strip() or "—",
+        }
+    return out
+
+
+def highlight_items(ctx: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Шаги, подсвеченные на To-Be: те же, что на холсте, и та же строка, что в фиолетовой карточке."""
+    delta = ctx.get("_tobe_delta") if isinstance(ctx.get("_tobe_delta"), dict) else {}
+    if not (delta.get("tobe_audit") or {}).get("critical_path"):
+        return []
+    cmp = _ctx_compare(ctx)
+    if not cmp.get("ready"):
+        return []
+    cat_asis = _light_catalog(str(ctx.get("_xml") or ""))
+    cat_tobe = _light_catalog(str(delta.get("tobe_xml") or ""))
+    mark_changed_steps(cat_asis, cat_tobe, cmp)
+    return [
+        {"id": nid, "name": str(e.get("name") or ""), "change": str(e.get("change") or "")}
+        for nid, e in cat_tobe.items() if e.get("changed") and e.get("change")
+    ]
+
+
+def highlight_reply(items: List[Dict[str, str]], selected: Optional[Dict[str, Any]] = None, one: bool = False) -> str:
+    """Ответ про подсвеченные шаги. Для одного шага и для списка строка изменения берётся дословно."""
+    if one and selected is not None:
+        if selected.get("changed") and selected.get("change"):
+            return f"**«{selected.get('name')}»**: {selected['change']}"
+        return "Этот шаг не подсвечен"
+    if not items:
+        return HIGHLIGHT_NONE
+    lines = [f"**Подсвечено шагов: {len(items)}.**"]
+    lines += [f"- **«{it['name']}»**: {it['change']}" for it in items]
+    return "\n".join(lines)
+
+
+# --------------------------- отмена передачи шага информационной системе --------------------------- #
+_REVERT_TRANSFER_RE = re.compile(
+    r"(?:убер\w*|отмен\w*|сним\w*|верни\w*)\s+(?:\w+\s+){0,2}?(?:смен\w+\s+рол\w+|передач\w+)|"
+    r"\bне\s+(?:меняй|менять|заменяй|заменять|подменяй|подменять)\s+.{0,60}?\bна\s+(?:информационн\w+\s+)?систем|"
+    r"\bнет\s+таких\s+возможност|"
+    r"\bне\s+(?:передавай|передавать|отдавай|отдавать)\s+.{0,60}?систем|"
+    r"верни\w*\s+(?:\w+\s+){0,2}?(?:прежн|исходн|старую)\w*\s+рол",
+    re.I,
+)
+_TRANSFER_STOP_ROOTS = {"систем", "инфор", "шаг", "роль", "смен", "возмо", "таких", "перед"}
+_ROLE_GENERIC_ROOTS = {"служб", "отдел", "управ", "депар", "групп"}
+
+
+def is_tobe_revert_request(message: str) -> bool:
+    """Просьба отменить передачу шага информационной системе (это не удаление шага)."""
+    return bool(_REVERT_TRANSFER_RE.search(message or ""))
+
+
+def _named_in_message(message: str, role: str, title: str) -> bool:
+    low = (message or "").lower().replace("ё", "е")
+    words = [w for w in re.findall(r"[а-я]+", low) if len(w) >= 5]
+    prefixes = {w[:5] for w in words}
+    role_roots = [
+        w[:5] for w in re.findall(r"[а-я]+", str(role or "").lower().replace("ё", "е"))
+        if len(w) >= 5 and w[:5] not in _ROLE_GENERIC_ROOTS
+    ]
+    if any(r in prefixes for r in role_roots):
+        return True
+    return any(r not in _TRANSFER_STOP_ROOTS for r in _shared_title_roots(message, title))
+
+
+def revert_tobe_transfer(
+    message: str, current_text: str, audit: Dict[str, Any], ctx: Dict[str, Any], delta: Optional[Dict[str, Any]],
+) -> str:
+    """Возвращает шагу прежнюю роль и срок из As-Is: To-Be пересобирается локально, без облака.
+
+    Шаг остаётся в регламенте. Набор отменённых шагов хранится в delta["skip_auto"]; delta обновляется на месте,
+    delta["tobe_rev"] растёт — приложение по нему пересобирает карточку и холст.
+    """
+    if not isinstance(delta, dict) or not delta.get("tobe_text"):
+        return "To-Be ещё не посчитан: передавать шаги системе нечего, шаги остаются как в регламенте."
+    try:
+        parsed_steps = list(parse_regulation(normalize_regulation(current_text or "")).steps)
+        autos, _pairs, _loops = _catalog_tobe_moves(current_text or "")
+    except Exception:  # noqa: BLE001
+        return "Не удалось разобрать регламент: To-Be оставлен без изменений."
+    skipped = {int(i) for i in (delta.get("skip_auto") or [])}
+    cands: List[Dict[str, Any]] = []
+    cmp = _ctx_compare(ctx)
+    for row in (cmp.get("steps") or []) if cmp.get("ready") else []:
+        if row.get("kind") != "changed" or not row.get("to_system"):
+            continue
+        idx = next((i for i, s in enumerate(parsed_steps) if s.num == row.get("num_before")), None)
+        if idx is None or idx not in autos or idx in skipped:
+            continue
+        cands.append({"idx": idx, "title": row.get("title_before") or row.get("title"),
+                      "role": row.get("role_before"), "hours": row.get("hours_before"), "active": True})
+    for idx in sorted(skipped):
+        if 0 <= idx < len(parsed_steps):
+            st_ = parsed_steps[idx]
+            cands.append({"idx": idx, "title": _strip_compare_tail(st_.title), "role": st_.role,
+                          "hours": st_.hours, "active": False})
+    if not cands:
+        return "Передачи шага информационной системе в To-Be нет: возвращать нечего, все шаги в регламенте на месте."
+    named = [c for c in cands if _named_in_message(message, c["role"], c["title"])]
+    chosen = named or cands
+    fresh = [c for c in chosen if c["active"]]
+    if fresh:
+        new_skip = skipped | {c["idx"] for c in fresh}
+        _text, new_delta = optimize_process_to_be(current_text, audit, skip_auto=new_skip)
+        rev = int(delta.get("tobe_rev") or 0) + 1
+        delta.clear()
+        delta.update(new_delta)
+        delta["tobe_rev"] = rev
+    lines = ["**Передачу шага информационной системе отменил.** Шаг остаётся в регламенте, To-Be пересобран локально."]
+    for c in chosen:
+        hours = "срок не указан" if c["hours"] is None else f"срок {_fh(float(c['hours']))}"
+        lines.append(f"- **«{c['title']}»**: роль «{c['role']}», {hours}.")
+    lines.append("Подсветка этой смены снята.")
+    if fresh:
+        facts = process_facts(audit, delta)
+        lines.append(_facts_time_reply({"facts": facts}).splitlines()[0])
+    return "\n".join(lines)
+
+
+def highlight_answer(message: str, ctx: Dict[str, Any], selected_id: Optional[str] = None,
+                     catalog: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Ответ из сравнения As-Is и To-Be без облака; None, если вопрос не про подсветку."""
+    if not _HIGHLIGHT_Q_RE.search(message or ""):
+        return None
+    sel = (catalog or {}).get(selected_id) if selected_id else None
+    if sel is not None and _HIGHLIGHT_ONE_RE.search(message):
+        return highlight_reply([], sel, one=True)
+    return highlight_reply(highlight_items(ctx))
+
+
 def _copilot_node_brief(name: str, role: str, kind: str, ctx: Dict[str, Any]) -> str:
     """До 6 строк: вывод, блок/роль на схеме, одна причина (критический путь или цикл)."""
     f = ctx.get("facts") or {}
@@ -5998,6 +6255,12 @@ def canvas_copilot_reply(
         return "Спросите про блок на схеме, SLA или As-Is/To-Be."
     if _SECRET_ASK_RE.search(msg):
         return CANVAS_REDIRECT
+    hl = highlight_answer(msg, ctx, selected_id, catalog)
+    if hl is not None:
+        return hl
+    if is_tobe_revert_request(msg):
+        cmd = re.sub(r"\s+", " ", msg).strip(" .")
+        return f"Команду в сайдбар: «{cmd}»"
     intent = classify_intent(msg)
     if intent == "edit":
         cmd = re.sub(r"\s+", " ", msg).strip(" .")
@@ -6061,6 +6324,7 @@ def build_canvas_copilot(
             f"Копайлот схемы «{title}»: объясняю то, что на холсте. Правки — в сайдбар."
         ),
         "redirect": CANVAS_REDIRECT,
+        "highlight": highlight_reply(highlight_items(ctx)),
         "fallback": sla_a,
         "compare": compare_a,
         "loops": loops_a,
@@ -6457,6 +6721,7 @@ def _heuristic_optimize_to_be(
     only_parallel: Optional[Set[int]] = None,
     only_loops: Optional[Set[int]] = None,
     only_control: Optional[Set[int]] = None,
+    skip_auto: Optional[Set[int]] = None,
 ) -> Tuple[str, List[Dict[str, str]]]:
     raw_text = normalize_regulation(regulation_text or "")
     header, raw_steps = _split_steps(raw_text)
@@ -6476,6 +6741,8 @@ def _heuristic_optimize_to_be(
     if do_auto:
         for i in range(n):
             if only_auto is not None and i not in only_auto:
+                continue
+            if skip_auto and i in skip_auto:
                 continue
             body = bodies[i]
             if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
@@ -6791,14 +7058,19 @@ def _iter_tobe_selections(
     return selections
 
 
-def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str, dict]:
+def optimize_process_to_be(
+    regulation_text: str, audit_data: dict, skip_auto: Optional[Iterable[int]] = None,
+) -> Tuple[str, dict]:
     """Реинжиниринг As-Is → To-Be: поиск оптимума с откатом ходов, нарушающих ОТ или удлиняющих голый путь.
 
     Лексикография после жёстких ограничений: короче путь с возвратами, затем короче голый КП, затем меньше шагов.
     Сначала считаются прежние наборы классов ходов — это текущий To-Be. Затем перебираются сочетания отдельных ходов.
     Сочетание заменяет текущий To-Be только если оно строго лучше. Если ни один кандидат не принят — возвращается As-Is.
     Облачная LLM включается только переменной BPMN_TOBE_LLM=1 и проходит ту же проверку.
+    skip_auto — номера шагов As-Is (с нуля), которые нельзя передавать информационной системе: шаг остаётся
+    с прежней ролью и сроком. С этим набором облако не вызывается, без него результат прежний.
     """
+    skip: Set[int] = {int(i) for i in (skip_auto or [])}
     text = (regulation_text or "").strip()
     empty = {
         "sla_before_hours": 0.0, "sla_after_hours": 0.0, "sla_saved_hours": 0.0, "sla_saved_pct": 0.0,
@@ -6851,20 +7123,22 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
             best = pack
 
     llm_text = None
-    try:
-        llm_text = _try_llm_optimize_to_be(text, asis_audit)
-    except Exception:  # noqa: BLE001
-        llm_text = None
+    if not skip:
+        try:
+            llm_text = _try_llm_optimize_to_be(text, asis_audit)
+        except Exception:  # noqa: BLE001
+            llm_text = None
     if llm_text:
         _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm")
 
     for flags in flagsets:
-        opt_text, actions = _heuristic_optimize_to_be(text, **flags)
+        opt_text, actions = _heuristic_optimize_to_be(text, **flags, skip_auto=skip)
         if not actions:
             continue
         _consider(opt_text, actions, "semantic-optimizer")
 
     autos, pairs, loops = _catalog_tobe_moves(text)
+    autos = [a for a in autos if a not in skip]
     for auto_idx, pair_idx, loop_idx, ctrl_idx in _iter_tobe_selections(autos, pairs, loops):
         if not (auto_idx or pair_idx or loop_idx or ctrl_idx):
             continue
@@ -6901,6 +7175,8 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
         delta["tobe_audit"] = new_audit or asis_audit
         delta["tobe_error"] = err or ""
         delta["tobe_text"] = optimized
+        if skip:
+            delta["skip_auto"] = sorted(skip)
         return optimized, delta
 
     _score, optimized, actions, xml, new_audit, engine = best
@@ -6912,6 +7188,8 @@ def optimize_process_to_be(regulation_text: str, audit_data: dict) -> Tuple[str,
     delta["tobe_audit"] = new_audit or {}
     delta["tobe_error"] = ""
     delta["tobe_text"] = optimized
+    if skip:
+        delta["skip_auto"] = sorted(skip)
     return optimized, delta
 
 

@@ -1036,6 +1036,195 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
+    # 2е. Подсветка на схеме: только изменившиеся шаги, «исчез» и «появился» не размечаются, по клику одна строка.
+    from ai_generator import build_diagram_catalog, mark_changed_steps
+
+    cat_asis = build_diagram_catalog(cmp_pack["xml"], cmp_asis_audit, cmp_text)
+    cat_tobe = build_diagram_catalog(cmp_pack["tobe_xml"], cmp_pack["tobe_audit"], cmp_pack["tobe_text"])
+    assert mark_changed_steps(cat_asis, cat_tobe, cmp_view) == 1
+    for catalog_side, role_side in ((cat_asis, "Диспетчер"), (cat_tobe, "Информационная система")):
+        marked_nodes = [e for e in catalog_side.values() if e.get("changed")]
+        assert len(marked_nodes) == 1, [e["name"] for e in marked_nodes]
+        assert "Зафиксировать аварию" in marked_nodes[0]["name"] and marked_nodes[0]["role"] == role_side
+        assert marked_nodes[0]["change"] == "Роль «Диспетчер» сменилась на «Информационная система»; шаг передан системе."
+        assert not any("changed" in e or "change" in e for e in catalog_side.values() if e is not marked_nodes[0])
+    synth = {"ready": True, "steps": [
+        {"kind": "removed", "title": "Старый шаг", "role_before": "Мастер", "title_before": "Старый шаг"},
+        {"kind": "added", "title": "Новый шаг", "role_after": "Мастер"},
+    ]}
+    cat_asis2 = build_diagram_catalog(cmp_pack["xml"], cmp_asis_audit, cmp_text)
+    cat_tobe2 = build_diagram_catalog(cmp_pack["tobe_xml"], cmp_pack["tobe_audit"], cmp_pack["tobe_text"])
+    assert mark_changed_steps(cat_asis2, cat_tobe2, synth) == 0
+    assert not any(e.get("changed") for e in [*cat_asis2.values(), *cat_tobe2.values()])
+    # Срок и параллель: строка называет старый и новый срок и тот же текст, что в списке сравнения.
+    from ai_generator import _change_line
+
+    assert _change_line({"hours_changed": True, "hours_before": 2.0, "hours_after": 0.5}) == "Срок 2 ч → 30 мин."
+    assert _change_line({"role_changed": True, "role_before": "А", "role_after": "Б", "hours_changed": True,
+                         "hours_before": 1.0, "hours_after": 2.0, "became_parallel": True}) == (
+        "Роль «А» сменилась на «Б»; срок 1 ч → 2 ч; шаг стал параллельным.")
+    page_marks = bpmn_app.viewer_html(cmp_pack["xml"], 400, cat_asis, {}, xml_tobe=cmp_pack["tobe_xml"], catalog_tobe=cat_tobe)
+    assert "ir-changed" in page_marks and "markChanged()" in page_marks and 'id="t-chg"' in page_marks
+    assert page_marks.count("importXML(") >= 1
+    _css_i = page_marks.index(".djs-element.ir-changed .djs-visual")
+    _css_blk = page_marks[_css_i:page_marks.index("}", _css_i)]
+    assert "stroke-width:3px" in _css_blk and "fill:#F5ECFA" in _css_blk and "non-scaling-stroke" in _css_blk
+    assert "drop-shadow" not in _css_blk
+    # Подсветка и строка про изменение — только на To-Be.
+    assert "if (activeMode !== 'tobe') return;" in page_marks
+    assert "activeMode === 'tobe' && meta.change" in page_marks
+
+    # 2ж. Ассистенты знают подсвеченные шаги: ответ из сравнения, облако не вызывается, холст = сайдбар.
+    import ai_generator as _agen
+    from ai_generator import build_canvas_copilot
+
+    def _no_cloud(*_a, **_k):
+        raise AssertionError("облако вызвано для вопроса про подсвеченные шаги")
+
+    _saved_chat = _agen._chat_llm
+    _agen._chat_llm = _no_cloud
+    try:
+        proc_text = (Path(__file__).parent / "examples" / "example_2_equipment_procurement.txt").read_text(encoding="utf-8")
+        proc_pack = bpmn_app.prepare_regulation(proc_text, use_llm=False)
+        proc_args = (proc_pack["xml"], proc_pack["audit"], proc_text)
+        for hq in ("какие узлы подсвечены фиолетовым", "Какие узлы фиолетовые", "почему подсвечен",
+                   "что изменилось в этом шаге"):
+            side, _t, _x, _a = assistant_chat(hq, [], *proc_args, use_llm=True, tobe_delta=proc_pack["delta"])
+            canv = canvas_copilot_reply(hq, *proc_args, proc_pack["delta"])
+            assert side == canv, (hq, side, canv)
+            assert "Зарегистрировать заявки" in side and "Роль «Закупочная служба» сменилась на «Информационная система»" in side, side
+            assert "120 ч" in side and "→ 5 мин" in side and "шаг передан системе" in side, side
+            assert "нет данных" not in side.lower() and "Подсвеченных шагов нет" not in side, side
+        # Та же строка, что в фиолетовой карточке; пакет холста несёт тот же текст.
+        proc_cat_tb = build_diagram_catalog(proc_pack["tobe_xml"], proc_pack["tobe_audit"], proc_pack["tobe_text"])
+        proc_cat_as = build_diagram_catalog(proc_pack["xml"], proc_pack["audit"], proc_text)
+        proc_cmp = compare_asis_tobe(
+            str(proc_pack["audit"].get("result_text") or proc_text), proc_pack["tobe_text"],
+            proc_pack["audit"], proc_pack["tobe_audit"], proc_pack["facts"])
+        mark_changed_steps(proc_cat_as, proc_cat_tb, proc_cmp)
+        proc_marked = [(k, v) for k, v in proc_cat_tb.items() if v.get("changed")]
+        assert len(proc_marked) == 1 and proc_marked[0][1]["change"] in side
+        assert build_canvas_copilot(*proc_args, proc_pack["delta"])["highlight"] == side
+        # Выбранный шаг: «что изменилось в этом шаге» → строка карточки; обычный шаг → не подсвечен.
+        sel_id = proc_marked[0][0]
+        one = canvas_copilot_reply("что изменилось в этом шаге", *proc_args, proc_pack["delta"], sel_id, proc_cat_tb)
+        assert one == f"**«{proc_marked[0][1]['name']}»**: {proc_marked[0][1]['change']}", one
+        plain_id = next(k for k, v in proc_cat_tb.items() if not v.get("changed") and v.get("kind") in _agen._TASK_TAGS)
+        assert canvas_copilot_reply("почему подсвечен", *proc_args, proc_pack["delta"], plain_id, proc_cat_tb) == "Этот шаг не подсвечен"
+        # Срок стал короче: карточка не пишет, что задержка на шаге сдвигает весь срок.
+        assert "задержка сдвигает" not in proc_marked[0][1]["comment"], proc_marked[0][1]["comment"]
+        assert "Срок шага сокращён" in proc_marked[0][1]["comment"]
+        # Подсвеченных шагов нет: нет To-Be-дельты → одна фраза.
+        no_hl, *_rest = assistant_chat("какие узлы подсвечены", [], *proc_args, use_llm=True)
+        assert no_hl == "Подсвеченных шагов нет", no_hl
+        assert canvas_copilot_reply("какие узлы фиолетовые", *proc_args) == "Подсвеченных шагов нет"
+        # Пример 1: роль «Диспетчер» → «Информационная система», срока в строке нет.
+        ex1_side, *_r1 = assistant_chat("какие узлы подсвечены", [], cmp_pack["xml"], cmp_pack["audit"], cmp_text,
+                                        use_llm=True, tobe_delta=cmp_pack["delta"])
+        assert "Роль «Диспетчер» сменилась на «Информационная система»" in ex1_side and "срок" not in ex1_side, ex1_side
+    finally:
+        _agen._chat_llm = _saved_chat
+    # 2з. Отмена передачи шага системе: шаг остаётся, роль и срок из As-Is, подсветки нет, экономия пересчитана, облака нет.
+    _agen._chat_llm = _no_cloud
+    try:
+        assert "skip_auto" not in proc_pack["delta"] and "tobe_rev" not in proc_pack["delta"]
+        proc_tobe_before = proc_pack["delta"]["tobe_text"]
+        for rq in ("не меняй закупочную службу на информационную систему", "убери смену роли на информационную систему",
+                   "нет таких возможностей", "не передавай этот шаг системе"):
+            assert _agen.is_tobe_revert_request(rq), rq
+            rp = bpmn_app.prepare_regulation(proc_text, use_llm=False)
+            rd = rp["delta"]
+            rargs = (rp["xml"], rp["audit"], proc_text)
+            asked = "какие узлы подсвечены фиолетовым"
+            before_hl, *_b = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
+            assert "заявк" in before_hl and "120 ч (≈ 15 раб. дн.) → 5 мин" in before_hl, before_hl
+            facts_before = _agen.process_facts(rp["audit"], rd)
+            rev_reply, rev_text, rev_xml, rev_audit = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
+            assert rev_text is None and rev_xml is None and rev_audit is None, rq  # As-Is не менялся
+            assert "Не понял" not in rev_reply and "удал" not in rev_reply.lower(), rev_reply
+            assert "заявк" in rev_reply and "«Закупочная служба»" in rev_reply and "120 ч (≈ 15 раб. дн.)" in rev_reply, rev_reply
+            assert "Подсветка этой смены снята" in rev_reply, rev_reply
+            assert rd["skip_auto"] and rd["tobe_rev"] == 1 and rd["tobe_text"] != proc_tobe_before
+            # Шаг остаётся в To-Be с той же ролью и сроком, что в As-Is; смены роли в сравнении нет.
+            assert "заявк" in rd["tobe_text"].lower()
+            assert "Информационная система автоматически регистрирует заявк" not in rd["tobe_text"]
+            hl_after, *_h = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
+            assert hl_after == "Подсвеченных шагов нет", hl_after
+            assert canvas_copilot_reply(asked, *rargs, rd) == "Подсвеченных шагов нет"
+            # Карточка и раскладка экономии пересчитаны: сумма строк равна новой экономии.
+            tuned = bpmn_app.retune_tobe(rp["audit"], rd)
+            assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] != facts_before["rw_after"]
+            tuned_cmp = compare_asis_tobe(
+                str(rp["audit"].get("result_text") or proc_text), tuned["tobe_text"], rp["audit"],
+                tuned["tobe_audit"], tuned["facts"])
+            assert not [r for r in tuned_cmp["steps"] if r.get("to_system")], tuned_cmp["steps"]
+            tn = lambda v: int(round(float(v or 0) * 10))  # noqa: E731
+            assert sum(tn(p_["hours"]) for p_ in tuned_cmp["parts"]) == tn(tuned["facts"]["rw_before"]) - tn(tuned["facts"]["rw_after"])
+            # Повтор той же просьбы на той же сборке: шаг назван снова, To-Be не пересобирается.
+            again, *_a = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
+            assert "заявк" in again and rd["tobe_rev"] == 1, again
+        # Без нужной сборки To-Be и без передачи шагов — понятный ответ, не удаление.
+        nothing, *_n = assistant_chat("нет таких возможностей", [], *proc_args, use_llm=True)
+        assert "To-Be ещё не посчитан" in nothing and "Не понял" not in nothing, nothing
+        # Настоящее удаление шага по-прежнему удаляет шаг.
+        del_reply, del_text, _dx, _da = assistant_chat("Убери шаг 3", [], *proc_args, use_llm=True)
+        assert del_text and "удалён шаг 3" in del_reply, del_reply
+        assert not _agen.is_tobe_revert_request("Убери шаг 3")
+    finally:
+        _agen._chat_llm = _saved_chat
+    # 2и. Кнопка To-Be: активна при принятом To-Be, иначе выключена с одной строкой причины из delta; As-Is не подменяется.
+    _aud = {"sla": {"critical_path_hours": 10.0}}
+    _acc = {"tobe_ready": True, "cp_before": 10.0, "cp_after": 9.0, "loops_before": 2, "loops_after": 0}
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, _acc, "<xml/>") == ""
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, cp_after=12.0), "<xml/>").startswith("Голый путь To-Be длиннее: 10 ч → 12 ч")
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_after=2), "<xml/>").startswith("Циклы возврата не уменьшились: 2 → 2")
+    assert bpmn_app.tobe_unavailable_reason(
+        _aud, {"quality_before": 80, "quality_after": 70}, dict(_acc, tobe_ready=False), "").startswith("Качество To-Be ниже: 80 → 70")
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_before=0, loops_after=0, cp_after=10.0), "").startswith("Ни один ход")
+    assert "не посчитан срок" in bpmn_app.tobe_unavailable_reason({}, {}, {}, "")
+    # Пример 1 без облака: To-Be есть, кнопка активна, причины нет, цифры прежние.
+    assert cmp_pack["tobe_ok"] and not cmp_pack.get("tobe_reason")
+    page_on = bpmn_app.viewer_html(
+        cmp_pack["xml"], 400, {}, {}, xml_tobe=cmp_pack["tobe_xml"], tobe_reason="не должна показываться")
+    assert 'id="tobe-why"' not in page_on and not re.search(r'<button[^>]*id="cv-tobe"[^>]*\bdisabled', page_on)
+    # Оптимизатор ничего не нашёл: To-Be нет, кнопка выключена, под ней одна строка причины.
+    flat_text = ("Рассмотрение заявки\nSLA: 8 часов\n1. Специалист проверяет заявку (1 час).\n"
+                 "2. Специалист утверждает проверенную заявку (1 час).\n3. Специалист направляет заявку заказчику (1 час).\n")
+    flat_pack = bpmn_app.prepare_regulation(flat_text, use_llm=False)
+    assert not flat_pack["tobe_ok"] and not flat_pack["tobe_xml"] and flat_pack["xml"]
+    assert flat_pack["tobe_reason"] == "Ни один ход оптимизации не прошёл проверку.", flat_pack["tobe_reason"]
+    page_off = bpmn_app.viewer_html(flat_pack["xml"], 400, {}, {}, xml_tobe="", tobe_reason=flat_pack["tobe_reason"])
+    assert re.search(r'<button[^>]*id="cv-tobe"[^>]*\bdisabled', page_off)
+    assert f'id="tobe-why">{flat_pack["tobe_reason"]}</div>' in page_off
+    # Нет SLA (облачный As-Is без расчёта): ensure_tobe_pack не пересобирает схему и не подменяет As-Is эмулятором.
+    _st = bpmn_app.st
+    _saved_prepare = bpmn_app.prepare_regulation
+    _saved_ss = dict(_st.session_state)
+
+    def _no_prepare(*_a, **_k):
+        raise AssertionError("prepare_regulation вызван при отсутствии sla")
+
+    bpmn_app.prepare_regulation = _no_prepare
+    try:
+        cloud_xml = flat_pack["xml"]
+        _st.session_state["result"] = {"xml": cloud_xml, "audit": {"stats": {}}, "error": ""}
+        _st.session_state["reg_text"] = flat_text
+        _st.session_state.pop("tobe_pack", None)
+        no_sla_pack = bpmn_app.ensure_tobe_pack()
+        assert no_sla_pack and not no_sla_pack["tobe_ok"] and not no_sla_pack["xml"]
+        assert "не посчитан срок" in no_sla_pack["reason"], no_sla_pack["reason"]
+        assert _st.session_state["result"]["xml"] == cloud_xml and _st.session_state["result"]["audit"] == {"stats": {}}
+        assert bpmn_app.ensure_tobe_pack() is no_sla_pack  # повторный вызов берёт сохранённое
+    finally:
+        bpmn_app.prepare_regulation = _saved_prepare
+        _st.session_state.clear()
+        _st.session_state.update(_saved_ss)
+
+    # Страница холста отдаёт тот же ответ: ключ highlight в пакете и правило в JS.
+    page_hl = bpmn_app.viewer_html(cmp_pack["xml"], 400, cat_asis, build_canvas_copilot(
+        cmp_pack["xml"], cmp_pack["audit"], cmp_text, cmp_pack["delta"]), xml_tobe=cmp_pack["tobe_xml"], catalog_tobe=cat_tobe)
+    assert "COPILOT.highlight" in page_hl and "подсвеч" in page_hl
+
     # 2д. Четыре строки экономии: пересчёт пути без хода, обрезка остатком, сумма равна карточке в десятых.
     part_h = {p["kind"]: p["hours"] for p in cmp_view["parts"]}
     assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "rest"]
