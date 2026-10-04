@@ -42,7 +42,7 @@ import signal
 import threading
 import time
 import xml.etree.ElementTree as _ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
@@ -2995,6 +2995,30 @@ def _compare_key(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
+_COMPARE_TAIL_RE = re.compile(
+    r"\s*[,;.—–-]?\s*(?:\bиначе\b.*|\bвернуть(?:ся)?\s+на\s+(?:п(?:ункт)?\.?\s*)?\d+.*)$",
+    re.I | re.S,
+)
+
+
+def _strip_compare_tail(title: Optional[str]) -> str:
+    """Название без хвоста «, иначе «…»» и «вернуть на п.N»: в сравнении шаг — это его действие."""
+    text = str(title or "").strip()
+    head = _COMPARE_TAIL_RE.sub("", text).rstrip(" .;,:—–-")
+    return head if head else text
+
+
+def _is_title_prefix(left: str, right: str) -> bool:
+    """Одно название — начало другого по границе слова, общая часть от двух слов. Равные названия сюда не попадают."""
+    a, b = _compare_key(left), _compare_key(right)
+    if not a or not b or a == b:
+        return False
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    if len(re.findall(r"\w+", short)) < 2:
+        return False
+    return long_.startswith(short) and long_[len(short)] in " ,;.:—–-"
+
+
 def _compare_hours_equal(left: Optional[float], right: Optional[float]) -> bool:
     if left is None or right is None:
         return left is None and right is None
@@ -3048,9 +3072,11 @@ def compare_asis_tobe(
 
     def _steps(text: str) -> List[Step]:
         try:
-            return list(parse_regulation(normalize_regulation(text or "")).steps)
+            parsed = list(parse_regulation(normalize_regulation(text or "")).steps)
         except Exception:  # noqa: BLE001
             return []
+        # Перед сопоставлением у названия отрезаются хвосты «иначе …» и «вернуть на п.N».
+        return [_dc_replace(s, title=_strip_compare_tail(s.title)) for s in parsed]
 
     before, after = _steps(asis_text), _steps(tobe_text)
     pair_key = lambda s: (_compare_key(s.role), _compare_key(s.title))  # noqa: E731
@@ -3073,6 +3099,17 @@ def compare_asis_tobe(
             pairs.append((i, hit))
             right_free.discard(hit)
     left_free -= {i for i, _ in pairs}
+    # Одна роль, и одно название — начало другого («Принять сообщение» / «Принять сообщение об аварии»): один шаг.
+    prefix_pairs = []
+    for i in left_free:
+        for j in right_free:
+            if _compare_key(before[i].role) == _compare_key(after[j].role) and _is_title_prefix(before[i].title, after[j].title):
+                prefix_pairs.append((abs(i - j), i, j))
+    for _, i, j in sorted(prefix_pairs):
+        if i in left_free and j in right_free:
+            pairs.append((i, j))
+            left_free.discard(i)
+            right_free.discard(j)
     # Третье правило: шаг переименован при передаче системе. Пара — только если роль To-Be «Информационная система»,
     # роль As-Is другая и в названиях минимум два общих корня от 5 букв. Один шаг входит только в одну пару.
     candidates = []

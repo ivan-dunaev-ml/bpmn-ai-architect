@@ -1036,6 +1036,58 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
+    # 2г. Один шаг — одна строка: хвосты «иначе …» и «вернуть на п.N» отрезаются, начало названия — та же пара.
+    assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 1}, cmp_view["counts"]
+    assert round(float(cmp_view["saved_hours"]), 1) == 3.0
+
+    def _pair_view(before_steps: str, after_steps: str) -> dict:
+        return compare_asis_tobe(
+            "Регламент: Пары\n" + before_steps, "Регламент: Пары\n" + after_steps, {}, {}, same_facts)
+
+    pre_view = _pair_view(
+        "1. Диспетчер: Принять сообщение (1 ч).\n2. Мастер: Подписать акт (1 ч).\n",
+        "1. Диспетчер: Принять сообщение об аварийном отключении (2 ч).\n2. Мастер: Подписать акт (1 ч).\n",
+    )
+    assert pre_view["counts"] == {"added": 0, "removed": 0, "changed": 1}, pre_view["steps"]
+    assert [r["kind"] for r in pre_view["steps"]] == ["changed"]
+    tail_view = _pair_view(
+        "1. Диспетчер: Принять заявку (1 ч).\n"
+        "2. Мастер: Проверить наряд-допуск (1 ч). Если замечания, иначе «Замечания» — вернуть на п.1.\n",
+        "1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Проверить наряд-допуск (1 ч).\n",
+    )
+    assert tail_view["counts"] == {"added": 0, "removed": 0, "changed": 0}, tail_view["steps"]
+    from ai_generator import _strip_compare_tail
+
+    assert _strip_compare_tail("Проверить наряд-допуск, иначе «Замечания»") == "Проверить наряд-допуск"
+    assert _strip_compare_tail("Проверить комплект документов, вернуть на п.1") == "Проверить комплект документов"
+    tail_pair = _pair_view(
+        "1. Мастер: Проверить наряд-допуск, иначе «Замечания» (1 ч).\n",
+        "1. Мастер: Проверить наряд-допуск (3 ч).\n",
+    )
+    assert tail_pair["counts"] == {"added": 0, "removed": 0, "changed": 1}, tail_pair["steps"]
+    # Общая часть названия — минимум два слова: «Согласовать» и «Согласовать договор» парой не становятся.
+    one_word = _pair_view(
+        "1. Менеджер: Согласовать (1 ч).\n", "1. Менеджер: Согласовать договор (1 ч).\n")
+    assert one_word["counts"] == {"added": 1, "removed": 1, "changed": 0}, one_word["steps"]
+    assert {r["kind"]: r["title"] for r in one_word["steps"]} == {"removed": "Согласовать", "added": "Согласовать договор"}
+    # Другая роль — не пара; новый шаг остаётся «появился», пропавший — «исчез»; один шаг — одна пара.
+    other_role = _pair_view(
+        "1. Диспетчер: Принять сообщение (1 ч).\n", "1. Мастер: Принять сообщение об аварии (1 ч).\n")
+    assert other_role["counts"] == {"added": 1, "removed": 1, "changed": 0}, other_role["steps"]
+    gone_new = _pair_view(
+        "1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Старый шаг (1 ч).\n",
+        "1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Новый шаг (1 ч).\n",
+    )
+    assert gone_new["counts"] == {"added": 1, "removed": 1, "changed": 0}
+    assert {r["kind"]: r["title"] for r in gone_new["steps"]} == {"removed": "Старый шаг", "added": "Новый шаг"}
+    one_to_one = _pair_view(
+        "1. Диспетчер: Принять сообщение (1 ч).\n",
+        "1. Диспетчер: Принять сообщение об аварии (2 ч).\n2. Диспетчер: Принять сообщение об отключении (2 ч).\n",
+    )
+    assert one_to_one["counts"]["changed"] == 1 and one_to_one["counts"]["added"] == 1, one_to_one["steps"]
+    assert one_to_one["counts"]["removed"] == 0
+    assert sum(tenths(p["hours"]) for p in pre_view["parts"]) == tenths(same_facts["rw_before"] - same_facts["rw_after"])
+
     # 2в. Экран сравнения: шаги «исчез» и «появился» построчно не выводятся, только числа в подписи.
     shown: list = []
     real_md, real_cap = bpmn_app.st.markdown, bpmn_app.st.caption
