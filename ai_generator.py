@@ -225,8 +225,8 @@ def _insert_missing_gateways(diagram: BPMNDiagramBuilder) -> List[str]:
 
     Частая ошибка LLM на сложных регламентах: «Анализировать телеметрию» сразу ведёт в две
     задачи с подписями условий. Это не повод отбрасывать весь ответ и падать в эмулятор:
-    подписанные ветки → exclusive-шлюз (вопрос — по подписи первой ветки), без подписей →
-    parallel-шлюз. Смысл модели сохраняется, схема становится корректной.
+    все ветки подписаны → exclusive-шлюз (вопрос — по подписи первой ветки). Ветки без подписей
+    не трогаем: развилку от параллели не отличить, ответ уходит на исправление модели.
     """
     actions: List[str] = []
     subprocess_ids = {n.id for n in diagram.nodes.values() if n.kind == "subProcess"}
@@ -237,14 +237,14 @@ def _insert_missing_gateways(diagram: BPMNDiagramBuilder) -> List[str]:
         if len({l.target_id for l in outs}) < 2:
             continue
         labels = [l.condition_name.strip() for l in outs if l.condition_name.strip()]
+        if len(labels) < len(outs):
+            # Без подписей нельзя понять, развилка это или параллель (а параллель без слияния
+            # выполнит общий шаг дважды) — не угадываем, ответ уходит на исправление модели.
+            continue
         parent = node.owner_id if node.owner_id in subprocess_ids else (node.lane_id or node.owner_id)
-        if labels:
-            question = labels[0].rstrip("?.! ") + "?"
-            gw = diagram.add_exclusive_gateway(question[:70], parent)
-            kind = "шлюз-развилка"
-        else:
-            gw = diagram.add_parallel_gateway("Параллельно", parent)
-            kind = "параллельный шлюз"
+        question = labels[0].rstrip("?.! ") + "?"
+        gw = diagram.add_exclusive_gateway(question[:70], parent)
+        kind = "шлюз-развилка"
         for link in outs:
             link.source_id = gw
         diagram.add_link(node.id, gw)
