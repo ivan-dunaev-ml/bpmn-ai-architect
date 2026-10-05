@@ -130,14 +130,43 @@ def _audit_cache_slice(audit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-@st.cache_data(show_spinner=False)
+class _SkipBpmnCache(Exception):
+    """Исключение, чтобы Streamlit не клал фолбэк LLM в кэш."""
+
+    def __init__(self, payload: Tuple[str, Dict[str, Any], str]) -> None:
+        super().__init__("skip-bpmn-cache")
+        self.payload = payload
+
+
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
+def _cached_local_generate_bpmn(text_hash: str, text: str) -> Tuple[str, Dict[str, Any], str]:
+    _ = text_hash
+    return generate_bpmn_from_text(text, use_llm=False)
+
+
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
+def _cached_llm_generate_bpmn(text_hash: str, text: str) -> Tuple[str, Dict[str, Any], str]:
+    """Кэш только успешного ответа облака. Фолбэк/эмулятор — исключение, в кэш не попадает."""
+    _ = text_hash
+    xml, audit, err = generate_bpmn_from_text(text, use_llm=True)
+    gen = (audit or {}).get("generation") or {}
+    engine = str(gen.get("engine") or "")
+    if err or gen.get("fallback") or "emulator" in engine.lower():
+        raise _SkipBpmnCache((xml, audit, err))
+    return xml, audit, err
+
+
 def cached_generate_bpmn(text_hash: str, text: str, use_llm: bool) -> Tuple[str, Dict[str, Any], str]:
     """Генерация XML + аудит. Кэш v7: не отдаёт прошлую схему с другим числом обратных рёбер."""
-    _ = text_hash
-    return generate_bpmn_from_text(text, use_llm=use_llm)
+    if not use_llm:
+        return _cached_local_generate_bpmn(text_hash, text)
+    try:
+        return _cached_llm_generate_bpmn(text_hash, text)
+    except _SkipBpmnCache as skip:
+        return skip.payload
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
 def cached_optimize_to_be(text_hash: str, text: str, asis_core: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """To-Be по хешу регламента и числу рёбер этой сборки. Прошлый delta с другим числом петель не берётся."""
     _ = text_hash
@@ -1560,10 +1589,12 @@ def render_audit(audit: Dict[str, Any]) -> None:
         sla_color, sla_pill = BAD, "Риск срыва SLA"
     elif float(sla["rework_share"]) > 0.25:
         sla_color, sla_pill = WARN, "Возвраты съедают запас"
+    elif target in (None, ""):
+        sla_color, sla_pill = BLUE, "Цель SLA не задана"
     else:
         sla_color, sla_pill = OK, "В пределах SLA"
     sla_value = fmt_hours(base_h) if base_h < 48 else fmt_days(base_h)
-    sla_sub = f"{stats['critical_path_layers']} слоёв согласования"
+    sla_sub = f"{stats['critical_path_layers']} этапов схемы"
     if target:
         sla_sub += f" · цель {fmt_hours(float(target)) if float(target) < 48 else fmt_days(float(target))}"
     rework_value = fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)
@@ -1606,6 +1637,13 @@ def render_audit(audit: Dict[str, Any]) -> None:
         ),
         unsafe_allow_html=True,
     )
+    if audit.get("sla_hours_note"):
+        note = str(audit["sla_hours_note"])
+        if audit.get("sla_hours_approximate"):
+            note += " Итоговые часы ориентировочные."
+        st.caption(note)
+    if audit.get("sla_month_ignored"):
+        st.caption("срок в месяцах не учтён")
 
     st.write("")
     render_load_and_path(audit)
@@ -2532,7 +2570,10 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             note = ""
             if gen.get("fallback") and engine == "semantic-emulator":
                 reasons = gen.get("trace") or ["LLM недоступна"]
-                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in reasons)
+                if any("лимит облачной модели" in str(r).lower() for r in reasons):
+                    st.info("Лимит облачной модели исчерпан, схема построена локально")
+                safe = [r for r in reasons if "Traceback" not in str(r) and 'File "' not in str(r)]
+                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in safe)
             elif gen.get("attempts", 1) > 1:
                 note = f" · исправлено со {gen['attempts']}-й попытки"
             xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
@@ -2630,7 +2671,7 @@ def render_diagram(canvas_height: int) -> None:
     if not result:
         st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
     elif result["error"]:
-        st.error(result["error"])
+        st.error(str(result["error"]).splitlines()[0][:300])
     else:
         pack = ensure_tobe_pack()
         if pack and pack.get("error") and not pack.get("xml"):
