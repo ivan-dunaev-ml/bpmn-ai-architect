@@ -380,6 +380,11 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
 
     for step in steps:
         title = step.title or ""
+        # Срок уже стоит на узле с более точным названием: на соседний шаг с общим словом его не переносят.
+        placed = max(
+            (_sla_title_score(title, n.name or "") for n in work if not _sla_looks_default(n)),
+            default=0,
+        )
         best, score = None, 0
         for node in work:
             if not _free(node):
@@ -387,7 +392,7 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
             sc = _sla_title_score(title, node.name or "")
             if sc > score:
                 best, score = node, sc
-        if best is not None and score >= 1:
+        if best is not None and score >= 1 and score > placed:
             best.sla_hours = float(step.hours)
             best.sla_source = "regulation"
             used_nodes.add(best.id)

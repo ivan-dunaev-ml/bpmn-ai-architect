@@ -1640,6 +1640,35 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     assert not err_m and xml_m and audit_m.get("sla_month_ignored")
     note_m = str(audit_m.get("sla_hours_note") or "")
     assert "Срок указан в регламенте у" in note_m and " из " in note_m and "по умолчанию" in note_m
+    src_text = (
+        "Регламент: источник часов\n"
+        "1. Диспетчер принимает заявку.\n"
+        "2. Мастер закрывает заявку (5 часов).\n"
+    )
+    from bpmn_framework import WORK_KINDS
+    from bpmn_framework import BPMNDiagramBuilder as _Builder
+
+    held_src: list = []
+    orig_analyze = _Builder.analyze_bottlenecks
+
+    def _hold_analyze(self, *args, **kwargs):
+        held_src.append(self)
+        return orig_analyze(self, *args, **kwargs)
+
+    _Builder.analyze_bottlenecks = _hold_analyze
+    try:
+        _xml_src, audit_src, err_src = generate_bpmn_from_text(src_text, use_llm=False)
+    finally:
+        _Builder.analyze_bottlenecks = orig_analyze
+    assert not err_src and held_src
+    work_src = [n for n in held_src[-1].nodes.values() if n.kind in WORK_KINDS]
+    bare_src = next(n for n in work_src if "принять заявку" in (n.name or "").lower())
+    assert bare_src.sla_source == "default", (bare_src.name, bare_src.sla_hours, bare_src.sla_source)
+    held_src[-1].set_sla(bare_src.id, 5)
+    assert bare_src.sla_hours == 5 and bare_src.sla_source == "regulation"
+    note_src = str(audit_src.get("sla_hours_note") or "")
+    n_reg_src = sum(1 for n in work_src if getattr(n, "sla_source", None) == "regulation")
+    assert f"у {n_reg_src - 1} из {len(work_src)}" in note_src, (note_src, n_reg_src, len(work_src))
     assert opened["audit"]["sla"]["critical_path_hours"] == 9.7
     assert opened["audit"]["sla"]["with_rework_hours"] == 12.55
     assert "Срок указан в регламенте у" in str(opened["audit"].get("sla_hours_note") or "")
