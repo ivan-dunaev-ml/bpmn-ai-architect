@@ -7188,6 +7188,39 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
     }
 
 
+def _auto_move_changes_task(text: str, index: int) -> bool:
+    """Ход автоматизации остаётся, если узел стал scriptTask или срок шага изменился.
+
+    Смена только дорожки при том же userTask и том же сроке в принятый набор не входит.
+    Новый короткий срок здесь не подставляется.
+    """
+    try:
+        before = parse_regulation(normalize_regulation(text))
+    except Exception:  # noqa: BLE001
+        return False
+    if index < 0 or index >= len(before.steps):
+        return False
+    cand, actions = _heuristic_optimize_to_be(
+        text,
+        do_auto=True, do_parallel=False, do_safety=False, do_loops=False, do_control=False,
+        only_auto={index},
+    )
+    if not actions:
+        return False
+    try:
+        after = parse_regulation(normalize_regulation(cand))
+    except Exception:  # noqa: BLE001
+        return False
+    old = before.steps[index]
+    new = next((s for s in after.steps if s.num == old.num), None)
+    if new is None:
+        return False
+    became_script = bool(new.system) and not bool(old.system)
+    old_h = None if old.hours is None else round(float(old.hours), 3)
+    new_h = None if new.hours is None else round(float(new.hours), 3)
+    return became_script or old_h != new_h
+
+
 def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], List[int]]:
     """Индексы отдельных ходов: автоматизация, соседняя параллель, снятие цикла."""
     raw_text = normalize_regulation(regulation_text or "")
@@ -7364,6 +7397,14 @@ def _measure_isolated_moves(
     n = len(units)
     if n == 0:
         return []
+    if n > 12:
+        return [{
+            "kind": "stopped",
+            "index": -1,
+            "path_hours": 0.0,
+            "premium_hours": 0.0,
+            "note": "Принятых ходов больше 12, перебор сочетаний не запущен.",
+        }]
 
     def _metrics(mask: int) -> Tuple[float, float]:
         if mask == 0:
@@ -7545,6 +7586,9 @@ def optimize_process_to_be(
 
     autos_all, pairs_all, loops_all = _catalog_tobe_moves(text)
     autos_all = [a for a in autos_all if a not in skip]
+    idle_auto = {a for a in autos_all if not _auto_move_changes_task(text, a)}
+    autos_all = [a for a in autos_all if a not in idle_auto]
+    search_skip = set(skip) | idle_auto
 
     def _spec_of(flags: Dict[str, bool]) -> Dict[str, Set[int]]:
         return {
@@ -7555,13 +7599,13 @@ def optimize_process_to_be(
         }
 
     for flags in flagsets:
-        opt_text, actions = _heuristic_optimize_to_be(text, **flags, skip_auto=skip)
+        opt_text, actions = _heuristic_optimize_to_be(text, **flags, skip_auto=search_skip)
         if not actions:
             continue
         _consider(opt_text, actions, "semantic-optimizer", _spec_of(flags))
 
     autos, pairs, loops = _catalog_tobe_moves(text)
-    autos = [a for a in autos if a not in skip]
+    autos = [a for a in autos if a not in search_skip]
     for auto_idx, pair_idx, loop_idx, ctrl_idx in _iter_tobe_selections(autos, pairs, loops):
         if not (auto_idx or pair_idx or loop_idx or ctrl_idx):
             continue
@@ -7622,8 +7666,11 @@ def optimize_process_to_be(
     delta["tobe_error"] = ""
     delta["tobe_text"] = optimized
     delta["move_hours"] = _measure_isolated_moves(
-        text, float(base_m["cp"]), float(base_m["rw"]), move_spec or {}, skip,
+        text, float(base_m["cp"]), float(base_m["rw"]), move_spec or {}, search_skip,
     )
+    if any(row.get("kind") == "stopped" for row in delta["move_hours"]):
+        delta["tobe_error"] = str(delta["move_hours"][0].get("note") or "")
+        delta["move_hours"] = []
     return _finish(delta, optimized)
 
 

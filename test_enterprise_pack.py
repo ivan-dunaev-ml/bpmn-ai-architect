@@ -190,7 +190,7 @@ def main() -> None:
     assert "Параллелизац" in why or "параллел" in why.lower()
     assert "scriptTask" in why or "Автоматизац" in why
     qual = heuristic_analysis("Почему упал Quality Score?", ctx_p)
-    assert "100%" in qual
+    assert "62 → 62" in qual and "не изменилась" in qual, qual
     assert "метро" not in qual.lower()
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
@@ -1079,15 +1079,13 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     dup_view = compare_asis_tobe(ren_before, dup_after, {}, {}, ren_facts)
     dup_kinds = [r["kind"] for r in dup_view["steps"] if "латеж" in r["title"] and r["role_after"] == "Информационная система"]
     assert sorted(dup_kinds) == ["added", "changed"], dup_view["steps"]
-    # Закупка: шаг сменил роль на «Информационная система» и сохранил предмет в названии — одна строка.
+    # Закупка: ход журнала не сменил тип и срок, дорожка «Закупочная служба» остаётся, автоматизация 0.
     proc_ctx = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
     proc_cmp = _ctx_compare(proc_ctx)
-    reg_rows = [r for r in proc_cmp["steps"] if "заявки участников" in r["title"]]
-    assert len(reg_rows) == 1 and reg_rows[0]["kind"] == "changed", proc_cmp["steps"]
-    assert reg_rows[0]["role_after"] == "Информационная система" and "роль" in reg_rows[0]["label"]
+    assert not any(r.get("to_system") for r in proc_cmp["steps"]), proc_cmp["steps"]
     assert proc_cmp["counts"]["removed"] == 0 and proc_cmp["counts"]["added"] == 0
     proc_auto = next(p for p in proc_cmp["parts"] if p["kind"] == "automation")
-    assert reg_rows[0]["hours_after"] == reg_rows[0]["hours_before"] and proc_auto["hours"] == 0.0
+    assert proc_auto["hours"] == 0.0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
     # 2е. Подсветка на схеме: только изменившиеся шаги, «исчез» и «появился» не размечаются, по клику одна строка.
@@ -1095,13 +1093,8 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
 
     cat_asis = build_diagram_catalog(cmp_pack["xml"], cmp_asis_audit, cmp_text)
     cat_tobe = build_diagram_catalog(cmp_pack["tobe_xml"], cmp_pack["tobe_audit"], cmp_pack["tobe_text"])
-    assert mark_changed_steps(cat_asis, cat_tobe, cmp_view) == 1
-    for catalog_side, role_side in ((cat_asis, "Диспетчер"), (cat_tobe, "Информационная система")):
-        marked_nodes = [e for e in catalog_side.values() if e.get("changed")]
-        assert len(marked_nodes) == 1, [e["name"] for e in marked_nodes]
-        assert "Зафиксировать аварию" in marked_nodes[0]["name"] and marked_nodes[0]["role"] == role_side
-        assert marked_nodes[0]["change"] == "Роль «Диспетчер» сменилась на «Информационная система»; шаг передан системе."
-        assert not any("changed" in e or "change" in e for e in catalog_side.values() if e is not marked_nodes[0])
+    assert mark_changed_steps(cat_asis, cat_tobe, cmp_view) == 0
+    assert not any(e.get("changed") for e in [*cat_asis.values(), *cat_tobe.values()])
     synth = {"ready": True, "steps": [
         {"kind": "removed", "title": "Старый шаг", "role_before": "Мастер", "title_before": "Старый шаг"},
         {"kind": "added", "title": "Новый шаг", "role_after": "Мастер"},
@@ -1145,39 +1138,20 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
                    "что изменилось в этом шаге"):
             side, _t, _x, _a = assistant_chat(hq, [], *proc_args, use_llm=True, tobe_delta=proc_pack["delta"])
             canv = canvas_copilot_reply(hq, *proc_args, proc_pack["delta"])
-            assert side == canv, (hq, side, canv)
-            assert "Зарегистрировать заявки" in side and "Роль «Закупочная служба» сменилась на «Информационная система»" in side, side
-            assert "шаг передан системе" in side and "5 мин" not in side and "120 ч" not in side, side
-            assert "нет данных" not in side.lower() and "Подсвеченных шагов нет" not in side, side
-        # Та же строка, что в фиолетовой карточке; пакет холста несёт тот же текст.
+            assert side == canv and side == "Подсвеченных шагов нет", (hq, side, canv)
+        assert build_canvas_copilot(*proc_args, proc_pack["delta"])["highlight"] == "Подсвеченных шагов нет"
         proc_cat_tb = build_diagram_catalog(proc_pack["tobe_xml"], proc_pack["tobe_audit"], proc_pack["tobe_text"])
-        proc_cat_as = build_diagram_catalog(proc_pack["xml"], proc_pack["audit"], proc_text)
-        proc_cmp = compare_asis_tobe(
-            str(proc_pack["audit"].get("result_text") or proc_text), proc_pack["tobe_text"],
-            proc_pack["audit"], proc_pack["tobe_audit"], proc_pack["facts"])
-        mark_changed_steps(proc_cat_as, proc_cat_tb, proc_cmp)
-        proc_marked = [(k, v) for k, v in proc_cat_tb.items() if v.get("changed")]
-        assert len(proc_marked) == 1 and proc_marked[0][1]["change"] in side
-        assert build_canvas_copilot(*proc_args, proc_pack["delta"])["highlight"] == side
-        # Выбранный шаг: «что изменилось в этом шаге» → строка карточки; обычный шаг → не подсвечен.
-        sel_id = proc_marked[0][0]
-        one = canvas_copilot_reply("что изменилось в этом шаге", *proc_args, proc_pack["delta"], sel_id, proc_cat_tb)
-        assert one == f"**«{proc_marked[0][1]['name']}»**: {proc_marked[0][1]['change']}", one
-        plain_id = next(k for k, v in proc_cat_tb.items() if not v.get("changed") and v.get("kind") in _agen._TASK_TAGS)
+        plain_id = next(k for k, v in proc_cat_tb.items() if v.get("kind") in _agen._TASK_TAGS)
         assert canvas_copilot_reply("почему подсвечен", *proc_args, proc_pack["delta"], plain_id, proc_cat_tb) == "Этот шаг не подсвечен"
-        # Срок из регламента на шаге тот же: карточка не пишет, что срок сокращён.
-        assert "Срок шага сокращён" not in proc_marked[0][1]["comment"], proc_marked[0][1]["comment"]
         shortened = {"comment": "Узел на критическом пути: задержка сдвигает весь срок."}
         _agen._drop_delay_claim(shortened, {"hours_changed": True, "hours_before": 120.0, "hours_after": 0.083})
         assert "задержка" not in shortened["comment"].lower() and "Срок шага сокращён" in shortened["comment"]
-        # Подсвеченных шагов нет: нет To-Be-дельты → одна фраза.
         no_hl, *_rest = assistant_chat("какие узлы подсвечены", [], *proc_args, use_llm=True)
         assert no_hl == "Подсвеченных шагов нет", no_hl
         assert canvas_copilot_reply("какие узлы фиолетовые", *proc_args) == "Подсвеченных шагов нет"
-        # Пример 1: роль «Диспетчер» → «Информационная система», срока в строке нет.
         ex1_side, *_r1 = assistant_chat("какие узлы подсвечены", [], cmp_pack["xml"], cmp_pack["audit"], cmp_text,
                                         use_llm=True, tobe_delta=cmp_pack["delta"])
-        assert "Роль «Диспетчер» сменилась на «Информационная система»" in ex1_side and "срок" not in ex1_side, ex1_side
+        assert ex1_side == "Подсвеченных шагов нет", ex1_side
     finally:
         _agen._chat_llm = _saved_chat
     # 2з. Отмена передачи шага системе: шаг остаётся, роль и срок из As-Is, подсветки нет, экономия пересчитана, облака нет.
@@ -1193,21 +1167,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             rargs = (rp["xml"], rp["audit"], proc_text)
             asked = "какие узлы подсвечены фиолетовым"
             before_hl, *_b = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert "заявк" in before_hl and "шаг передан системе" in before_hl and "5 мин" not in before_hl, before_hl
+            assert before_hl == "Подсвеченных шагов нет", before_hl
             facts_before = _agen.process_facts(rp["audit"], rd)
             rev_reply, rev_text, rev_xml, rev_audit = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert rev_text is None and rev_xml is None and rev_audit is None, rq  # As-Is не менялся
-            assert "Не понял" not in rev_reply and "удал" not in rev_reply.lower(), rev_reply
-            assert "заявк" in rev_reply and "«Закупочная служба»" in rev_reply and "120 ч (≈ 15 раб. дн.)" in rev_reply, rev_reply
-            assert "Подсветка этой смены снята" in rev_reply, rev_reply
-            assert rd["skip_auto"] and rd["tobe_rev"] == 1 and rd["tobe_text"] != proc_tobe_before
-            # Шаг остаётся в To-Be с той же ролью и сроком, что в As-Is; смены роли в сравнении нет.
+            assert rev_text is None and rev_xml is None and rev_audit is None, rq
+            assert "возвращать нечего" in rev_reply and "Не понял" not in rev_reply, rev_reply
+            assert "skip_auto" not in rd and "tobe_rev" not in rd and rd["tobe_text"] == proc_tobe_before
             assert "заявк" in rd["tobe_text"].lower()
             assert "Информационная система автоматически регистрирует заявк" not in rd["tobe_text"]
             hl_after, *_h = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
             assert hl_after == "Подсвеченных шагов нет", hl_after
             assert canvas_copilot_reply(asked, *rargs, rd) == "Подсвеченных шагов нет"
-            # Карточка и раскладка экономии пересчитаны: сумма строк равна новой экономии.
             tuned = bpmn_app.retune_tobe(rp["audit"], rd)
             assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] == facts_before["rw_after"]
             tuned_cmp = compare_asis_tobe(
@@ -1216,9 +1186,8 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             assert not [r for r in tuned_cmp["steps"] if r.get("to_system")], tuned_cmp["steps"]
             tn = lambda v: int(round(float(v or 0) * 10))  # noqa: E731
             assert sum(tn(p_["hours"]) for p_ in tuned_cmp["parts"]) == tn(tuned["facts"]["rw_before"]) - tn(tuned["facts"]["rw_after"])
-            # Повтор той же просьбы на той же сборке: шаг назван снова, To-Be не пересобирается.
             again, *_a = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert "заявк" in again and rd["tobe_rev"] == 1, again
+            assert "возвращать нечего" in again and "tobe_rev" not in rd, again
         # Без нужной сборки To-Be и без передачи шагов — понятный ответ, не удаление.
         nothing, *_n = assistant_chat("нет таких возможностей", [], *proc_args, use_llm=True)
         assert "To-Be ещё не посчитан" in nothing and "Не понял" not in nothing, nothing
@@ -1316,7 +1285,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert {p["kind"]: p["hours"] for p in short_view["parts"]}["automation"] == 0.0
 
     # 2г. Один шаг — одна строка: хвосты «иначе …» и «вернуть на п.N» отрезаются, начало названия — та же пара.
-    assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 1}, cmp_view["counts"]
+    assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 0}, cmp_view["counts"]
     assert round(float(cmp_view["saved_hours"]), 1) == 3.0
 
     def _pair_view(before_steps: str, after_steps: str) -> dict:
@@ -1391,7 +1360,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert "<b>исчез</b>" not in screen and "<b>появился</b>" not in screen
     assert "появилось 1, исчезло 17, изменилось" in screen
     assert screen.count("<b>исчез") == 0
-    assert "Информационная система" in screen and "<b>изменилась роль</b>" in screen
+    assert "Информационная система" not in screen and "<b>изменилась роль</b>" not in screen
     assert f"циклы {cmp_view['loops_before']} → {cmp_view['loops_after']}" in screen
     assert f"Экономия: {bpmn_app.fmt_hours(cmp_view['saved_hours'])}" in screen
     shown_parts = [float(m) for m in re.findall(r"</b>: ([+-]\d+\.\d) ч", screen)]
@@ -1770,7 +1739,6 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     from validate_bpmn import xsd_errors_xml
 
     assert xsd_errors_xml(xml_fork) == [] or xsd_errors_xml(xml_fork) is None or not xsd_errors_xml(xml_fork)
-
     print(
         "ok",
         f"steps={len(parsed.steps)}",
