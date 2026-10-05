@@ -7224,13 +7224,23 @@ _MOVE_KIND = {"zero_rework": "loops", "parallel": "parallel", "automation": "aut
 
 
 def _category_contrib(moves: Sequence[dict]) -> Dict[str, float]:
-    """Вклад категории — сумма вкладов её ходов. Порядок списка сумму не меняет."""
+    """Вклад категории — сумма вкладов её ходов. Порядок списка сумму не меняет.
+
+    Голый путь параллели и автоматизации идёт в свою категорию. Надбавка за цикл
+    (время с возвратами минус голый путь) идёт в «Снятые возвраты» у каждого хода.
+    Запись без premium_hours считает path_hours в категорию хода, как раньше.
+    """
     acc = {"loops": 0.0, "parallel": 0.0, "automation": 0.0}
     for move in moves or []:
-        key = _MOVE_KIND.get(str((move or {}).get("kind") or ""))
-        if key is None:
-            continue
-        acc[key] += float(move.get("path_hours") or 0)
+        kind = str((move or {}).get("kind") or "")
+        key = _MOVE_KIND.get(kind)
+        path = float((move or {}).get("path_hours") or 0)
+        if "premium_hours" in (move or {}):
+            if key in ("parallel", "automation"):
+                acc[key] += path
+            acc["loops"] += float(move.get("premium_hours") or 0)
+        elif key:
+            acc[key] += path
     return acc
 
 
@@ -7311,10 +7321,18 @@ def _iter_tobe_selections(
 
 
 def _measure_isolated_moves(
-    text: str, base_cp: float, spec: Dict[str, Set[int]], skip: Set[int],
+    text: str, base_cp: float, base_rw: float, spec: Dict[str, Set[int]], skip: Set[int],
 ) -> List[Dict[str, Any]]:
-    """Каждый принятый ход отдельно: критический путь до хода и после, тот же Беллман–Форд."""
-    rows: List[Dict[str, Any]] = []
+    """Доля каждого хода в голом пути и в надбавке за цикл.
+
+    Оба числа — тот же путь и то же время с возвратами, что у карточки.
+    Доли посчитаны по всем сочетаниям ходов и в сумме дают эффект пакета.
+    Порядок ходов сумму не меняет. Надбавка худшего цикла не аддитивна,
+    поэтому одного замера «ход сам по себе» мало: второй цикл виден только вместе с первым.
+    """
+    from itertools import combinations
+    from math import factorial
+
     plain_loops = set(spec.get("loops") or []) - set(spec.get("control") or [])
     plan = [
         ("automation", sorted(spec.get("auto") or []), {
@@ -7330,21 +7348,92 @@ def _measure_isolated_moves(
             "do_auto": False, "do_parallel": False, "do_safety": False, "do_loops": True, "do_control": True,
         }, "only_control"),
     ]
+    units: List[Dict[str, Any]] = []
     for kind, indexes, flags, only_key in plan:
         for index in indexes:
             only = {"only_auto": set(), "only_parallel": set(), "only_loops": set(), "only_control": set()}
             only[only_key] = {index}
             if only_key == "only_control":
                 only["only_loops"] = {index}
-            cand_text, actions = _heuristic_optimize_to_be(text, skip_auto=skip, **flags, **only)
-            hours = 0.0
-            if actions:
-                _, audit_i, err_i = _rebuild_process(cand_text, "move", [], use_llm=False)
-                if not err_i and audit_i:
-                    after = float((audit_i.get("sla") or {}).get("critical_path_hours") or base_cp)
-                    hours = round(base_cp - after, 3)
-            rows.append({"kind": kind, "index": index, "path_hours": hours})
-    return rows
+            units.append({"kind": kind, "index": index, "flags": flags, "only": only})
+    n = len(units)
+    if n == 0:
+        return []
+
+    def _metrics(mask: int) -> Tuple[float, float]:
+        if mask == 0:
+            return base_cp, base_rw
+        merged_flags = {
+            "do_auto": False, "do_parallel": False, "do_safety": False, "do_loops": False, "do_control": False,
+        }
+        merged_only: Dict[str, Set[int]] = {
+            "only_auto": set(), "only_parallel": set(), "only_loops": set(), "only_control": set(),
+        }
+        for bit, unit in enumerate(units):
+            if mask & (1 << bit) == 0:
+                continue
+            for key, value in unit["flags"].items():
+                if value:
+                    merged_flags[key] = True
+            for key, value in unit["only"].items():
+                merged_only[key] |= set(value)
+        cand_text, actions = _heuristic_optimize_to_be(text, skip_auto=skip, **merged_flags, **merged_only)
+        if not actions:
+            return base_cp, base_rw
+        _, audit_i, err_i = _rebuild_process(cand_text, "move", [], use_llm=False)
+        if err_i or not audit_i:
+            return base_cp, base_rw
+        sla_i = audit_i.get("sla") or {}
+        after_cp = float(sla_i.get("critical_path_hours") or base_cp)
+        after_rw = float(sla_i.get("with_rework_hours") or after_cp)
+        return after_cp, after_rw
+
+    cache = {mask: _metrics(mask) for mask in range(1 << n)}
+    path_share = [0.0] * n
+    premium_share = [0.0] * n
+    for bit in range(n):
+        others = [j for j in range(n) if j != bit]
+        for size in range(len(others) + 1):
+            weight = factorial(size) * factorial(n - size - 1) / factorial(n)
+            for chosen in combinations(others, size):
+                mask = 0
+                for j in chosen:
+                    mask |= 1 << j
+                before_cp, before_rw = cache[mask]
+                after_cp, after_rw = cache[mask | (1 << bit)]
+                path_share[bit] += weight * (before_cp - after_cp)
+                premium_share[bit] += weight * ((before_rw - before_cp) - (after_rw - after_cp))
+
+    final_cp, final_rw = cache[(1 << n) - 1]
+
+    def _card(value: float) -> float:
+        return round(float(value), 1)
+
+    path_target = round(_card(base_cp) - _card(final_cp), 1)
+    premium_target = round(
+        (_card(base_rw) - _card(base_cp)) - (_card(final_rw) - _card(final_cp)),
+        1,
+    )
+
+    def _pin(shares: List[float], target: float) -> List[float]:
+        rounded = [round(value, 3) for value in shares]
+        drift = round(target - sum(rounded), 3)
+        if rounded and drift:
+            idx = max(range(len(rounded)), key=lambda i: abs(rounded[i]))
+            rounded[idx] = round(rounded[idx] + drift, 3)
+        return rounded
+
+    path_share = _pin(path_share, path_target)
+    premium_share = _pin(premium_share, premium_target)
+    return [
+        {
+            "kind": unit["kind"],
+            "index": unit["index"],
+            "path_hours": path_share[i],
+            "premium_hours": premium_share[i],
+        }
+        for i, unit in enumerate(units)
+    ]
 
 
 def optimize_process_to_be(
@@ -7527,7 +7616,9 @@ def optimize_process_to_be(
     delta["tobe_audit"] = new_audit or {}
     delta["tobe_error"] = ""
     delta["tobe_text"] = optimized
-    delta["move_hours"] = _measure_isolated_moves(text, float(base_m["cp"]), move_spec or {}, skip)
+    delta["move_hours"] = _measure_isolated_moves(
+        text, float(base_m["cp"]), float(base_m["rw"]), move_spec or {}, skip,
+    )
     return _finish(delta, optimized)
 
 
