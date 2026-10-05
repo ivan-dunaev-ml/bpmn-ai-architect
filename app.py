@@ -2329,6 +2329,12 @@ def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
     for part in cmp.get("parts") or []:
+        if part.get("kind") == "stopped":
+            st.markdown(
+                f'<div class="tobe-act">{esc(part.get("label") or "")}</div>',
+                unsafe_allow_html=True,
+            )
+            continue
         hours = float(part.get("hours") or 0)
         if abs(hours) < 0.05:
             continue

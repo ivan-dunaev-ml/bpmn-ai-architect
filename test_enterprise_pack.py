@@ -31,6 +31,7 @@ def main() -> None:
     assert not err, err
     assert audit["sla"]["critical_path_hours"] == 9.7
     assert audit["sla"]["with_rework_hours"] == 12.55
+    assert audit["sla"]["role_hours"] >= audit["sla"]["critical_path_hours"]
     assert len(audit["rework_loops"]) == 2
     assert audit["methodology"]["long_chains"]
     assert audit["methodology"]["score"] < 100
@@ -167,6 +168,7 @@ def main() -> None:
     assert not err_g_full, err_g_full
     assert audit_g_full["sla"]["critical_path_hours"] == 400.3
     assert audit_g_full["sla"]["with_rework_hours"] == 584.4
+    assert audit_g_full["sla"]["role_hours"] >= audit_g_full["sla"]["critical_path_hours"]
     assert audit_g_full["methodology"]["score"] == 100
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
@@ -181,6 +183,7 @@ def main() -> None:
     assert q_after >= q_before, (q_after, q_before)
     assert audit_p["sla"]["critical_path_hours"] == 528.3
     assert audit_p["sla"]["with_rework_hours"] == 856.5
+    assert audit_p["sla"]["role_hours"] >= audit_p["sla"]["critical_path_hours"]
     assert "автоматически:" not in opt_p.lower()
     assert "проводит предварительный входной контроль" in opt_p or "входной контроль" in opt_p.lower()
     ctx_p = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
@@ -1086,6 +1089,10 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert proc_cmp["counts"]["removed"] == 0 and proc_cmp["counts"]["added"] == 0
     proc_auto = next(p for p in proc_cmp["parts"] if p["kind"] == "automation")
     assert proc_auto["hours"] == 0.0
+    proc_par = next(p for p in proc_cmp["parts"] if p["kind"] == "parallel")
+    assert "Заключить договор поставки с победителем" in proc_par["detail"]
+    assert "Организовать приёмку трансформатора и входной контроль" in proc_par["detail"]
+    assert "экспертизу проекта договора" not in proc_par["detail"]
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
     # 2е. Подсветка на схеме: только изменившиеся шаги, «исчез» и «появился» не размечаются, по клику одна строка.
@@ -1795,17 +1802,24 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     }
     one_role = compare_asis_tobe(
         "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
-        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Параллельно: Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Параллельно*: Мастер: Первый шаг (3 ч).\n2. Параллельно: Мастер: Второй шаг (5 ч).\n",
         {}, {}, role_facts,
     )
     one_par = next(p for p in one_role["parts"] if p["kind"] == "parallel")
     assert one_par["same_role"] is True and one_par["hours"] != 0, one_par
-    two_roles = compare_asis_tobe(
-        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Диспетчер: Второй шаг (5 ч).\n",
-        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Параллельно: Диспетчер: Второй шаг (5 ч).\n",
+    chain = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
         {}, {}, role_facts,
     )
-    assert next(p for p in two_roles["parts"] if p["kind"] == "parallel")["same_role"] is False
+    assert next(p for p in chain["parts"] if p["kind"] == "parallel")["same_role"] is False
+    skipped = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        {}, {}, dict(role_facts, move_hours=[{"kind": "stopped", "path_hours": 0, "premium_hours": 0}]),
+    )
+    assert skipped["saved_hours"] == 3.0
+    assert [p["label"] for p in skipped["parts"]] == ["Раскладка по категориям не считалась: ходов больше 12"]
 
     print(
         "ok",

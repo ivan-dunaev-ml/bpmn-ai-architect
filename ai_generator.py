@@ -3268,6 +3268,76 @@ def _tobe_variant(tobe_text: str, mode: str, edits: Dict[int, float]) -> Optiona
     return "\n".join([*header, "", *[f"{s['num']}. {s['body']}" for s in steps]]).strip() + "\n"
 
 
+def _parallel_split_groups(steps: Sequence[Step]) -> List[List[Step]]:
+    """Группы шагов одного parallel-шлюза: подряд идущие пометки «Параллельно», «*» начинает новую."""
+    groups: List[List[Step]] = []
+    current: List[Step] = []
+    for step in steps:
+        if not step.parallel:
+            if current:
+                groups.append(current)
+                current = []
+            continue
+        if step.fork_parallel and current:
+            groups.append(current)
+            current = []
+        current.append(step)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _parallel_same_role(steps: Sequence[Step]) -> bool:
+    """Одна роль на двух ветках одного шлюза. Соседняя строка без второй пометки этим не является."""
+    for group in _parallel_split_groups(steps):
+        if len(group) < 2:
+            continue
+        roles = [_compare_key(step.role) for step in group]
+        if len(roles) != len(set(roles)):
+            return True
+    return False
+
+
+def _parallel_caption_titles(
+    before: Sequence[Step], after: Sequence[Step], pairs: Sequence[Tuple[int, int]],
+) -> List[str]:
+    """Названия веток хода, который поставил пометку «Параллельно». Уже параллельный шаг в подпись не входит."""
+    was = {j: before[i].parallel for i, j in pairs}
+    titles: List[str] = []
+    seen: set = set()
+
+    def add(step: Step) -> None:
+        key = _compare_key(step.title)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        titles.append(step.title)
+
+    j = 0
+    while j < len(after):
+        step = after[j]
+        if not (step.parallel and not was.get(j, False)):
+            j += 1
+            continue
+        if j > 0 and not step.fork_parallel:
+            add(after[j - 1])
+        add(step)
+        k = j + 1
+        while (
+            k < len(after)
+            and after[k].parallel
+            and not after[k].fork_parallel
+            and not was.get(k, False)
+        ):
+            add(after[k])
+            k += 1
+        j = k
+    return titles
+
+
+_LAYOUT_SKIPPED = "Раскладка по категориям не считалась: ходов больше 12"
+
+
 def compare_asis_tobe(
     asis_text: str,
     tobe_text: str,
@@ -3418,21 +3488,25 @@ def compare_asis_tobe(
     cp_b, cp_a = tenth(f.get("cp_before")), tenth(f.get("cp_after"))
     saved_t = rw_b - rw_a
     move_hours = [m for m in (f.get("move_hours") or []) if isinstance(m, dict)]
-    par_titles = [s.title for s in after if s.parallel]
+    has_parallel = any(s.parallel for s in after)
     auto_edits = {
         j: before[i].hours for i, j in pairs
         if _compare_key(after[j].role) == _SYSTEM_ROLE_KEY and _compare_key(before[i].role) != _compare_key(after[j].role)
         and before[i].hours is not None and after[j].hours is not None and before[i].hours > after[j].hours
     }
-    if move_hours:
+    layout_skipped = any(m.get("kind") == "stopped" for m in move_hours)
+    if layout_skipped:
+        loops_t = par_t = auto_t = 0
+        path_saved_t = cp_b - cp_a
+    elif move_hours:
         contrib = _category_contrib(move_hours)
         loops_t, par_t, auto_t = tenth(contrib["loops"]), tenth(contrib["parallel"]), tenth(contrib["automation"])
         path_saved_t = cp_b - cp_a
     else:
         loops_t = max(0, (rw_b - cp_b) - (rw_a - cp_a)) if removed_n > 0 else 0
-        base_rw = _what_if_rw(tobe_text) if (par_titles or auto_edits) else None
+        base_rw = _what_if_rw(tobe_text) if (has_parallel or auto_edits) else None
         par_t = 0
-        if base_rw is not None and par_titles:
+        if base_rw is not None and has_parallel:
             no_par = _tobe_variant(tobe_text, "no_parallel", {})
             alt = _what_if_rw(no_par) if no_par else None
             par_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
@@ -3443,14 +3517,17 @@ def compare_asis_tobe(
             auto_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
         path_saved_t = cp_b - cp_a
     auto_titles = [after[j].title for j in sorted(auto_edits)] if auto_t else []
-    par_titles = par_titles if par_t else []
+    par_titles = _parallel_caption_titles(before, after, pairs) if par_t else []
     # Общая экономия карточки — baseline минус to-be по пути с возвратами. Нехватка или перекрытие ходов не уходит в «Параллель».
     joint_t = saved_t - loops_t - par_t - auto_t
 
     def _h(t: int) -> float:
         return round(t / 10.0, 1)
 
-    parts = [
+    if layout_skipped:
+        parts = [{"kind": "stopped", "label": _LAYOUT_SKIPPED, "hours": 0.0, "detail": ""}]
+    else:
+        parts = [
         {
             "kind": "loops", "label": "Снятые возвраты", "hours": _h(loops_t),
             "detail": f"Петель снято: {removed_n}. Надбавка худшего цикла к пути убрана." if removed_n else "",
@@ -3458,10 +3535,7 @@ def compare_asis_tobe(
         {
             "kind": "parallel", "label": "Параллель", "hours": _h(par_t),
             "detail": ("Шаги стали параллельными: " + ", ".join(f"«{t}»" for t in par_titles)) if par_titles else "",
-            "same_role": any(
-                s.parallel and i > 0 and _compare_key(s.role) == _compare_key(after[i - 1].role)
-                for i, s in enumerate(after)
-            ),
+            "same_role": _parallel_same_role(after),
         },
         {
             "kind": "automation", "label": "Автоматизация", "hours": _h(auto_t),
@@ -7411,7 +7485,7 @@ def _measure_isolated_moves(
             "index": -1,
             "path_hours": 0.0,
             "premium_hours": 0.0,
-            "note": "Принятых ходов больше 12, перебор сочетаний не запущен.",
+            "note": _LAYOUT_SKIPPED,
         }]
 
     def _metrics(mask: int) -> Tuple[float, float]:
@@ -7676,9 +7750,6 @@ def optimize_process_to_be(
     delta["move_hours"] = _measure_isolated_moves(
         text, float(base_m["cp"]), float(base_m["rw"]), move_spec or {}, search_skip,
     )
-    if any(row.get("kind") == "stopped" for row in delta["move_hours"]):
-        delta["tobe_error"] = str(delta["move_hours"][0].get("note") or "")
-        delta["move_hours"] = []
     return _finish(delta, optimized)
 
 

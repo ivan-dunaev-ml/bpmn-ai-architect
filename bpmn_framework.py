@@ -1463,9 +1463,10 @@ class BPMNDiagramBuilder:
         for u, v in forward:
             succ[u].append(v)
             pred[v].append(u)
-        sources = [n for n in ids if not pred[n]]
-        if start_id in scope and start_id not in sources:
-            sources.append(start_id)
+        if start_id in scope:
+            sources = [start_id]
+        else:
+            sources = [n for n in ids if not pred[n]]
 
         def _reach(edges: Sequence[Tuple[str, str]]) -> Set[str]:
             out: Dict[str, List[str]] = defaultdict(list)
@@ -1481,24 +1482,18 @@ class BPMNDiagramBuilder:
                 stack.extend(out.get(cur, []))
             return seen
 
-        tails: Dict[str, float] = {}
+        def _bare(edges: Sequence[Tuple[str, str]], live: Set[str]) -> float:
+            live_edges = [(u, v) for u, v in edges if u in live and v in live]
+            src = {nid: hours[nid] for nid in sources if nid in live}
+            if not src:
+                return 0.0
+            dist, _pred = self._bellman_ford_longest(list(live), live_edges, hours, src)
+            finite = [d for d in dist.values() if d != float("inf")]
+            if not finite:
+                return 0.0
+            return -min(finite)
 
-        def _tail(nid: str, stack: Set[str]) -> float:
-            if nid in tails:
-                return tails[nid]
-            if nid in stack:
-                tails[nid] = hours[nid]
-                return tails[nid]
-            stack.add(nid)
-            best = max((_tail(w, stack) for w in succ.get(nid, [])), default=0.0)
-            stack.remove(nid)
-            tails[nid] = hours[nid] + best
-            return tails[nid]
-
-        for nid in ids:
-            _tail(nid, set())
-
-        def _makespan(edges: Sequence[Tuple[str, str]]) -> float:
+        def _makespan(edges: Sequence[Tuple[str, str]]) -> Tuple[float, bool]:
             live = _reach(edges)
             out: Dict[str, List[str]] = defaultdict(list)
             inn: Dict[str, List[str]] = defaultdict(list)
@@ -1506,6 +1501,22 @@ class BPMNDiagramBuilder:
                 if u in live and v in live:
                     out[u].append(v)
                     inn[v].append(u)
+            tails: Dict[str, float] = {}
+
+            def _tail(nid: str, stack: Set[str]) -> float:
+                if nid in tails:
+                    return tails[nid]
+                if nid in stack:
+                    tails[nid] = hours[nid]
+                    return tails[nid]
+                stack.add(nid)
+                best = max((_tail(w, stack) for w in out.get(nid, [])), default=0.0)
+                stack.remove(nid)
+                tails[nid] = hours[nid] + best
+                return tails[nid]
+
+            for nid in live:
+                _tail(nid, set())
             finish: Dict[str, float] = {}
             role_free: Dict[str, float] = defaultdict(float)
             pending = set(live)
@@ -1531,7 +1542,10 @@ class BPMNDiagramBuilder:
                 if role is not None:
                     role_free[role] = done
                 pending.remove(nid)
-            return max(finish.values(), default=0.0)
+            computed = max(finish.values(), default=0.0)
+            if pending:
+                return max(computed, _bare(edges, live)), True
+            return computed, False
 
         estimate = False
         splits: List[Tuple[str, List[str]]] = []
@@ -1580,10 +1594,12 @@ class BPMNDiagramBuilder:
                 (u, v) for u, v in forward
                 if u not in chosen or v == chosen[u]
             ]
-            return round(_makespan(edges), 2), True
+            span, _incomplete = _makespan(edges)
+            return round(span, 2), True
 
         if not splits:
-            return round(_makespan(forward), 2), estimate
+            span, incomplete = _makespan(forward)
+            return round(span, 2), estimate or incomplete
 
         from itertools import product
 
@@ -1595,7 +1611,9 @@ class BPMNDiagramBuilder:
                 (u, v) for u, v in forward
                 if u not in chosen or v == chosen[u]
             ]
-            best = max(best, _makespan(edges))
+            span, incomplete = _makespan(edges)
+            estimate = estimate or incomplete
+            best = max(best, span)
         return round(best, 2), estimate
 
     def _rework_loops(self, memo: Dict[str, float]) -> List[Dict[str, object]]:
