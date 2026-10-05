@@ -1001,14 +1001,14 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     tenths = lambda value: int(round(float(value) * 10))  # noqa: E731
     assert tenths(cmp_view["saved_hours"]) == tenths(cmp_facts["rw_saved_hours"])
     assert tenths(cmp_facts["rw_saved_hours"]) == tenths(cmp_facts["rw_before"]) - tenths(cmp_facts["rw_after"])
-    assert sum(tenths(p["hours"]) for p in cmp_view["parts"]) == tenths(cmp_facts["rw_saved_hours"]), cmp_view["parts"]
+    assert sum(tenths(p["hours"]) for p in cmp_view["parts"]) == tenths(cmp_view["saved_hours"]), cmp_view["parts"]
     assert tenths(cmp_view["explained_hours"]) + tenths(cmp_view["rest_hours"]) == tenths(cmp_view["saved_hours"])
-    assert {p["kind"] for p in cmp_view["parts"]} >= {"loops", "parallel", "automation", "rest"}
+    assert {p["kind"] for p in cmp_view["parts"]} >= {"loops", "parallel", "automation", "joint"}
     assert (cmp_snapshot[0], cmp_snapshot[1]) == (cmp_facts["cp_before"], cmp_facts["rw_before"])
     assert cmp_asis_audit["sla"]["critical_path_hours"] == 9.7
     assert cmp_asis_audit["sla"]["with_rework_hours"] == 12.55
     assert cmp_snapshot[2:4] == (2, 0) and cmp_snapshot[5] == 2
-    assert cmp_view["parts"][-1]["kind"] == "rest" and cmp_view["parts"][-1]["label"] == "остальное"
+    assert cmp_view["parts"][-1]["kind"] == "joint" and cmp_view["parts"][-1]["label"] == "Совместный эффект"
     for item in cmp_view["removed_returns"]:
         assert item["scheme"] == "As-Is"
     for row in cmp_view["steps"]:
@@ -1279,14 +1279,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
         cmp_pack["xml"], cmp_pack["audit"], cmp_text, cmp_pack["delta"]), xml_tobe=cmp_pack["tobe_xml"], catalog_tobe=cat_tobe)
     assert "COPILOT.highlight" in page_hl and "подсвеч" in page_hl
 
-    # 2д. Четыре строки экономии: пересчёт пути без хода, обрезка остатком, сумма равна карточке в десятых.
+    # 2д. Вклады категорий — сумма ходов, без обрезки первой категорией. Совместный эффект добирает карточку.
     part_h = {p["kind"]: p["hours"] for p in cmp_view["parts"]}
-    assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "rest"]
-    assert tenths(part_h["loops"]) == (tenths(cmp_facts["rw_before"]) - tenths(cmp_facts["cp_before"])) - (
-        tenths(cmp_facts["rw_after"]) - tenths(cmp_facts["cp_after"]))
-    assert all(tenths(v) >= 0 for v in part_h.values()), part_h
+    assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "joint"]
+    from ai_generator import _category_contrib as _contrib_hours
+
+    contrib_h = _contrib_hours(cmp_facts.get("move_hours") or [])
+    assert tenths(part_h["loops"]) == tenths(contrib_h["loops"])
+    assert tenths(part_h["parallel"]) == tenths(contrib_h["parallel"])
+    assert tenths(part_h["automation"]) == tenths(contrib_h["automation"])
     assert sum(tenths(v) for v in part_h.values()) == tenths(cmp_facts["rw_saved_hours"])
-    # Ход выключается и пересчитывается: без «Параллельно» путь длиннее на часы шага, автоматизация обрезается остатком.
+    # Ход считается сам по себе: параллель 1 ч, автоматизация 5.9 ч. Перекрытие не обрезает автоматизацию, а уходит в совместный эффект.
     what_facts = dict(same_facts, rw_before=9.0, rw_after=7.0, cp_before=9.0, cp_after=7.0, rw_saved_pct=22)
     what_before = (
         "Регламент: Пересчёт\n1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Проверить комплект (2 ч).\n"
@@ -1298,12 +1301,13 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     )
     what_view = compare_asis_tobe(what_before, what_after, {}, {}, what_facts)
     what_h = {p["kind"]: p["hours"] for p in what_view["parts"]}
-    assert what_h["parallel"] == 1.0 and what_h["automation"] == 1.0 and what_h["loops"] == 0.0, what_h
+    assert what_h["parallel"] == 1.0 and what_h["automation"] == 5.9 and what_h["loops"] == 0.0, what_h
+    assert what_h["joint"] == -4.9, what_h
     assert sum(tenths(v) for v in what_h.values()) == tenths(what_facts["rw_before"] - what_facts["rw_after"])
     # Нет хода — строка 0, часы остаются в «остальное».
     idle_view = compare_asis_tobe(what_before, what_before, {}, {}, what_facts)
     idle_h = {p["kind"]: p["hours"] for p in idle_view["parts"]}
-    assert idle_h == {"loops": 0.0, "parallel": 0.0, "automation": 0.0, "rest": 2.0}, idle_h
+    assert idle_h == {"loops": 0.0, "parallel": 0.0, "automation": 0.0, "joint": 2.0}, idle_h
     # Прежний срок не длиннее — автоматизация 0.
     short_after = what_after.replace("(5 минут)", "(7 ч)")
     short_view = compare_asis_tobe(what_before, short_after, {}, {}, what_facts)
@@ -1682,6 +1686,59 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)
+
+    # To-Be принимается относительно локального baseline, а не облачной схемы.
+    from ai_generator import LOCAL_MODEL_NOTE, _category_contrib, _tobe_feasible
+
+    plain = (
+        "Регламент: Приёмка относительно baseline\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    better_than_base = {"cp": 9.0, "rw": 9.0, "loops": 0.0, "q": 70.0, "n": 2.0}
+    baseline_worse = {"cp": 10.0, "rw": 12.0, "loops": 2.0, "q": 60.0, "n": 4.0}
+    cloud_better = {"cp": 8.0, "rw": 8.0, "loops": 0.0, "q": 90.0, "n": 2.0}
+    assert _tobe_feasible(baseline_worse, better_than_base, plain, plain)
+    assert not _tobe_feasible(cloud_better, better_than_base, plain, plain)
+    worse_than_base = {"cp": 10.0, "rw": 11.0, "loops": 1.0, "q": 80.0, "n": 3.0}
+    baseline_better = {"cp": 9.0, "rw": 9.0, "loops": 0.0, "q": 80.0, "n": 2.0}
+    cloud_worse = {"cp": 12.0, "rw": 16.0, "loops": 2.0, "q": 50.0, "n": 6.0}
+    assert _tobe_feasible(cloud_worse, worse_than_base, plain, plain)
+    assert not _tobe_feasible(baseline_better, worse_than_base, plain, plain)
+    assert bpmn_app._tobe_accepted({
+        "tobe_ready": True, "cp_before": 10.0, "cp_after": 9.0, "loops_before": 2, "loops_after": 0,
+    })
+    assert not bpmn_app._tobe_accepted({
+        "tobe_ready": True, "cp_before": 9.0, "cp_after": 10.0, "loops_before": 0, "loops_after": 0,
+    })
+    assert opened["delta"].get("local_model") and LOCAL_MODEL_NOTE
+
+    moves_fwd = [
+        {"kind": "parallel", "path_hours": 1.5},
+        {"kind": "automation", "path_hours": 2.0},
+        {"kind": "zero_rework", "path_hours": 0.5},
+    ]
+    assert _category_contrib(moves_fwd) == _category_contrib(list(reversed(moves_fwd)))
+    total_path = 3.0
+    summed = sum(_category_contrib(moves_fwd).values())
+    assert round(total_path - summed, 3) == -1.0
+
+    fork_only = (
+        "Регламент: только развилка\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Если заявка полная — «полная» — перейти к п.3, иначе «неполная» — завершить процесс.\n"
+        "3. Диспетчер закрывает заявку (1 час).\n"
+    )
+    xml_fork, audit_fork, err_fork = generate_bpmn_from_text(fork_only, use_llm=False)
+    assert not err_fork and xml_fork, err_fork
+    shown_fork = render_result_regulation(fork_only, xml_fork)
+    assert "Выполнить действие" not in shown_fork, shown_fork
+    assert "Если Заявка полная, иначе «Неполная»" in shown_fork, shown_fork
+    xml_again, _, err_again = generate_bpmn_from_text(shown_fork, use_llm=False)
+    assert not err_again and xml_again and "Выполнить действие" not in xml_again
+    from validate_bpmn import xsd_errors_xml
+
+    assert xsd_errors_xml(xml_fork) == [] or xsd_errors_xml(xml_fork) is None or not xsd_errors_xml(xml_fork)
 
     print(
         "ok",

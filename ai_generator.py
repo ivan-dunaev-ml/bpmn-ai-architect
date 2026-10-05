@@ -3407,42 +3407,40 @@ def compare_asis_tobe(
         for x in gone[:removed_n]
     ]
 
-    # Раскладка экономии карточки по десятым часа. Сумма частей и «остальное» равна экономии ровно.
+    # Вклады ходов не обрезаются в пользу первой категории. Несовпадение с общей экономией — «Совместный эффект».
     tenth = lambda v: int(round(float(v or 0) * 10))  # noqa: E731
     rw_b, rw_a = tenth(f.get("rw_before")), tenth(f.get("rw_after"))
     cp_b, cp_a = tenth(f.get("cp_before")), tenth(f.get("cp_after"))
     saved_t = rw_b - rw_a
-    # 1. Снятые возвраты: насколько путь с возвратами длиннее голого до оптимизации минус насколько длиннее после.
-    loops_t = max(0, min(saved_t, (rw_b - cp_b) - (rw_a - cp_a))) if removed_n > 0 else 0
-    pool = max(0, saved_t - loops_t)
-
-    # 2-3. Параллель и автоматизация: путь To-Be пересчитывается без хода, берётся разница с настоящим путём To-Be.
+    move_hours = [m for m in (f.get("move_hours") or []) if isinstance(m, dict)]
     par_titles = [s.title for s in after if s.parallel]
-    base_rw = _what_if_rw(tobe_text) if (par_titles or any(
-        _compare_key(after[j].role) == _SYSTEM_ROLE_KEY and _compare_key(before[i].role) != _compare_key(after[j].role)
-        for i, j in pairs)) else None
-    par_t = 0
-    if base_rw is not None and par_titles:
-        no_par = _tobe_variant(tobe_text, "no_parallel", {})
-        alt = _what_if_rw(no_par) if no_par else None
-        par_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
-    par_t = max(0, min(par_t, pool))
-
     auto_edits = {
         j: before[i].hours for i, j in pairs
         if _compare_key(after[j].role) == _SYSTEM_ROLE_KEY and _compare_key(before[i].role) != _compare_key(after[j].role)
         and before[i].hours is not None and after[j].hours is not None and before[i].hours > after[j].hours
     }
-    auto_t = 0
-    if base_rw is not None and auto_edits:
-        old_hours = _tobe_variant(tobe_text, "old_hours", auto_edits)
-        alt = _what_if_rw(old_hours) if old_hours else None
-        auto_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
-    auto_t = max(0, min(auto_t, pool - par_t))
+    if move_hours:
+        contrib = _category_contrib(move_hours)
+        loops_t, par_t, auto_t = tenth(contrib["loops"]), tenth(contrib["parallel"]), tenth(contrib["automation"])
+        path_saved_t = cp_b - cp_a
+    else:
+        loops_t = max(0, (rw_b - cp_b) - (rw_a - cp_a)) if removed_n > 0 else 0
+        base_rw = _what_if_rw(tobe_text) if (par_titles or auto_edits) else None
+        par_t = 0
+        if base_rw is not None and par_titles:
+            no_par = _tobe_variant(tobe_text, "no_parallel", {})
+            alt = _what_if_rw(no_par) if no_par else None
+            par_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
+        auto_t = 0
+        if base_rw is not None and auto_edits:
+            old_hours = _tobe_variant(tobe_text, "old_hours", auto_edits)
+            alt = _what_if_rw(old_hours) if old_hours else None
+            auto_t = tenth(max(0.0, alt - base_rw)) if alt is not None else 0
+        path_saved_t = cp_b - cp_a
     auto_titles = [after[j].title for j in sorted(auto_edits)] if auto_t else []
     par_titles = par_titles if par_t else []
-    # 4. Всё, что не вошло, остаётся в «остальное»: сумма строк равна экономии карточки.
-    rest_t = saved_t - loops_t - par_t - auto_t
+    # Общая экономия карточки — baseline минус to-be по пути с возвратами. Нехватка или перекрытие ходов не уходит в «Параллель».
+    joint_t = saved_t - loops_t - par_t - auto_t
 
     def _h(t: int) -> float:
         return round(t / 10.0, 1)
@@ -3460,7 +3458,7 @@ def compare_asis_tobe(
             "kind": "automation", "label": "Автоматизация", "hours": _h(auto_t),
             "detail": ("Шаги переданы системе: " + ", ".join(f"«{t}»" for t in auto_titles)) if auto_titles else "",
         },
-        {"kind": "rest", "label": "остальное", "hours": _h(rest_t), "detail": ""},
+        {"kind": "joint", "label": "Совместный эффект", "hours": _h(joint_t), "detail": ""},
     ]
     return {
         "ready": True,
@@ -3473,10 +3471,11 @@ def compare_asis_tobe(
         "rw_before": float(f.get("rw_before") or 0),
         "rw_after": float(f.get("rw_after") or 0),
         "saved_hours": _h(saved_t),
+        "path_saved_hours": _h(path_saved_t),
         "saved_pct": int(f.get("rw_saved_pct") or 0),
         "parts": parts,
         "explained_hours": _h(loops_t + par_t + auto_t),
-        "rest_hours": _h(rest_t),
+        "rest_hours": _h(joint_t),
     }
 
 
@@ -4218,9 +4217,9 @@ def _analysis_why_saved(ctx: Dict[str, Any]) -> str:
         f"2) **Параллелизация:** {par_txt}, {_h('parallel'):.1f} ч.",
         f"3) **Автоматизация (scriptTask):** {auto_txt}, {_h('automation'):.1f} ч.",
     ]
-    rest = _h("rest")
+    rest = _h("joint")
     if abs(rest) >= 0.05:
-        out.append(f"4) **остальное:** {rest:.1f} ч — часть пути, которую не удалось отнести к трём видам ходов.")
+        out.append(f"4) **Совместный эффект:** {rest:.1f} ч — взаимное влияние ходов, не прибавленное к «Параллели».")
     sum_txt = " + ".join(f"{_h(k):.1f}" for k in ("loops", "parallel", "automation")) + (
         f" + {rest:.1f}" if abs(rest) >= 0.05 else ""
     )
