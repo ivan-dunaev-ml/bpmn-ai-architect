@@ -286,6 +286,7 @@ class FlowNode:
     y: float = 0.0
     order: int = 0
     sla_hours: Optional[float] = None
+    sla_source: Optional[str] = None
     inner_start_id: Optional[str] = None
     inner_end_id: Optional[str] = None
     label_rect: Optional[Rect] = None
@@ -648,6 +649,7 @@ class BPMNDiagramBuilder:
             return
         try:
             node.sla_hours = max(0.0, float(hours))
+            node.sla_source = "regulation"
         except (TypeError, ValueError):
             self.warnings.append(f"set_sla: некорректное значение {hours!r}.")
 
@@ -1373,6 +1375,8 @@ class BPMNDiagramBuilder:
             value = self._critical_path(node.id, node.inner_start_id, memo)[0]
         else:
             value = DEFAULT_HOURS.get(node.kind, 1.0)
+            if not getattr(node, "sla_source", None):
+                node.sla_source = "default"
         memo[node.id] = value
         return value
 
@@ -1833,7 +1837,7 @@ class BPMNDiagramBuilder:
                     "metric": "critical_path_layers",
                     "severity": "medium",
                     "value": path_layers,
-                    "message": f"Критический путь состоит из {path_layers} последовательных слоёв согласования.",
+                    "message": f"Критический путь состоит из {path_layers} последовательных этапов схемы.",
                 }
             )
         for alert in bus_alerts:
