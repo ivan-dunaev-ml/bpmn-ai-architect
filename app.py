@@ -1734,15 +1734,27 @@ def tobe_unavailable_reason(
         cp_before = float(f.get("cp_before") or 0)
         cp_after = float(f.get("cp_after") if f.get("cp_after") is not None else cp_before)
         if cp_after > cp_before + 1.0 / 60.0:
-            return f"Голый путь To-Be длиннее: {fmt_hours(cp_before)} → {fmt_hours(cp_after)}."
+            return f"Голый путь To-Be длиннее: {fmt_hours(cp_before)} → {fmt_hours(cp_after)}." + _rejected_move_note(d)
         loops_before = int(f.get("loops_before") or 0)
         loops_after = int(f.get("loops_after") or 0)
         if loops_after > loops_before or (loops_before > 0 and loops_after >= loops_before):
-            return f"Циклы возврата не уменьшились: {loops_before} → {loops_after}."
+            return f"Циклы возврата не уменьшились: {loops_before} → {loops_after}." + _rejected_move_note(d)
     q_before, q_after = d.get("quality_before"), d.get("quality_after")
     if q_before is not None and q_after is not None and int(q_after) < int(q_before):
-        return f"Качество To-Be ниже: {int(q_before)} → {int(q_after)}."
-    return "Ни один ход оптимизации не прошёл проверку."
+        return f"Качество To-Be ниже: {int(q_before)} → {int(q_after)}." + _rejected_move_note(d)
+    return "Ни один ход оптимизации не прошёл проверку." + _rejected_move_note(d)
+
+
+def _rejected_move_note(delta: Dict[str, Any]) -> str:
+    """К причинам кнопки добавляются уже записанные отказы ходов, без новых формулировок."""
+    bits: List[str] = []
+    for item in (delta or {}).get("rejected") or []:
+        reason = str(item.get("reason") or "").strip()
+        if not reason:
+            continue
+        detail = str(item.get("detail") or "").strip()
+        bits.append(f"{detail}: {reason}" if detail else reason)
+    return (" " + " ".join(bits)) if bits else ""
 
 
 def tobe_card_headline(facts: Dict[str, Any]) -> str:
@@ -1783,9 +1795,11 @@ def _annotate_tobe_facts(
 
 
 def _delta_matches_edges(delta: Dict[str, Any], audit: Dict[str, Any]) -> bool:
-    """Delta этой сборки: число петель до оптимизации равно обратным рёбрам её аудита."""
+    """Delta этой сборки: петли холста As-Is, для которого её считали, совпадают с текущим аудитом."""
     edges = len((audit or {}).get("rework_loops") or [])
-    reported = (delta or {}).get("rework_before")
+    reported = (delta or {}).get("canvas_loops")
+    if reported is None:
+        reported = (delta or {}).get("rework_before")
     return reported is not None and int(reported) == edges
 
 
@@ -2357,6 +2371,11 @@ def render_tobe_tab() -> None:
     )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
+    if delta.get("local_model"):
+        st.caption(
+            "Эффект посчитан по одной локальной модели регламента, до оптимизации и после. "
+            "Схема слева построена отдельно, моделью по тексту."
+        )
     actions = [
         act for act in (facts.get("tobe_actions") or delta.get("actions") or [])
         if "узких мест" not in str(act.get("detail") or "")

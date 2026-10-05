@@ -3043,6 +3043,8 @@ def process_facts(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[d
         "quality_before": int(delta.get("quality_before") or (data.get("methodology") or {}).get("score") or 0),
         "quality_after": int(delta.get("quality_after") or 0),
         "tobe_actions": [a for a in (delta.get("actions") or []) if isinstance(a, dict)],
+        "move_hours": [m for m in (delta.get("move_hours") or []) if isinstance(m, dict)],
+        "local_model": bool(delta.get("local_model")),
     }
 
 
@@ -3837,6 +3839,8 @@ def _analysis_tobe(ctx: Dict[str, Any]) -> str:
         out.append(f"Голый критический путь {_fh(cp_b)} → {_fh(cp_a)} — не оптимален, если есть кандидат без удлинения.")
     else:
         out.append(f"Голый критический путь: {_fh(cp_b)} → {_fh(cp_a)}.")
+    if f.get("local_model"):
+        out.append(LOCAL_MODEL_NOTE)
     kinds = {str(a.get("kind")) for a in (ctx.get("tobe_actions") or [])}
     if "zero_rework" in kinds:
         out.append("Zero-Rework: циклы заменены эскалацией на исключительной ветке, не на счастливом пути.")
@@ -4004,6 +4008,8 @@ def _facts_time_reply(ctx: Dict[str, Any]) -> str:
     ]
     if abs(rw_a - cp_a) < 0.051 or ra == 0:
         lines.append("Одинаковые цифры справа: циклы сняты, добавки за возврат нет.")
+    if f.get("local_model"):
+        lines.append(LOCAL_MODEL_NOTE)
     return "\n".join(lines)
 
 
@@ -6895,6 +6901,18 @@ def _ot_order_ok(text: str) -> bool:
     return True
 
 
+def _tobe_known_block(base: Dict[str, float], cand: Dict[str, float]) -> str:
+    """Причина отказа из уже существующих формулировок. Новых причин нет."""
+    if cand["cp"] > base["cp"] + _TOBE_MINUTE:
+        return f"Голый путь To-Be длиннее: {_fh(base['cp'])} → {_fh(cand['cp'])}."
+    loops_b, loops_a = int(base["loops"]), int(cand["loops"])
+    if loops_a > loops_b or (loops_b > 0 and loops_a >= loops_b):
+        return f"Циклы возврата не уменьшились: {loops_b} → {loops_a}."
+    if cand["q"] + 1e-9 < base["q"]:
+        return f"Качество To-Be ниже: {int(base['q'])} → {int(cand['q'])}."
+    return ""
+
+
 def _tobe_feasible(asis: Dict[str, float], cand: Dict[str, float], asis_text: str, cand_text: str) -> bool:
     """Жёсткие ограничения + лексикографические откаты (голый путь, возвраты, циклы, quality, ОТ)."""
     if cand["cp"] > asis["cp"] + _TOBE_MINUTE:
@@ -7203,6 +7221,42 @@ def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], Lis
 
 _TOBE_FULL_ENUM_LIMIT = 48
 _TOBE_REBUILD_BUDGET = 64
+LOCAL_MODEL_NOTE = (
+    "Эффект посчитан по одной локальной модели регламента, до оптимизации и после. "
+    "Схема слева построена отдельно, моделью по тексту."
+)
+_MOVE_KIND = {"zero_rework": "loops", "parallel": "parallel", "automation": "automation"}
+
+
+def _category_contrib(moves: Sequence[dict]) -> Dict[str, float]:
+    """Вклад категории — сумма вкладов её ходов. Порядок списка сумму не меняет."""
+    acc = {"loops": 0.0, "parallel": 0.0, "automation": 0.0}
+    for move in moves or []:
+        key = _MOVE_KIND.get(str((move or {}).get("kind") or ""))
+        if key is None:
+            continue
+        acc[key] += float(move.get("path_hours") or 0)
+    return acc
+
+
+def _diagram_signature(xml: str) -> Tuple:
+    """Узлы и потоки без координат: сравнение графа до первого хода оптимизации."""
+    if not (xml or "").strip():
+        return ()
+    try:
+        struct = parse_bpmn_structure(xml)
+    except Exception:  # noqa: BLE001
+        return ("unparsed", xml)
+    nodes = tuple(sorted(
+        (n.get("type") or "", n.get("name") or "", n.get("lane") or "")
+        for n in (struct.get("nodes") or {}).values()
+    ))
+    id_name = {n.get("id"): n.get("name") or "" for n in (struct.get("nodes") or {}).values()}
+    flows = tuple(sorted(
+        (id_name.get(f.get("src"), f.get("src") or ""), id_name.get(f.get("dst"), f.get("dst") or ""), f.get("name") or "")
+        for f in (struct.get("flows") or [])
+    ))
+    return nodes, flows
 
 
 def _iter_tobe_selections(
@@ -7261,6 +7315,43 @@ def _iter_tobe_selections(
     return selections
 
 
+def _measure_isolated_moves(
+    text: str, base_cp: float, spec: Dict[str, Set[int]], skip: Set[int],
+) -> List[Dict[str, Any]]:
+    """Каждый принятый ход отдельно: критический путь до хода и после, тот же Беллман–Форд."""
+    rows: List[Dict[str, Any]] = []
+    plain_loops = set(spec.get("loops") or []) - set(spec.get("control") or [])
+    plan = [
+        ("automation", sorted(spec.get("auto") or []), {
+            "do_auto": True, "do_parallel": False, "do_safety": False, "do_loops": False, "do_control": False,
+        }, "only_auto"),
+        ("parallel", sorted(spec.get("parallel") or []), {
+            "do_auto": False, "do_parallel": True, "do_safety": False, "do_loops": False, "do_control": False,
+        }, "only_parallel"),
+        ("zero_rework", sorted(plain_loops), {
+            "do_auto": False, "do_parallel": False, "do_safety": False, "do_loops": True, "do_control": False,
+        }, "only_loops"),
+        ("zero_rework", sorted(spec.get("control") or []), {
+            "do_auto": False, "do_parallel": False, "do_safety": False, "do_loops": True, "do_control": True,
+        }, "only_control"),
+    ]
+    for kind, indexes, flags, only_key in plan:
+        for index in indexes:
+            only = {"only_auto": set(), "only_parallel": set(), "only_loops": set(), "only_control": set()}
+            only[only_key] = {index}
+            if only_key == "only_control":
+                only["only_loops"] = {index}
+            cand_text, actions = _heuristic_optimize_to_be(text, skip_auto=skip, **flags, **only)
+            hours = 0.0
+            if actions:
+                _, audit_i, err_i = _rebuild_process(cand_text, "move", [], use_llm=False)
+                if not err_i and audit_i:
+                    after = float((audit_i.get("sla") or {}).get("critical_path_hours") or base_cp)
+                    hours = round(base_cp - after, 3)
+            rows.append({"kind": kind, "index": index, "path_hours": hours})
+    return rows
+
+
 def optimize_process_to_be(
     regulation_text: str, audit_data: dict, skip_auto: Optional[Iterable[int]] = None,
 ) -> Tuple[str, dict]:
@@ -7288,7 +7379,25 @@ def optimize_process_to_be(
         return text, empty
 
     asis_audit = audit_data or {}
-    asis_m = _tobe_metrics(asis_audit, text)
+    # Бюджет 0: та же локальная пересборка исходного текста, без ходов оптимизации.
+    base_xml, base_audit, base_err = _rebuild_process(text, "local-baseline", [], use_llm=False)
+    check_xml, _, check_err = _rebuild_process(text, "local-baseline", [], use_llm=False)
+    canvas_loops = len((asis_audit.get("rework_loops") or []))
+    if base_err or not base_audit or check_err:
+        empty["tobe_error"] = base_err or check_err or "локальная модель не собрала baseline"
+        empty["canvas_loops"] = canvas_loops
+        empty["local_model"] = True
+        return text, empty
+    if _diagram_signature(base_xml) != _diagram_signature(check_xml):
+        empty["tobe_error"] = (
+            "Локальная модель дала разные графы до первого хода оптимизации "
+            "(бюджет 0 и старт бюджета 64). Генератор не менялся."
+        )
+        empty["canvas_loops"] = canvas_loops
+        empty["local_model"] = True
+        return text, empty
+    base_m = _tobe_metrics(base_audit, text)
+    rejected: List[Dict[str, str]] = []
     flagsets: List[Dict[str, bool]] = [
         {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": False},
         {"do_auto": True, "do_parallel": True, "do_safety": True, "do_loops": True, "do_control": True},
@@ -7300,9 +7409,14 @@ def optimize_process_to_be(
     ]
     seen: set = set()
     built = 0
-    best: Optional[Tuple[Tuple[float, float, float], str, List[Dict[str, str]], str, dict, str]] = None
+    best: Optional[Tuple] = None
 
-    def _consider(cand_text: str, cand_actions: List[Dict[str, str]], cand_engine: str) -> None:
+    def _consider(
+        cand_text: str,
+        cand_actions: List[Dict[str, str]],
+        cand_engine: str,
+        move_spec: Optional[Dict[str, Set[int]]] = None,
+    ) -> None:
         nonlocal best, built
         if built >= _TOBE_REBUILD_BUDGET:
             return
@@ -7318,10 +7432,16 @@ def optimize_process_to_be(
         if err or not new_audit:
             return
         metrics = _tobe_metrics(new_audit, cand_text)
-        if not _tobe_feasible(asis_m, metrics, text, cand_text):
+        if not _tobe_feasible(base_m, metrics, text, cand_text):
+            reason = _tobe_known_block(base_m, metrics)
+            if reason and len(rejected) < 24:
+                detail = "; ".join(
+                    str(a.get("detail") or a.get("kind") or "") for a in (cand_actions or [])[:2]
+                ) or cand_engine
+                rejected.append({"detail": detail, "reason": reason})
             return
         score = (metrics["rw"], metrics["cp"], metrics["n"])
-        pack = (score, cand_text, cand_actions or [], xml, new_audit, cand_engine)
+        pack = (score, cand_text, cand_actions or [], xml, new_audit, cand_engine, move_spec)
         if best is None or pack[0] < best[0]:
             best = pack
 
@@ -7332,13 +7452,24 @@ def optimize_process_to_be(
         except Exception:  # noqa: BLE001
             llm_text = None
     if llm_text:
-        _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm")
+        _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm", None)
+
+    autos_all, pairs_all, loops_all = _catalog_tobe_moves(text)
+    autos_all = [a for a in autos_all if a not in skip]
+
+    def _spec_of(flags: Dict[str, bool]) -> Dict[str, Set[int]]:
+        return {
+            "auto": set(autos_all) if flags.get("do_auto") else set(),
+            "parallel": set(pairs_all) if flags.get("do_parallel") else set(),
+            "loops": set(loops_all) if flags.get("do_loops") else set(),
+            "control": set(loops_all) if flags.get("do_control") else set(),
+        }
 
     for flags in flagsets:
         opt_text, actions = _heuristic_optimize_to_be(text, **flags, skip_auto=skip)
         if not actions:
             continue
-        _consider(opt_text, actions, "semantic-optimizer")
+        _consider(opt_text, actions, "semantic-optimizer", _spec_of(flags))
 
     autos, pairs, loops = _catalog_tobe_moves(text)
     autos = [a for a in autos if a not in skip]
@@ -7359,41 +7490,50 @@ def optimize_process_to_be(
         )
         if not actions:
             continue
-        _consider(opt_text, actions, "semantic-optimizer")
+        _consider(
+            opt_text,
+            actions,
+            "semantic-optimizer",
+            {
+                "auto": set(auto_idx),
+                "parallel": set(pair_idx),
+                "loops": set(loop_idx),
+                "control": set(ctrl_idx),
+            },
+        )
 
     engine = "semantic-optimizer"
+
+    def _finish(delta: dict, optimized_text: str) -> Tuple[str, dict]:
+        delta["canvas_loops"] = canvas_loops
+        delta["local_model"] = True
+        delta["rejected"] = rejected
+        if skip:
+            delta["skip_auto"] = sorted(skip)
+        return optimized_text, delta
+
     if best is None:
         optimized = text
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
-        xml, new_audit, err = "", asis_audit, ""
-        if asis_audit.get("sla"):
-            pass
-        else:
-            try:
-                xml, new_audit, err = _rebuild_process(text, "to-be · as-is", [], use_llm=False)
-            except Exception as exc:  # noqa: BLE001
-                err = f"{type(exc).__name__}: {exc}"
-        delta = _tobe_delta(asis_audit, new_audit or asis_audit, actions, engine)
-        delta["tobe_xml"] = xml or ""
-        delta["tobe_audit"] = new_audit or asis_audit
-        delta["tobe_error"] = err or ""
+        delta = _tobe_delta(base_audit, base_audit, actions, engine)
+        delta["tobe_xml"] = ""
+        delta["tobe_audit"] = base_audit
+        delta["tobe_error"] = ""
         delta["tobe_text"] = optimized
-        if skip:
-            delta["skip_auto"] = sorted(skip)
-        return optimized, delta
+        delta["move_hours"] = []
+        return _finish(delta, optimized)
 
-    _score, optimized, actions, xml, new_audit, engine = best
-    actions = _limit_escalation_actions(actions, asis_audit, new_audit)
+    _score, optimized, actions, xml, new_audit, engine, move_spec = best
+    actions = _limit_escalation_actions(actions, base_audit, new_audit)
     if not actions:
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
-    delta = _tobe_delta(asis_audit, new_audit or {}, actions, engine)
+    delta = _tobe_delta(base_audit, new_audit or {}, actions, engine)
     delta["tobe_xml"] = xml or ""
     delta["tobe_audit"] = new_audit or {}
     delta["tobe_error"] = ""
     delta["tobe_text"] = optimized
-    if skip:
-        delta["skip_auto"] = sorted(skip)
-    return optimized, delta
+    delta["move_hours"] = _measure_isolated_moves(text, float(base_m["cp"]), move_spec or {}, skip)
+    return _finish(delta, optimized)
 
 
 def _docx_shade(cell: Any, fill: str) -> None:
