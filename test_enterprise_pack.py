@@ -1951,6 +1951,40 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
             tobe_m = ((ex_delta.get("tobe_audit") or {}).get("methodology") or {})
             assert int(tobe_m.get("score") or ex_delta.get("quality_after") or 0) < 100 or tobe_m.get("long_chains")
 
+    # Холст с баллом 92 не подменяет локальную пару. Пустое «Снято» оставляет 62 → 62.
+    chain_item = {
+        "type": "chain",
+        "role": "Закупочная служба",
+        "steps": ["Проверить комплектность заявки"],
+        "message": "«Закупочная служба»: Проверить комплектность заявки",
+        "quote": "",
+    }
+    mixed = {
+        "quality_before": 62,
+        "quality_after": 62,
+        "baseline_violations": [chain_item],
+        "violations_removed": [],
+        "violations_remaining": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        mixed,
+        {"methodology": {"score": 62, "violation_items": [chain_item], "quality_fraction": "8 / 13"}},
+    )
+    assert mixed["quality_before"] == 62 and mixed["quality_after"] == 62, mixed
+    assert mixed["violations_removed"] == []
+    assert mixed["violations_remaining"]
+    raised = {
+        "quality_before": 50,
+        "quality_after": 50,
+        "baseline_violations": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        raised,
+        {"methodology": {"score": 80, "violation_items": []}},
+    )
+    assert raised["quality_before"] == 50 and raised["quality_after"] == 80
+    assert raised["violations_removed"]
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",

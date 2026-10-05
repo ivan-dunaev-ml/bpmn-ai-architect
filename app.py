@@ -1880,6 +1880,32 @@ def _delta_matches_edges(delta: Dict[str, Any], audit: Dict[str, Any]) -> bool:
     return reported is not None and int(reported) == edges
 
 
+def _keep_local_tobe_quality(delta: Dict[str, Any], shown_audit: Dict[str, Any]) -> None:
+    """Балл карточки — локальная модель до и после. Балл холста сюда не подставляется.
+
+    Холст может быть собран другой моделью. Пустое «Снято» оставляет балл равным
+    баллу локальной модели до ходов. Балл не падает, если нарушение не снято.
+    """
+    from ai_generator import notation_removed_remaining
+
+    local_before = int(delta.get("quality_before") or 0)
+    baseline = delta.get("baseline_violations")
+    if isinstance(baseline, list):
+        removed, remaining = notation_removed_remaining(
+            {"methodology": {"violation_items": baseline}},
+            shown_audit or {},
+        )
+        delta["violations_removed"] = removed
+        delta["violations_remaining"] = remaining
+    removed = list(delta.get("violations_removed") or [])
+    paste_after = int((((shown_audit or {}).get("methodology") or {}).get("score") or 0))
+    if not removed or paste_after < local_before:
+        paste_after = local_before
+    delta["quality_before"] = local_before
+    delta["quality_after"] = paste_after
+    delta["quality_gain"] = max(0, paste_after - local_before)
+
+
 def prepare_regulation(
     text: str,
     use_llm: bool = False,
@@ -1933,11 +1959,6 @@ def prepare_regulation(
         pack["tobe_reason"] = tobe_unavailable_reason(audit, delta, facts, tobe_xml)
         return pack
     shown_tobe, tobe_view = align_result_quality(opt_text or "", tobe_xml, tobe_audit, bool(use_llm))
-    paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
-    delta["quality_after"] = paste_after
-    delta["quality_before"] = int(((audit.get("methodology") or {}).get("score") or 0))
-    delta["quality_gain"] = max(0, paste_after - int(delta["quality_before"]))
-    facts = process_facts(audit, delta)
     pack["tobe_text"] = shown_tobe or opt_text or ""
     # На экране схема повторной сборки текста, а не рисунок в памяти с более высоким баллом.
     rebuilt_xml = str(tobe_view.get("result_xml") or "")
@@ -1945,6 +1966,11 @@ def prepare_regulation(
     if rebuilt_xml and rebuilt_audit:
         tobe_xml = rebuilt_xml
         tobe_audit = rebuilt_audit
+    elif isinstance(tobe_view.get("methodology"), dict):
+        tobe_audit = dict(tobe_audit)
+        tobe_audit["methodology"] = dict(tobe_view["methodology"])
+    _keep_local_tobe_quality(delta, tobe_audit)
+    facts = process_facts(audit, delta)
     pack["tobe_xml"] = tobe_xml
     pack["tobe_audit"] = tobe_audit
     pack["delta"] = delta or {}
@@ -1968,15 +1994,15 @@ def retune_tobe(audit: Dict[str, Any], delta: Dict[str, Any], use_llm: bool = Fa
         out["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
         return out
     shown_tobe, tobe_view = align_result_quality(opt_text, tobe_xml, tobe_audit, bool(use_llm))
-    paste_after = int(((tobe_view.get("methodology") or {}).get("score") or 0))
-    delta["quality_after"] = paste_after
-    delta["quality_before"] = int(((audit.get("methodology") or {}).get("score") or 0))
-    delta["quality_gain"] = max(0, paste_after - int(delta["quality_before"]))
-    facts = process_facts(audit, delta)
     rebuilt_xml = str(tobe_view.get("result_xml") or "")
     rebuilt_audit = tobe_view.get("result_audit") if isinstance(tobe_view.get("result_audit"), dict) else None
     if rebuilt_xml and rebuilt_audit:
         tobe_xml, tobe_audit = rebuilt_xml, rebuilt_audit
+    elif isinstance(tobe_view.get("methodology"), dict):
+        tobe_audit = dict(tobe_audit)
+        tobe_audit["methodology"] = dict(tobe_view["methodology"])
+    _keep_local_tobe_quality(delta, tobe_audit)
+    facts = process_facts(audit, delta)
     out.update(
         tobe_text=shown_tobe or opt_text or "", tobe_xml=tobe_xml, tobe_audit=tobe_audit, tobe_ok=True,
         facts=_annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True),
@@ -2453,18 +2479,17 @@ def render_tobe_tab() -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
-    asis_for_card = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_for_card = pack.get("audit") or {}
-    asis_meth = (asis_for_card.get("methodology") or {})
     tobe_meth = (tobe_for_card.get("methodology") or {})
-    frac = tobe_meth.get("quality_fraction") or asis_meth.get("quality_fraction") or ""
+    frac = tobe_meth.get("quality_fraction") or ""
     if frac:
         st.caption(f"Доля без нарушений: {frac}")
-    try:
-        from ai_generator import notation_removed_remaining
-        removed_v, remain_v = notation_removed_remaining(asis_for_card, tobe_for_card)
-    except Exception:  # noqa: BLE001
-        removed_v, remain_v = [], list((tobe_meth.get("violation_items") or tobe_meth.get("violations") or []))
+    # Списки той же локальной пары, что и баллы карточки. Холст As-Is сюда не подмешивается.
+    removed_v = delta.get("violations_removed")
+    remain_v = delta.get("violations_remaining")
+    if not isinstance(removed_v, list) or not isinstance(remain_v, list):
+        removed_v = []
+        remain_v = list(tobe_meth.get("violation_items") or [])
     st.markdown('<div class="ir-title" style="margin-top:8px">Снято</div>', unsafe_allow_html=True)
     if not removed_v:
         st.markdown(
@@ -3030,8 +3055,7 @@ def main() -> None:
             ]
         )
         with tab_audit:
-            # Качество To-Be — строго из To-Be audit активной схемы, не из As-Is.
-            render_audit(audit, asis_audit=result["audit"])
+            render_audit(audit)
             render_details(audit)
         with tab_tobe:
             render_tobe_tab()

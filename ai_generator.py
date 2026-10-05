@@ -7930,7 +7930,7 @@ def apply_notation_to_diagram(diagram: BPMNDiagramBuilder, regulation_text: str 
                 if st.decision.no_label:
                     no_lab = st.decision.no_label
                     break
-        if no_lab is None and regulation_text and re.search(r"иначе", regulation_text, re.I):
+        if no_lab is None and regulation_text and re.search(r"\bиначе\b", regulation_text, re.I):
             no_lab = "Иначе"
         if not yes_lab or len(str(yes_lab).strip()) < 2:
             continue
@@ -8229,6 +8229,7 @@ def optimize_process_to_be(
         delta["tobe_text"] = optimized
         delta["move_hours"] = []
         removed, remaining = notation_removed_remaining(base_audit, new_audit or base_audit)
+        delta["baseline_violations"] = _methodology_items(base_audit)
         delta["violations_removed"] = removed
         delta["violations_remaining"] = remaining
         if not removed:
@@ -8267,6 +8268,7 @@ def optimize_process_to_be(
     )
     # Честные «Снято» / «Осталось» из аудитов
     removed, remaining = notation_removed_remaining(base_audit, new_audit or {})
+    delta["baseline_violations"] = _methodology_items(base_audit)
     delta["violations_removed"] = removed
     delta["violations_remaining"] = remaining
     # Балл растёт только вместе со строкой «Снято»
