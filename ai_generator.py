@@ -3458,6 +3458,10 @@ def compare_asis_tobe(
         {
             "kind": "parallel", "label": "Параллель", "hours": _h(par_t),
             "detail": ("Шаги стали параллельными: " + ", ".join(f"«{t}»" for t in par_titles)) if par_titles else "",
+            "same_role": any(
+                s.parallel and i > 0 and _compare_key(s.role) == _compare_key(after[i - 1].role)
+                for i, s in enumerate(after)
+            ),
         },
         {
             "kind": "automation", "label": "Автоматизация", "hours": _h(auto_t),
@@ -7178,6 +7182,10 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
         "rework_hours_after": round(rw_h_a, 3),
         "with_rework_before": round(before_rw, 3),
         "with_rework_after": round(after_rw, 3),
+        "role_before": old_sla.get("role_hours"),
+        "role_after": new_sla.get("role_hours"),
+        "role_before_estimate": bool(old_sla.get("role_hours_estimate")),
+        "role_after_estimate": bool(new_sla.get("role_hours_estimate")),
         "quality_before": q_b,
         "quality_after": q_a,
         "quality_gain": max(0, q_a - q_b),

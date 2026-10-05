@@ -189,6 +189,11 @@ def fmt_days(hours: float) -> str:
     return f"≈ {hours / 8:.0f} раб. дн."
 
 
+def fmt_role_hours(hours: float) -> str:
+    text = f"{float(hours):.1f} ч"
+    return text.replace(".0 ч", " ч")
+
+
 # --------------------------------------------------------------------------- #
 # Стили
 # --------------------------------------------------------------------------- #
@@ -1637,6 +1642,19 @@ def render_audit(audit: Dict[str, Any]) -> None:
         ),
         unsafe_allow_html=True,
     )
+    if sla.get("role_hours") is not None:
+        role_est = " · оценка" if sla.get("role_hours_estimate") else ""
+        st.markdown(
+            card(
+                "Срок с учётом ролей",
+                fmt_role_hours(float(sla["role_hours"])) + role_est,
+                "Параллельные ветки идут одновременно только если на них разные роли. "
+                "Одна роль делает свои шаги по очереди.",
+                BLUE,
+                "по ролям",
+            ),
+            unsafe_allow_html=True,
+        )
     if audit.get("sla_hours_note"):
         note = str(audit["sla_hours_note"])
         if audit.get("sla_hours_approximate"):
@@ -2319,6 +2337,11 @@ def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
             f'<div class="tobe-act"><b>{esc(part["label"])}</b>: {hours:+.1f} ч{esc(extra)}</div>',
             unsafe_allow_html=True,
         )
+        if part.get("kind") == "parallel" and part.get("same_role"):
+            st.markdown(
+                '<div class="tobe-act">По людям выигрыша нет: одна роль на обеих ветках</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def render_tobe_tab() -> None:
@@ -2369,6 +2392,21 @@ def render_tobe_tab() -> None:
         f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
         f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
+    role_before = delta.get("role_before")
+    role_after = delta.get("role_after")
+    if role_before is not None and role_after is not None:
+        role_est = ""
+        if delta.get("role_before_estimate") or delta.get("role_after_estimate"):
+            role_est = " · оценка"
+        st.markdown(
+            f'<div class="ir-title" style="margin-top:8px">Срок с учётом ролей: '
+            f'{fmt_role_hours(float(role_before))} → {fmt_role_hours(float(role_after))}{role_est}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Параллельные ветки идут одновременно только если на них разные роли. "
+            "Одна роль делает свои шаги по очереди."
+        )
     engine = delta.get("engine") or "semantic-optimizer"
     st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
     if delta.get("local_model"):

@@ -1739,6 +1739,74 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     from validate_bpmn import xsd_errors_xml
 
     assert xsd_errors_xml(xml_fork) == [] or xsd_errors_xml(xml_fork) is None or not xsd_errors_xml(xml_fork)
+
+    from bpmn_framework import BPMNDiagramBuilder
+
+    def _role_case(lanes, kind, same_lane):
+        diagram = BPMNDiagramBuilder()
+        _, lane_ids = diagram.add_pool("p", lanes)
+        start = diagram.add_start_event("Старт", lane_ids[0])
+        first = diagram.add_user_task("Первый", lane_ids[0])
+        second = diagram.add_user_task("Второй", lane_ids[0] if same_lane else lane_ids[1])
+        end = diagram.add_end_event("Конец", lane_ids[0])
+        diagram.set_sla(first, 3)
+        diagram.set_sla(second, 5)
+        if kind == "chain":
+            diagram.add_link(start, first)
+            diagram.add_link(first, second)
+            diagram.add_link(second, end)
+        elif kind == "par":
+            split = diagram.add_parallel_gateway("Разделить", lane_ids[0])
+            join = diagram.add_parallel_gateway("Слить", lane_ids[0])
+            diagram.add_link(start, split)
+            diagram.add_link(split, first)
+            diagram.add_link(split, second)
+            diagram.add_link(first, join)
+            diagram.add_link(second, join)
+            diagram.add_link(join, end)
+        else:
+            split = diagram.add_exclusive_gateway("Выбор", lane_ids[0])
+            join = diagram.add_exclusive_gateway("Снова", lane_ids[0])
+            diagram.set_sla(split, 0)
+            diagram.set_sla(join, 0)
+            diagram.add_link(start, split)
+            diagram.add_link(split, first, "да")
+            diagram.add_link(split, second, "нет")
+            diagram.add_link(first, join)
+            diagram.add_link(second, join)
+            diagram.add_link(join, end)
+        return diagram.analyze_bottlenecks()["sla"]
+
+    par_diff = _role_case(["А", "Б"], "par", False)
+    assert par_diff["critical_path_hours"] == 5 and par_diff["role_hours"] == 5, par_diff
+    par_same = _role_case(["А"], "par", True)
+    assert par_same["critical_path_hours"] == 5 and par_same["role_hours"] == 8, par_same
+    xor_same = _role_case(["А"], "xor", True)
+    assert xor_same["critical_path_hours"] == 5 and xor_same["role_hours"] == 5, xor_same
+    chain_same = _role_case(["А"], "chain", True)
+    assert chain_same["critical_path_hours"] == 8 and chain_same["role_hours"] == 8, chain_same
+    role_once = opened["audit"]["sla"]["role_hours"]
+    role_twice = generate_bpmn_from_text(text1, use_llm=False)[1]["sla"]["role_hours"]
+    assert role_once == role_twice
+    assert opened["audit"]["sla"]["critical_path_hours"] == 9.7
+    role_facts = {
+        "tobe_ready": True, "rw_before": 8.0, "rw_after": 5.0, "cp_before": 8.0, "cp_after": 5.0,
+        "loops_before": 0, "loops_after": 0, "rw_saved_pct": 37,
+    }
+    one_role = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Параллельно: Мастер: Второй шаг (5 ч).\n",
+        {}, {}, role_facts,
+    )
+    one_par = next(p for p in one_role["parts"] if p["kind"] == "parallel")
+    assert one_par["same_role"] is True and one_par["hours"] != 0, one_par
+    two_roles = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Диспетчер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Параллельно: Диспетчер: Второй шаг (5 ч).\n",
+        {}, {}, role_facts,
+    )
+    assert next(p for p in two_roles["parts"] if p["kind"] == "parallel")["same_role"] is False
+
     print(
         "ok",
         f"steps={len(parsed.steps)}",

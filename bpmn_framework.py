@@ -1435,6 +1435,169 @@ class BPMNDiagramBuilder:
         path.reverse()
         return -dist[best], path
 
+    def _role_schedule(
+        self, owner_id: str, start_id: Optional[str], back: Set[str], memo: Dict[str, float],
+    ) -> Tuple[float, bool]:
+        """Срок с учётом ролей: список-расписание на том же графе, что голый путь, без обратных рёбер.
+
+        Параллельные ветки идут одновременно только при разных ролях. Exclusive — альтернативы,
+        в итог берётся самый длинный сценарий. Это не замена Беллмана — Форда.
+        """
+        nodes = self._children(owner_id)
+        if not nodes:
+            return 0.0, False
+        ids = [n.id for n in nodes]
+        hours = {n.id: self._node_hours(n, memo) for n in nodes}
+        roles: Dict[str, Optional[str]] = {}
+        for n in nodes:
+            if n.kind not in WORK_KINDS:
+                roles[n.id] = None
+            elif n.lane_id in self.lanes and (self.lanes[n.lane_id].name or "").strip():
+                roles[n.id] = self.lanes[n.lane_id].name.strip()
+            else:
+                roles[n.id] = "без роли"
+        scope = set(ids)
+        forward = [(l.source_id, l.target_id) for l in self._scope_links(scope) if l.id not in back]
+        succ: Dict[str, List[str]] = defaultdict(list)
+        pred: Dict[str, List[str]] = defaultdict(list)
+        for u, v in forward:
+            succ[u].append(v)
+            pred[v].append(u)
+        sources = [n for n in ids if not pred[n]]
+        if start_id in scope and start_id not in sources:
+            sources.append(start_id)
+
+        def _reach(edges: Sequence[Tuple[str, str]]) -> Set[str]:
+            out: Dict[str, List[str]] = defaultdict(list)
+            for u, v in edges:
+                out[u].append(v)
+            seen: Set[str] = set()
+            stack = list(sources)
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(out.get(cur, []))
+            return seen
+
+        tails: Dict[str, float] = {}
+
+        def _tail(nid: str, stack: Set[str]) -> float:
+            if nid in tails:
+                return tails[nid]
+            if nid in stack:
+                tails[nid] = hours[nid]
+                return tails[nid]
+            stack.add(nid)
+            best = max((_tail(w, stack) for w in succ.get(nid, [])), default=0.0)
+            stack.remove(nid)
+            tails[nid] = hours[nid] + best
+            return tails[nid]
+
+        for nid in ids:
+            _tail(nid, set())
+
+        def _makespan(edges: Sequence[Tuple[str, str]]) -> float:
+            live = _reach(edges)
+            out: Dict[str, List[str]] = defaultdict(list)
+            inn: Dict[str, List[str]] = defaultdict(list)
+            for u, v in edges:
+                if u in live and v in live:
+                    out[u].append(v)
+                    inn[v].append(u)
+            finish: Dict[str, float] = {}
+            role_free: Dict[str, float] = defaultdict(float)
+            pending = set(live)
+            guard = 0
+            while pending and guard <= len(ids) + 2:
+                guard += 1
+                ready = []
+                for nid in pending:
+                    if any(p not in finish for p in inn.get(nid, [])):
+                        continue
+                    pred_done = max((finish[p] for p in inn.get(nid, [])), default=0.0)
+                    role = roles[nid]
+                    start = pred_done if role is None else max(pred_done, role_free[role])
+                    ready.append((start, -tails.get(nid, 0.0), nid, role))
+                if not ready:
+                    break
+                moment = min(item[0] for item in ready)
+                ready = [item for item in ready if abs(item[0] - moment) < 1e-9]
+                ready.sort(key=lambda item: (item[1], item[2]))
+                start, _, nid, role = ready[0]
+                done = start + hours[nid]
+                finish[nid] = done
+                if role is not None:
+                    role_free[role] = done
+                pending.remove(nid)
+            return max(finish.values(), default=0.0)
+
+        estimate = False
+        splits: List[Tuple[str, List[str]]] = []
+        for n in nodes:
+            outs = succ.get(n.id, [])
+            if len(outs) < 2:
+                continue
+            if n.kind == "inclusiveGateway":
+                estimate = True
+            elif n.kind == "exclusiveGateway":
+                splits.append((n.id, list(outs)))
+        count = 1
+        for _, outs in splits:
+            count *= len(outs)
+        def _from(origin: str) -> Set[str]:
+            seen: Set[str] = set()
+            stack = [origin]
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(succ.get(cur, []))
+            return seen
+
+        if count > 64:
+            estimate = True
+            chosen: Dict[str, str] = {}
+            for gid, outs in splits:
+                reach = [_from(t) for t in outs]
+                # Узел, доступный из другой ветки того же шлюза, — это слияние, его часы в сумму ветки не входят.
+                scores = []
+                for i, tgt in enumerate(outs):
+                    others: Set[str] = set()
+                    for j, got in enumerate(reach):
+                        if j != i:
+                            others |= got
+                    branch = {tgt} | {x for x in reach[i] if x not in others}
+                    scores.append((
+                        sum(hours[x] for x in branch if roles[x] is not None),
+                        tgt,
+                    ))
+                scores.sort(key=lambda item: (-item[0], item[1]))
+                chosen[gid] = scores[0][1]
+            edges = [
+                (u, v) for u, v in forward
+                if u not in chosen or v == chosen[u]
+            ]
+            return round(_makespan(edges), 2), True
+
+        if not splits:
+            return round(_makespan(forward), 2), estimate
+
+        from itertools import product
+
+        best = 0.0
+        options = [outs for _, outs in splits]
+        for pick in product(*options):
+            chosen = {splits[i][0]: pick[i] for i in range(len(splits))}
+            edges = [
+                (u, v) for u, v in forward
+                if u not in chosen or v == chosen[u]
+            ]
+            best = max(best, _makespan(edges))
+        return round(best, 2), estimate
+
     def _rework_loops(self, memo: Dict[str, float]) -> List[Dict[str, object]]:
         loops: List[Dict[str, object]] = []
         owners = [p.process_id for p in self.pools.values()][:1] or [self.process_id]
@@ -1790,9 +1953,12 @@ class BPMNDiagramBuilder:
             if self.nodes[nid].kind not in EVENT_KINDS
         ]
         target = self.sla_target_hours
+        role_hours, role_estimate = self._role_schedule(root, start_id, back, memo)
         sla = {
             "target_hours": target,
             "critical_path_hours": round(base_hours, 2),
+            "role_hours": role_hours,
+            "role_hours_estimate": role_estimate,
             "with_rework_hours": round(with_rework, 2),
             "rework_hours": rework_hours,
             "rework_total_hours": rework_total,
