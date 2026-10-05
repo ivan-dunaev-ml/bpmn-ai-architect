@@ -1366,10 +1366,10 @@ def _task_title(text: str) -> str:
     text = _CONNECTORS_RE.sub("", text).strip(" .;,:—–-")
     text = _INTRO_CLAUSE_RE.sub("", text).strip(" .;,:—–-")
     if not text:
-        return "Выполнить действие"
+        return ""
     words = [_infinitive(w) if re.fullmatch(r"[А-Яа-яЁё]+", w) else w for w in text.split(" ")]
     title = " ".join(words)
-    title = title[:1].upper() + title[1:] if title else "Выполнить действие"
+    title = title[:1].upper() + title[1:] if title else ""
     if len(title) > TITLE_MAX:
         cut = title[:TITLE_MAX].rsplit(" ", 1)[0]
         title = cut.rstrip(",;:—–- ") + "…"
@@ -5074,6 +5074,30 @@ def _hours_phrase(hours: Optional[float]) -> str:
     return f" ({hours:.1f} ч)".replace(".0 ч", " ч")
 
 
+def _paste_step_name(step: Optional[Step], task: Optional[Dict[str, Any]]) -> str:
+    """Имя шага для текста, который вставляют обратно. Заглушку «Выполнить действие» не пишет."""
+    task_name = str((task or {}).get("name") or "").strip()
+    title = str(getattr(step, "title", "") or "").strip()
+    if task_name == "Выполнить действие":
+        task_name = ""
+    if title == "Выполнить действие":
+        title = ""
+    name = task_name or title
+    if name:
+        return name
+    decision = getattr(step, "decision", None) if step is not None else None
+    if decision is None:
+        return ""
+    yes = str(getattr(decision, "yes_label", "") or "").strip()
+    no = str(getattr(decision, "no_label", "") or "").strip()
+    if yes and no:
+        return f"Если {yes}, иначе «{no}»"
+    if yes:
+        return f"Если {yes}"
+    clause = str(getattr(decision, "back_clause", "") or "").strip()
+    return clause
+
+
 def render_result_regulation(source_text: str, xml: str) -> str:
     """Текст результата: имена «глагол + объект», подписи веток и границы подпроцесса со схемы.
 
@@ -5219,19 +5243,42 @@ def render_result_regulation(source_text: str, xml: str) -> str:
     lines.append(f"Регламент: {title}")
     if parsed.sla_hours:
         lines.append(f"Целевой срок: {_hours_phrase(parsed.sla_hours).strip(' ()')}")
-    # Порядок и номер — из регламента, не из координат картинки.
+    # Порядок — из регламента. Пропущенный шаг без имени не оставляет дыру в нумерации.
+    drafted: List[Tuple[int, str]] = []
+    skipped = False
     for step in sorted(parsed.steps, key=lambda s: s.num):
         task = bound.get(step.num)
-        name = (str(task.get("name") or "").strip() if task is not None else "") or (step.title or "Выполнить действие")
+        name = _paste_step_name(step, task)
+        if not name:
+            skipped = True
+            continue
         role = (str(task.get("lane") or "").strip() if task is not None else "") or step.role or "Исполнитель"
         parallel = "Параллельно: " if step.parallel else ""
         body = f"{parallel}{role}: {name}{_stage_phrase(task, step)}{_hours_phrase(step.hours)}{_gateway_sentence(task, step)}"
-        lines.append(f"{step.num}. {body}.")
+        drafted.append((step.num, body))
     for task in pool:
-        name = str(task.get("name") or "").strip() or "Выполнить действие"
+        name = str(task.get("name") or "").strip()
+        if not name or name == "Выполнить действие":
+            skipped = True
+            continue
         role = str(task.get("lane") or "").strip() or "Исполнитель"
         body = f"{role}: {name}{_stage_phrase(task, None)}{_gateway_sentence(task, None)}"
-        lines.append(f"{int(task['_out_num'])}. {body}.")
+        drafted.append((int(task["_out_num"]), body))
+    if skipped:
+        mapping = {old: i for i, (old, _) in enumerate(drafted, 1)}
+
+        def _renumber(body: str) -> str:
+            return re.sub(
+                r"п\.(\d+)",
+                lambda m: f"п.{mapping[int(m.group(1))]}" if int(m.group(1)) in mapping else m.group(0),
+                body,
+            )
+
+        for i, (_, body) in enumerate(drafted, 1):
+            lines.append(f"{i}. {_renumber(body)}.")
+    else:
+        for num, body in drafted:
+            lines.append(f"{num}. {body}.")
     rendered = "\n".join(lines).strip()
     return rendered or source
 
