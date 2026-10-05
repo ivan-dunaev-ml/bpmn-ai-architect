@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 
 from ai_generator import (
+    apply_chain_wrap_text,
+    apply_notation_moves_text,
+    apply_notation_to_diagram,
     emulate_generation,
     execute_generated_code,
     export_docx_passport,
@@ -14,6 +17,7 @@ from ai_generator import (
     generate_raci_matrix,
     heuristic_analysis,
     build_process_context,
+    notation_removed_remaining,
     optimize_process_to_be,
     parse_regulation,
     read_docx_regulation,
@@ -21,6 +25,7 @@ from ai_generator import (
     _build_blocks,
     _hours_phrase,
 )
+from bpmn_framework import BPMNDiagramBuilder, WORK_KINDS, _name_is_infinitive_object
 
 
 def main() -> None:
@@ -1820,6 +1825,131 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     )
     assert skipped["saved_hours"] == 3.0
     assert [p["label"] for p in skipped["parts"]] == ["Раскладка по категориям не считалась: ходов больше 12"]
+
+
+    # --- P0 нотация: подпись шлюза, имя, цепочка, дорожка ИС, примеры 1–3 ---
+    gw_reg = (
+        "Регламент: Шлюз\n"
+        "1. Бухгалтер: Проверить сумму. Если сумма больше 100 — согласовать, иначе отклонить (1 ч).\n"
+        "2. Бухгалтер: Согласовать платёж (1 ч).\n"
+        "3. Бухгалтер: Отклонить заявку (1 ч).\n"
+    )
+    d_gw = BPMNDiagramBuilder(process_name="Шлюз")
+    _pool, lanes_gw = d_gw.add_pool("p", ["Бухгалтер"])
+    lane_gw = lanes_gw[0]
+    st_gw = d_gw.add_start_event("Старт", lane_gw)
+    en_gw = d_gw.add_end_event("Конец", lane_gw)
+    t_sum = d_gw.add_task("Проверить сумму", lane_gw)
+    d_gw.set_sla(t_sum, 1.0)
+    gw = d_gw.add_exclusive_gateway("сумма больше 100?", lane_gw)
+    t_yes = d_gw.add_task("Согласовать платёж", lane_gw)
+    d_gw.set_sla(t_yes, 1.0)
+    t_no = d_gw.add_task("Отклонить заявку", lane_gw)
+    d_gw.set_sla(t_no, 1.0)
+    d_gw.add_link(st_gw, t_sum)
+    d_gw.add_link(t_sum, gw)
+    d_gw.add_link(gw, t_yes, "")
+    d_gw.add_link(gw, t_no, "")
+    d_gw.add_link(t_yes, en_gw)
+    d_gw.add_link(t_no, en_gw)
+    d_gw.heal_graph()
+    meth_gw0 = d_gw.check_methodology_compliance()
+    hours_gw0 = {n.id: n.sla_hours for n in d_gw.nodes.values()}
+    assert any("без подписи" in v for v in meth_gw0["violations"]), meth_gw0
+    apply_notation_to_diagram(d_gw, gw_reg)
+    meth_gw1 = d_gw.check_methodology_compliance()
+    assert not any("без подписи" in v for v in meth_gw1["violations"]), meth_gw1
+    assert int(meth_gw1["score"]) > int(meth_gw0["score"])
+    assert all(n.sla_hours == hours_gw0[n.id] for n in d_gw.nodes.values())
+
+    name_reg = (
+        "Регламент: Имя\n"
+        "1. Бухгалтер: Заявка. Проверить заявку (1 ч).\n"
+        "2. Бухгалтер: Оплатить счёт (1 ч).\n"
+    )
+    xml_n0, aud_n0, err_n0 = generate_bpmn_from_text(name_reg, use_llm=False)
+    assert not err_n0
+    assert aud_n0["methodology"]["score"] < 100
+    name_fixed, name_acts = apply_notation_moves_text(name_reg)
+    assert name_acts, name_acts
+    xml_n1, aud_n1, err_n1 = generate_bpmn_from_text(name_fixed, use_llm=False)
+    assert not err_n1
+    assert aud_n1["methodology"]["score"] > aud_n0["methodology"]["score"]
+    assert aud_n1["sla"]["critical_path_hours"] == aud_n0["sla"]["critical_path_hours"]
+    bare_name = (
+        "Регламент: Имя без глагола\n"
+        "1. Бухгалтер: Заявка (1 ч).\n"
+        "2. Бухгалтер: Оплатить счёт (1 ч).\n"
+    )
+    xml_b0, aud_b0, err_b0 = generate_bpmn_from_text(bare_name, use_llm=False)
+    bare_fixed, bare_acts = apply_notation_moves_text(bare_name)
+    assert not bare_acts
+    xml_b1, aud_b1, err_b1 = generate_bpmn_from_text(bare_fixed or bare_name, use_llm=False)
+    assert aud_b1["methodology"]["score"] == aud_b0["methodology"]["score"]
+
+    chain5 = (
+        "Регламент: Цепочка роли\n"
+        "1. Диспетчер: Принять заявку смены (1 ч).\n"
+        "2. Диспетчер: Проверить комплект документов (1 ч).\n"
+        "3. Диспетчер: Зарегистрировать обращение в журнале (1 ч).\n"
+        "4. Диспетчер: Назначить исполнителя работ (1 ч).\n"
+        "5. Диспетчер: Передать наряд в работу (1 ч).\n"
+        "6. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    xml_c0, aud_c0, err_c0 = generate_bpmn_from_text(chain5, use_llm=False)
+    assert not err_c0
+    assert aud_c0["methodology"]["score"] < 100
+    assert aud_c0["methodology"]["long_chains"]
+    cp_c0 = aud_c0["sla"]["critical_path_hours"]
+    wrapped, wrap_acts = apply_chain_wrap_text(chain5)
+    assert wrap_acts
+    xml_c1, aud_c1, err_c1 = generate_bpmn_from_text(wrapped, use_llm=False)
+    assert not err_c1
+    assert aud_c1["methodology"]["score"] == aud_c0["methodology"]["score"]
+    assert aud_c1["methodology"]["long_chains"]
+    assert aud_c1["sla"]["critical_path_hours"] == cp_c0
+    assert any("Диспетчер" in str(v) for v in aud_c1["methodology"]["violations"])
+    opt_c, delta_c = optimize_process_to_be(chain5, aud_c0)
+    rem_c, left_c = notation_removed_remaining(aud_c0, delta_c.get("tobe_audit") or {})
+    # цепочка видна в «Осталось»
+    assert any("Диспетчер" in str((x.get("message") if isinstance(x, dict) else x)) for x in (delta_c.get("violations_remaining") or left_c or aud_c1["methodology"]["violations"]))
+
+    # шаг не уезжает на «Информационная система», если этих слов нет в предложении
+    is_reg = (
+        "Регламент: Роль\n"
+        "1. Диспетчер: Зарегистрировать обращение (1 ч).\n"
+        "2. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    d_is = BPMNDiagramBuilder(process_name="ИС")
+    _p, lanes_is = d_is.add_pool("p", ["Диспетчер", "Мастер", "Информационная система"])
+    t_is = d_is.add_task("Зарегистрировать обращение", lanes_is[0])
+    d_is.set_sla(t_is, 1.0)
+    apply_notation_to_diagram(d_is, is_reg)
+    lane_name = d_is.lanes[d_is.nodes[t_is].lane_id].name if d_is.nodes[t_is].lane_id in d_is.lanes else ""
+    assert lane_name != "Информационная система", lane_name
+
+    for ex_path, bare, with_ret in [
+        ("examples/example_1_substation_repair.txt", 9.7, 12.55),
+        ("examples/example_2_equipment_procurement.txt", 528.3, 856.5),
+        ("examples/example_3_grid_connection.txt", 400.3, 584.4),
+    ]:
+        ex_text = (Path(__file__).resolve().parent / ex_path).read_text(encoding="utf-8")
+        _x, ex_aud, ex_err = generate_bpmn_from_text(ex_text, use_llm=False)
+        assert not ex_err, ex_err
+        assert ex_aud["sla"]["critical_path_hours"] == bare, (ex_path, ex_aud["sla"]["critical_path_hours"])
+        assert ex_aud["sla"]["with_rework_hours"] == with_ret, (ex_path, ex_aud["sla"]["with_rework_hours"])
+        _opt, ex_delta = optimize_process_to_be(ex_text, ex_aud)
+        removed = ex_delta.get("violations_removed") or []
+        if not removed:
+            assert int(ex_delta.get("quality_after") or 0) == int(ex_delta.get("quality_before") or 0), ex_path
+        else:
+            assert int(ex_delta.get("quality_after") or 0) >= int(ex_delta.get("quality_before") or 0)
+        if "example_2" in ex_path:
+            remain = ex_delta.get("violations_remaining") or []
+            remain_msg = " ".join(str(x.get("message") if isinstance(x, dict) else x) for x in remain)
+            assert int(ex_delta.get("quality_after") or 0) < 100 or "Закупочная" in remain_msg
+            tobe_m = ((ex_delta.get("tobe_audit") or {}).get("methodology") or {})
+            assert int(tobe_m.get("score") or ex_delta.get("quality_after") or 0) < 100 or tobe_m.get("long_chains")
 
     print(
         "ok",

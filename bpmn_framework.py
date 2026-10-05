@@ -67,6 +67,7 @@ REWORK_PAD = 20.0              # запас U-петли возврата за �
 POOL_REWORK_PAD = 18.0         # отступ U-петли от нижней границы пула
 
 BUS_FACTOR_THRESHOLD = 0.45
+CHAIN_THRESHOLD = 4  # анти-метро: больше N шагов одной роли подряд
 
 # --------------------------------------------------------------------------- #
 # BPMN in Color
@@ -1669,11 +1670,13 @@ class BPMNDiagramBuilder:
         work = [n for n in self.nodes.values() if n.kind in WORK_KINDS]
         named_ok: List[str] = []
         named_bad: List[str] = []
+        named_bad_nodes: List[FlowNode] = []
         for node in work:
             if _name_is_infinitive_object(node.name):
                 named_ok.append(node.name)
             else:
                 named_bad.append(node.name)
+                named_bad_nodes.append(node)
         naming_ratio = (len(named_ok) / len(work)) if work else 1.0
         naming_pass = naming_ratio >= 0.999 or not work
 
@@ -1710,7 +1713,7 @@ class BPMNDiagramBuilder:
         chain_ids: Set[str] = set()
 
         def _flush_chain(active: List[FlowNode]) -> None:
-            if len(active) <= 4:
+            if len(active) <= CHAIN_THRESHOLD:
                 return
             names = " → ".join(c.name for c in active)
             label = f"«{role_of(active[0])}»: {names}"
@@ -1794,6 +1797,46 @@ class BPMNDiagramBuilder:
         total_units = len(work) + unlabeled_flows + missing_bounds
         score = 100 if total_units <= 0 else int(round(100.0 * clean / total_units))
         score = max(0, min(100, score))
+        violation_items: List[Dict[str, object]] = [
+            {
+                "type": "naming",
+                "role": role_of(node),
+                "steps": [node.name],
+                "message": f"Имя шага не в форме «глагол + объект»: «{node.name}»",
+                "quote": "",
+            }
+            for node in named_bad_nodes
+        ]
+        for active_label in chains:
+            # chains entries: «Role»: a → b → c
+            role_m = active_label
+            role_name = ""
+            step_names: List[str] = []
+            if active_label.startswith("«") and "»:" in active_label:
+                role_name = active_label[1:active_label.index("»:")]
+                step_names = [p.strip() for p in active_label.split("»:", 1)[1].split("→")]
+            violation_items.append(
+                {
+                    "type": "chain",
+                    "role": role_name,
+                    "steps": step_names,
+                    "message": active_label,
+                    "quote": "",
+                }
+            )
+        for issue in gw_issues:
+            if "без подписи" not in issue:
+                continue
+            violation_items.append(
+                {
+                    "type": "gateway_label",
+                    "role": "",
+                    "steps": [],
+                    "message": issue,
+                    "quote": "",
+                }
+            )
+
         violations: List[str] = [f"Имя шага не в форме «глагол + объект»: «{name}»" for name in named_bad]
         violations.extend(chains)
         violations.extend(issue for issue in gw_issues if "без подписи" in issue)
@@ -1849,7 +1892,7 @@ class BPMNDiagramBuilder:
                 subway_pass,
                 20,
                 subway_pts,
-                "Нет монотонных цепочек длиннее 4 шагов одной роли без подпроцесса."
+                f"Нет монотонных цепочек длиннее {CHAIN_THRESHOLD} шагов одной роли без подпроцесса."
                 if subway_pass
                 else f"Цепочек без декомпозиции: {len(chains)}.",
                 chains,
@@ -1866,6 +1909,14 @@ class BPMNDiagramBuilder:
                 dead + isolated,
             ),
         ]
+        if not has_start:
+            violation_items.append(
+                {"type": "bounds", "role": "", "steps": [], "message": "Нет стартового события", "quote": ""}
+            )
+        if not has_end:
+            violation_items.append(
+                {"type": "bounds", "role": "", "steps": [], "message": "Нет конечного события", "quote": ""}
+            )
         return {
             "score": score,
             "max_score": 100,
@@ -1877,6 +1928,10 @@ class BPMNDiagramBuilder:
             "dead_ends": len(dead),
             "orphans": len(isolated),
             "violations": violations,
+            "clean": clean,
+            "denominator": total_units,
+            "quality_fraction": f"{clean} / {total_units}",
+            "violation_items": violation_items,
         }
 
     def analyze_bottlenecks(self) -> Dict[str, object]:

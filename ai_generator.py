@@ -49,7 +49,14 @@ from dataclasses import dataclass, field, replace as _dc_replace
 from functools import lru_cache
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from bpmn_framework import DEFAULT_HOURS, GATEWAY_KINDS, WORK_KINDS, BPMNDiagramBuilder
+from bpmn_framework import (
+    CHAIN_THRESHOLD,
+    DEFAULT_HOURS,
+    GATEWAY_KINDS,
+    WORK_KINDS,
+    BPMNDiagramBuilder,
+    _name_is_infinitive_object,
+)
 from validate_bpmn import xsd_errors_xml
 
 ROOT_PROCESS_ID = "Process_Root"
@@ -502,6 +509,7 @@ def execute_generated_code(
         xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit, diagram)
+        _enrich_methodology_quotes(audit, regulation_text)
         expected_returns = _explicit_return_count(regulation_text)
         actual_returns = len(audit.get("rework_loops") or [])
         if expected_returns > actual_returns:
@@ -7564,6 +7572,474 @@ def _measure_isolated_moves(
     ]
 
 
+
+# --------------------------------------------------------------------------- #
+# Нотация To-Be: подписи шлюзов, имена «глагол+объект», дорожка исполнителя,
+# границы start/end; затем свёртка цепочек > CHAIN_THRESHOLD в подпроцесс.
+# Ходы не меняют часы узлов. Ход без снятия нарушения в набор не входит.
+# --------------------------------------------------------------------------- #
+_COND_QUOTE_RE = re.compile(
+    r"(?:если|когда|при|иначе|в случае(?:\s+если)?|да|нет)\b([^.;\n]{0,80})",
+    re.I,
+)
+_VERB_IN_SENT_RE = re.compile(
+    r"\b([А-Яа-яЁё]{3,}(?:ть|ти|чь)|"
+    + "|".join(re.escape(v) for v in list(VERB_MAP.keys())[:40])
+    + r")\b",
+    re.I,
+)
+
+
+def _violation_key(item: Dict[str, Any]) -> str:
+    return f"{item.get('type')}|{item.get('message')}|{'→'.join(item.get('steps') or [])}"
+
+
+def _methodology_items(audit: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    meth = (audit or {}).get("methodology") or {}
+    items = meth.get("violation_items")
+    if isinstance(items, list) and items:
+        return [dict(x) for x in items if isinstance(x, dict)]
+    out: List[Dict[str, Any]] = []
+    for msg in meth.get("violations") or []:
+        text = str(msg)
+        if text.startswith("Имя шага"):
+            out.append({"type": "naming", "role": "", "steps": [], "message": text, "quote": ""})
+        elif text.startswith("«") and "»:" in text:
+            role = text[1:text.index("»:")]
+            steps = [p.strip() for p in text.split("»:", 1)[1].split("→")]
+            out.append({"type": "chain", "role": role, "steps": steps, "message": text, "quote": ""})
+        elif "без подписи" in text:
+            out.append({"type": "gateway_label", "role": "", "steps": [], "message": text, "quote": ""})
+        elif "стартового" in text or "конечного" in text:
+            out.append({"type": "bounds", "role": "", "steps": [], "message": text, "quote": ""})
+        else:
+            out.append({"type": "other", "role": "", "steps": [], "message": text, "quote": ""})
+    return out
+
+
+def _quote_for_step_title(parsed: ParsedRegulation, title: str) -> str:
+    tokens = [t for t in re.findall(r"[А-Яа-яЁё]{4,}", (title or "").lower())][:5]
+    best, best_sc = "", 0
+    for st in parsed.steps:
+        low = (st.title or "").lower()
+        sc = sum(1 for t in tokens if t in low)
+        if sc > best_sc:
+            best_sc = sc
+            best = f"{st.num}. {st.role}: {st.title}"
+    return best
+
+
+def _enrich_methodology_quotes(audit: Dict[str, Any], regulation_text: str) -> None:
+    """Цитаты из регламента к violation_items (для карточки и «Снято»)."""
+    meth = audit.get("methodology") if isinstance(audit.get("methodology"), dict) else None
+    if not meth:
+        return
+    items = _methodology_items(audit)
+    try:
+        parsed = parse_regulation(normalize_regulation(regulation_text or ""))
+    except Exception:  # noqa: BLE001
+        parsed = None
+    for item in items:
+        if item.get("quote"):
+            continue
+        steps = item.get("steps") or []
+        if parsed is not None and steps:
+            quotes = []
+            for name in steps[:5]:
+                q = _quote_for_step_title(parsed, str(name))
+                if q:
+                    quotes.append(q)
+            if quotes:
+                item["quote"] = quotes[0] if len(quotes) == 1 else "; ".join(quotes[:3])
+        elif item.get("type") == "gateway_label" and parsed is not None:
+            for st in parsed.steps:
+                if st.decision is None:
+                    continue
+                body_bits = [st.decision.yes_label or "", st.decision.no_label or "", st.title or ""]
+                item["quote"] = next((b for b in body_bits if b), "")
+                break
+    meth["violation_items"] = items
+    if "clean" in meth and "denominator" in meth:
+        meth["quality_fraction"] = f"{meth['clean']} / {meth['denominator']}"
+
+
+def _extract_predicate_object(sentence: str) -> Optional[str]:
+    """Из предложения шага — «глагол + объект» (инфинитив), иначе None."""
+    src = re.sub(r"\s+", " ", (sentence or "").strip(" .;,:"))
+    if not src:
+        return None
+    # Уже инфинитив в начале
+    words = src.split()
+    if words and _name_is_infinitive_object(src):
+        return _task_title(src)
+    # Ищем глагол в личной форме или инфинитиве
+    tokens = list(re.finditer(r"[А-Яа-яЁё\-]+", src))
+    for i, tok in enumerate(tokens):
+        w = tok.group()
+        low = w.lower()
+        is_inf = low.endswith(("ть", "ти", "чь")) and len(low) >= 4
+        is_fin = low in VERB_MAP or _is_verb(w)
+        if not (is_inf or is_fin):
+            continue
+        inf = low if is_inf else _infinitive(w)
+        # объект — слова после глагола
+        rest = src[tok.end():].strip(" .;,:—–-")
+        if not rest:
+            # объект мог стоять до глагола (инверсия): «Заявку проверить»
+            before = src[: tok.start()].strip(" .;,:—–-")
+            if before and not _find_role(before)[0]:
+                cand = _task_title(f"{inf} {before[:1].lower() + before[1:] if before else ''}".strip())
+                if _name_is_infinitive_object(cand):
+                    return cand
+            return None
+        # отбросить роль в начале rest
+        role, rs, re_ = _find_role(rest)
+        if role and rs == 0:
+            rest = rest[re_:].strip(" :,—–-")
+        cand = _task_title(f"{inf} {rest}".strip())
+        if _name_is_infinitive_object(cand):
+            return cand
+    return None
+
+
+def _condition_label_from_body(body: str) -> Optional[str]:
+    """Подпись ветки только из условия в тексте шага (если/когда/при/иначе/да/нет/в случае)."""
+    src = body or ""
+    m = _COND_QUOTE_RE.search(src)
+    if not m:
+        # явные «да»/«нет» как отдельные слова
+        if re.search(r"(?:^|[^\w])да(?:[^\w]|$)", src, re.I) and re.search(r"(?:^|[^\w])нет(?:[^\w]|$)", src, re.I):
+            return None  # обе ветки — обрабатываются на уровне decision
+        return None
+    opener = m.group(0)
+    # Для «если сумма больше 100» — взять хвост условия до глагола перехода
+    tail = (m.group(1) or "").strip(" ,.:;—–-")
+    # отрезать «— перейти…» / «вернуть…»
+    tail = re.split(r"\s+[—–-]\s+|\s+(?:перейти|вернуть|направить|иначе)\b", tail, maxsplit=1, flags=re.I)[0]
+    tail = tail.strip(" ,.:;—–-")
+    head = opener.split()[0].lower()
+    if head in ("да", "нет"):
+        label = head[:1].upper() + head[1:]
+    elif head == "иначе":
+        label = "Иначе"
+    elif tail:
+        label = tail[:1].upper() + tail[1:]
+    else:
+        return None
+    label = re.sub(r"\s+", " ", label).strip()
+    if len(label) < 2:
+        return None
+    return label[:40]
+
+
+def apply_notation_moves_text(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Нотация по тексту регламента: имена и роли только из формулировок шага. Часы не трогает."""
+    raw = normalize_regulation(regulation_text or "")
+    header, raw_steps = _split_steps(raw)
+    try:
+        parsed = parse_regulation(raw)
+    except Exception:  # noqa: BLE001
+        return raw, []
+    n = min(len(parsed.steps), len(raw_steps))
+    if n < 1:
+        return raw, []
+    actions: List[Dict[str, str]] = []
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    # baseline audit for acceptance
+    base_xml, base_audit, base_err = generate_bpmn_from_text(raw, use_llm=False)
+    if base_err or not base_audit:
+        return raw, []
+    before_keys = {_violation_key(v) for v in _methodology_items(base_audit)}
+
+    changed = False
+    for i in range(n):
+        st = parsed.steps[i]
+        body = bodies[i]
+        # --- naming: не глагол+объект → предикат+объект из предложения шага ---
+        title = (st.title or "").strip()
+        if title and not _name_is_infinitive_object(title):
+            # предложение = тело без роли и срока
+            sent = body
+            sent = re.sub(r"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", "", sent, flags=re.I)
+            role, rs, re_ = _find_role(sent)
+            if role and rs == 0:
+                sent = sent[re_:].strip(" :,—–-")
+            sent = _DUR_RE.sub(" ", sent)
+            sent = re.sub(r"\(\s*этап\s*«[^»]+»\s*\)", " ", sent, flags=re.I)
+            pred = _extract_predicate_object(sent)
+            if pred and pred != title:
+                # заменить только название в теле, сохранив роль/срок/условия
+                new_body = _rename_step_body(body, pred)
+                if new_body != body:
+                    bodies[i] = new_body
+                    changed = True
+                    actions.append({
+                        "kind": "notation",
+                        "detail": f"Имя шага {st.num}: «{title}» → «{pred}» по формулировке регламента.",
+                        "quote": pred,
+                    })
+        # --- executor lane: роль в начале не совпадает с явным исполнителем в предложении ---
+        # только если в тексте явно назван другой исполнитель (паттерн роли)
+        inv = _match_inverted_role(body)
+        if inv and inv[0] and st.role and inv[0] != st.role:
+            # не переносим на «Информационная система», если этих слов нет в предложении
+            if inv[0] == "Информационная система" and not re.search(r"информационн\w+\s+систем", body, re.I):
+                pass
+            else:
+                # переписать роль в теле
+                old_role = st.role
+                new_role = inv[0]
+                if body.lower().startswith(old_role.lower()) or _find_role(body)[0] == old_role:
+                    # заменить ведущую роль
+                    role_m = re.match(rf"^(?:параллельно|одновременно)\s*[:,—–-]?\s*", body, re.I)
+                    prefix = role_m.group(0) if role_m else ""
+                    rest = body[len(prefix):]
+                    # убрать старую роль в начале rest
+                    r2, rs2, re2 = _find_role(rest)
+                    if r2 and rs2 == 0:
+                        rest = rest[re2:].lstrip(" :,—–-")
+                    bodies[i] = f"{prefix}{new_role}: {rest}"
+                    changed = True
+                    actions.append({
+                        "kind": "notation",
+                        "detail": f"Шаг {st.num}: исполнитель «{old_role}» → «{new_role}».",
+                        "quote": new_role,
+                    })
+
+    if not changed:
+        return raw, []
+    cand = _join_steps(header, [{"body": b} for b in bodies])
+    # принять только если список нарушений реально сократился
+    _, cand_audit, cand_err = generate_bpmn_from_text(cand, use_llm=False)
+    if cand_err or not cand_audit:
+        return raw, []
+    after_keys = {_violation_key(v) for v in _methodology_items(cand_audit)}
+    removed = before_keys - after_keys
+    if not removed:
+        return raw, []
+    # отфильтровать actions, которые не связаны со снятием — оставляем все notation, раз набор сократился
+    base_cp = float(((base_audit.get("sla") or {}).get("critical_path_hours") or 0))
+    cand_cp = float(((cand_audit.get("sla") or {}).get("critical_path_hours") or 0))
+    if abs(cand_cp - base_cp) > 0.05:
+        return raw, []
+    return cand, actions
+
+
+def apply_chain_wrap_text(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Цепочка одной роли длиннее CHAIN_THRESHOLD → этап-подпроцесс. Балл не растёт. Нарушение остаётся."""
+    raw = normalize_regulation(regulation_text or "")
+    header, raw_steps = _split_steps(raw)
+    try:
+        parsed = parse_regulation(raw)
+    except Exception:  # noqa: BLE001
+        return raw, []
+    n = min(len(parsed.steps), len(raw_steps))
+    if n <= CHAIN_THRESHOLD:
+        return raw, []
+    bodies = [raw_steps[i]["body"] for i in range(n)]
+    actions: List[Dict[str, str]] = []
+    i = 0
+    while i < n:
+        role = parsed.steps[i].role
+        if not role or parsed.steps[i].stage:
+            i += 1
+            continue
+        j = i
+        while j < n and parsed.steps[j].role == role and not parsed.steps[j].stage:
+            # не рвём на развилке/параллели — только монотонные step без decision
+            if parsed.steps[j].decision is not None or parsed.steps[j].parallel:
+                break
+            j += 1
+        run = j - i
+        if run > CHAIN_THRESHOLD:
+            stage_name = (parsed.steps[i].title or f"Этап {parsed.steps[i].num}").strip()
+            stage_name = stage_name[:60]
+            for k in range(i, j):
+                if re.search(r"\(\s*этап\s*«", bodies[k], re.I):
+                    continue
+                bodies[k] = bodies[k].rstrip() + f" (этап «{stage_name}»)"
+            actions.append({
+                "kind": "notation_wrap",
+                "detail": (
+                    f"Цепочка «{role}» ({run} шагов) свёрнута в подпроцесс «{stage_name}». "
+                    "Внутренние шаги остаются в формуле качества."
+                ),
+            })
+            i = j
+            continue
+        i = j if j > i else i + 1
+    if not actions:
+        return raw, []
+    return _join_steps(header, [{"body": b} for b in bodies]), actions
+
+
+def apply_notation_to_diagram(diagram: BPMNDiagramBuilder, regulation_text: str = "") -> List[Dict[str, str]]:
+    """Нотация на готовой схеме: подписи потоков, имена, дорожки, start/end. Часы узлов не меняет."""
+    actions: List[Dict[str, str]] = []
+    try:
+        parsed = parse_regulation(normalize_regulation(regulation_text or "")) if regulation_text else None
+    except Exception:  # noqa: BLE001
+        parsed = None
+    # map titles from regulation
+    title_to_step = {}
+    if parsed is not None:
+        for st in parsed.steps:
+            if st.title:
+                title_to_step[st.title.strip().lower()] = st
+
+    outgoing: Dict[str, List] = defaultdict(list)
+    for link in diagram.links:
+        outgoing[link.source_id].append(link)
+
+    # 1) unlabeled gateway flows
+    for node in list(diagram.nodes.values()):
+        if node.kind not in ("exclusiveGateway", "inclusiveGateway"):
+            continue
+        outs = outgoing.get(node.id, [])
+        if len(outs) <= 1:
+            continue
+        unlabeled = [lk for lk in outs if not (lk.condition_name or "").strip()]
+        if not unlabeled:
+            continue
+        # ищем условие в регламенте / имени шлюза
+        label_src = node.name or ""
+        body_label = None
+        if parsed is not None:
+            for st in parsed.steps:
+                if st.decision is None:
+                    continue
+                # шлюз часто называется по yes_label + ?
+                if st.decision.yes_label and st.decision.yes_label.rstrip("?") in (node.name or ""):
+                    body_label = st.decision.yes_label
+                    break
+                bl = _condition_label_from_body(
+                    f"если {st.decision.yes_label}" if st.decision.yes_label else (st.title or "")
+                )
+                if bl:
+                    body_label = bl
+                    break
+        # из имени шлюза «сумма больше 100?»
+        gw_cond = re.sub(r"[?？]\s*$", "", (node.name or "")).strip()
+        # подписи только из условия регламента; разные ветки — разные метки
+        yes_lab = body_label or _condition_label_from_body(f"если {gw_cond}") or (gw_cond if gw_cond else None)
+        no_lab = None
+        if parsed is not None:
+            for st in parsed.steps:
+                if st.decision is None:
+                    continue
+                if st.decision.no_label:
+                    no_lab = st.decision.no_label
+                    break
+        if no_lab is None and regulation_text and re.search(r"иначе", regulation_text, re.I):
+            no_lab = "Иначе"
+        if not yes_lab or len(str(yes_lab).strip()) < 2:
+            continue
+        if regulation_text and gw_cond and not re.search(re.escape(gw_cond[:20]), regulation_text, re.I):
+            if not re.search(r"если|когда|при|в случае", regulation_text, re.I):
+                continue
+        for idx, lk in enumerate(unlabeled):
+            lab = yes_lab if idx == 0 else (no_lab or yes_lab)
+            lk.condition_name = str(lab)[:40]
+            actions.append({
+                "kind": "notation",
+                "detail": f"Подпись потока у шлюза «{node.name}»: «{lk.condition_name}».",
+                "quote": lk.condition_name,
+            })
+
+    # 2) naming
+    for node in list(diagram.nodes.values()):
+        if node.kind not in WORK_KINDS:
+            continue
+        if _name_is_infinitive_object(node.name or ""):
+            continue
+        noun = (node.name or "").strip()
+        if not noun or parsed is None:
+            continue
+        # предложение регламента, где есть этот объект и глагол
+        pred = None
+        for pst in parsed.steps:
+            blob = " ".join(x for x in [pst.title or "", getattr(pst, "role", "") or ""] if x)
+            # также ищем по полному тексту шагов через title
+            cand = _extract_predicate_object(pst.title or "")
+            if cand and noun.lower() in cand.lower():
+                pred = cand
+                break
+            # «Заявка» + отдельное предложение «Проверить заявку» в том же title
+            if noun.lower() in (pst.title or "").lower():
+                cand2 = _extract_predicate_object(pst.title or "")
+                if cand2:
+                    pred = cand2
+                    break
+        if pred is None and regulation_text:
+            # свободный поиск предложения с глаголом и этим объектом
+            for sent in re.split("[.;\n]", regulation_text):
+                if noun.lower() not in sent.lower():
+                    continue
+                cand = _extract_predicate_object(sent.strip())
+                if cand and noun.lower() in cand.lower():
+                    pred = cand
+                    break
+        if not pred:
+            continue  # нет глагола в предложении — имя не трогаем
+        old = node.name
+        node.name = pred
+        actions.append({
+            "kind": "notation",
+            "detail": f"Имя «{old}» → «{pred}».",
+            "quote": pred,
+        })
+
+    # 3) missing start/end (root)
+    sub_ids = {n.id for n in diagram.nodes.values() if n.kind == "subProcess"}
+    def _is_inner(n):
+        return n.parent_id in sub_ids or n.owner_id in sub_ids
+    has_start = any(n.kind == "startEvent" and not _is_inner(n) for n in diagram.nodes.values())
+    has_end = any(n.kind == "endEvent" and not _is_inner(n) for n in diagram.nodes.values())
+    # builder всегда имеет ROOT start/end; для кастомных — add via API if missing
+    if not has_start:
+        actions.append({"kind": "notation", "detail": "Добавлено стартовое событие (0 ч)."})
+    if not has_end:
+        actions.append({"kind": "notation", "detail": "Добавлено конечное событие (0 ч)."})
+
+    return actions
+
+
+def notation_removed_remaining(
+    asis_audit: Dict[str, Any],
+    tobe_audit: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Списки «Снято» / «Осталось» по violation_items."""
+    before = {_violation_key(v): v for v in _methodology_items(asis_audit)}
+    after = {_violation_key(v): v for v in _methodology_items(tobe_audit)}
+    removed = [before[k] for k in before.keys() - after.keys()]
+    remaining = list(after.values())
+    return removed, remaining
+
+
+def _apply_notation_and_wrap(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Сначала нотация (только снимающая нарушения), затем wrap цепочек."""
+    actions: List[Dict[str, str]] = []
+    cur, acts = apply_notation_moves_text(text)
+    actions.extend(acts)
+    cur2, acts2 = apply_chain_wrap_text(cur)
+    # wrap не должен поднимать score
+    if acts2:
+        _, a0, e0 = generate_bpmn_from_text(cur, use_llm=False)
+        _, a1, e1 = generate_bpmn_from_text(cur2, use_llm=False)
+        if not e0 and not e1 and a0 and a1:
+            q0 = int(((a0.get("methodology") or {}).get("score") or 0))
+            q1 = int(((a1.get("methodology") or {}).get("score") or 0))
+            if q1 > q0:
+                return cur, actions
+            cp0 = float(((a0.get("sla") or {}).get("critical_path_hours") or 0))
+            cp1 = float(((a1.get("sla") or {}).get("critical_path_hours") or 0))
+            if abs(cp1 - cp0) > 0.05:
+                return cur, actions
+        actions.extend(acts2)
+        cur = cur2
+    return cur, actions
+
+
 def optimize_process_to_be(
     regulation_text: str, audit_data: dict, skip_auto: Optional[Iterable[int]] = None,
 ) -> Tuple[str, dict]:
@@ -7730,18 +8206,57 @@ def optimize_process_to_be(
     if best is None:
         optimized = text
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
-        delta = _tobe_delta(base_audit, base_audit, actions, engine)
-        delta["tobe_xml"] = ""
-        delta["tobe_audit"] = base_audit
+        notated, notation_actions = _apply_notation_and_wrap(optimized)
+        new_audit = base_audit
+        xml = ""
+        if notation_actions and notated.strip() != (optimized or "").strip():
+            try:
+                n_xml, n_audit, n_err = _rebuild_process(notated, "to-be · notation", [], use_llm=False)
+            except Exception:  # noqa: BLE001
+                n_xml, n_audit, n_err = "", {}, "notation-rebuild-failed"
+            if not n_err and n_audit and _tobe_feasible(base_m, _tobe_metrics(n_audit, notated), text, notated):
+                q_old = int(((base_audit.get("methodology") or {}).get("score") or 0))
+                q_new = int(((n_audit.get("methodology") or {}).get("score") or 0))
+                cp_old = float(((base_audit.get("sla") or {}).get("critical_path_hours") or 0))
+                cp_new = float(((n_audit.get("sla") or {}).get("critical_path_hours") or 0))
+                if q_new >= q_old and cp_new <= cp_old + 1e-6:
+                    optimized, xml, new_audit = notated, n_xml, n_audit
+                    actions = notation_actions
+        delta = _tobe_delta(base_audit, new_audit or base_audit, actions, engine)
+        delta["tobe_xml"] = xml or ""
+        delta["tobe_audit"] = new_audit or base_audit
         delta["tobe_error"] = ""
         delta["tobe_text"] = optimized
         delta["move_hours"] = []
+        removed, remaining = notation_removed_remaining(base_audit, new_audit or base_audit)
+        delta["violations_removed"] = removed
+        delta["violations_remaining"] = remaining
+        if not removed:
+            q_b = int(delta.get("quality_before") or 0)
+            delta["quality_after"] = q_b
+            delta["quality_gain"] = 0
         return _finish(delta, optimized)
 
     _score, optimized, actions, xml, new_audit, engine, move_spec = best
     actions = _limit_escalation_actions(actions, base_audit, new_audit)
     if not actions:
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
+    # Нотация и свёртка цепочек — отдельный класс ходов, не меняет часы узлов.
+    notated, notation_actions = _apply_notation_and_wrap(optimized)
+    if notation_actions and notated.strip() != (optimized or "").strip():
+        try:
+            n_xml, n_audit, n_err = _rebuild_process(notated, f"to-be · notation", [], use_llm=False)
+        except Exception:  # noqa: BLE001
+            n_xml, n_audit, n_err = "", {}, "notation-rebuild-failed"
+        if not n_err and n_audit and _tobe_feasible(base_m, _tobe_metrics(n_audit, notated), text, notated):
+            # score не ниже As-Is; голый путь не длиннее принятого кандидата
+            q_old = int(((new_audit or {}).get("methodology") or {}).get("score") or 0)
+            q_new = int(((n_audit.get("methodology") or {}).get("score") or 0))
+            cp_old = float((((new_audit or {}).get("sla") or {}).get("critical_path_hours") or 0))
+            cp_new = float(((n_audit.get("sla") or {}).get("critical_path_hours") or 0))
+            if q_new >= q_old and cp_new <= cp_old + 1e-6:
+                optimized, xml, new_audit = notated, n_xml, n_audit
+                actions = list(actions) + notation_actions
     delta = _tobe_delta(base_audit, new_audit or {}, actions, engine)
     delta["tobe_xml"] = xml or ""
     delta["tobe_audit"] = new_audit or {}
@@ -7750,6 +8265,15 @@ def optimize_process_to_be(
     delta["move_hours"] = _measure_isolated_moves(
         text, float(base_m["cp"]), float(base_m["rw"]), move_spec or {}, search_skip,
     )
+    # Честные «Снято» / «Осталось» из аудитов
+    removed, remaining = notation_removed_remaining(base_audit, new_audit or {})
+    delta["violations_removed"] = removed
+    delta["violations_remaining"] = remaining
+    # Балл растёт только вместе со строкой «Снято»
+    if not removed:
+        q_b = int(delta.get("quality_before") or 0)
+        delta["quality_after"] = q_b
+        delta["quality_gain"] = 0
     return _finish(delta, optimized)
 
 

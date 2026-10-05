@@ -1492,18 +1492,31 @@ def _meth_title(chk: Dict[str, Any]) -> str:
     return _METH_TITLE_RU.get(key) or _METH_TITLE_RU.get(title) or title
 
 
-def render_methodology(audit: Dict[str, Any]) -> None:
-    """Блок «Методологический контроль BPMN 2.0» — бейджи проверок и балл качества."""
+def render_methodology(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any]] = None) -> None:
+    """Блок «Методологический контроль BPMN 2.0» — балл, дробь clean/denom и нарушения.
+
+    Bus-factor на этой карточке не показывается. Для To-Be — группы «Снято» / «Осталось».
+    """
     meth = audit.get("methodology") if isinstance(audit.get("methodology"), dict) else {}
     if not meth:
         return
     score = int(meth.get("score") or 0)
     color = OK if score >= 85 else (WARN if score >= 65 else BAD)
+    clean = meth.get("clean")
+    denom = meth.get("denominator")
+    fraction = meth.get("quality_fraction") or (
+        f"{clean} / {denom}" if clean is not None and denom is not None else ""
+    )
     st.markdown('<div class="ir-title" style="margin-top:8px">Методологический контроль BPMN 2.0</div>', unsafe_allow_html=True)
+    frac_html = (
+        f'<div style="opacity:.95;font-size:.9rem;margin-top:6px">{esc(fraction)}</div>'
+        if fraction else ""
+    )
     badges = [
         f'<div class="meth-score" style="background:linear-gradient(105deg,{color},{BLUE})">'
         f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">QUALITY SCORE</div>'
         f'<div class="v">{score}%</div>'
+        f'{frac_html}'
         f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">доля регламента без нарушений</div></div>'
     ]
     for chk in meth.get("checks") or []:
@@ -1518,6 +1531,52 @@ def render_methodology(audit: Dict[str, Any]) -> None:
             f'<div class="d">{esc(chk.get("detail"))}{extra}</div></div>'
         )
     st.markdown('<div class="meth-row">' + "".join(badges) + "</div>", unsafe_allow_html=True)
+
+    items = list(meth.get("violation_items") or [])
+    if not items:
+        for gap in meth.get("violations") or []:
+            items.append({"type": "other", "message": gap, "quote": "", "steps": [], "role": ""})
+
+    is_tobe = bool(asis_audit) and asis_audit is not audit
+    if is_tobe:
+        try:
+            from ai_generator import notation_removed_remaining
+            removed, remaining = notation_removed_remaining(asis_audit or {}, audit)
+        except Exception:  # noqa: BLE001
+            removed, remaining = [], items
+        st.markdown('<div class="ir-title" style="margin-top:10px">Снято</div>', unsafe_allow_html=True)
+        if not removed:
+            st.markdown(
+                '<div class="rec">Принятые ходы эти нарушения не снимают</div>',
+                unsafe_allow_html=True,
+            )
+            # score To-Be должен совпадать с As-Is, если Снято пусто — подпись-напоминание
+            asis_score = int(((asis_audit or {}).get("methodology") or {}).get("score") or score)
+            if score != asis_score:
+                st.caption(f"As-Is: {asis_score}% · To-Be: {score}%")
+        else:
+            for item in removed[:5]:
+                msg = str(item.get("message") or "")
+                quote = str(item.get("quote") or "")
+                extra = f" — «{esc(quote)}»" if quote else ""
+                st.markdown(f'<div class="rec ok">{esc(msg)}{extra}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ir-title" style="margin-top:10px">Осталось</div>', unsafe_allow_html=True)
+        show = remaining[:5]
+        if not show:
+            st.caption("Нарушений не осталось.")
+        for item in show:
+            msg = str(item.get("message") or "")
+            st.markdown(f'<div class="rec bad">{esc(msg)}</div>', unsafe_allow_html=True)
+    else:
+        show = items[:5]
+        if show:
+            st.markdown('<div class="ir-title" style="margin-top:10px">Нарушения нотации</div>', unsafe_allow_html=True)
+            for item in show:
+                msg = str(item.get("message") or "")
+                quote = str(item.get("quote") or "")
+                extra = f"<br><span style='opacity:.85'>цитата: «{esc(quote)}»</span>" if quote else ""
+                st.markdown(f'<div class="rec bad">{esc(msg)}{extra}</div>', unsafe_allow_html=True)
+
     result_text = str(audit.get("result_text") or "").strip()
     if result_text:
         st.caption("Текст результата — его вставка собирает схему с тем же баллом.")
@@ -1577,9 +1636,9 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
     )
 
 
-def render_audit(audit: Dict[str, Any]) -> None:
+def render_audit(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any]] = None) -> None:
     st.markdown('<div class="ir-section">Аудит бизнес-архитектуры</div>', unsafe_allow_html=True)
-    render_methodology(audit)
+    render_methodology(audit, asis_audit=asis_audit)
     bus = audit["bus_factor"]
     sla = audit["sla"]
     loops: List[Dict[str, Any]] = audit["rework_loops"]
@@ -2394,6 +2453,39 @@ def render_tobe_tab() -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
+    asis_for_card = ((st.session_state.get("result") or {}).get("audit") or {})
+    tobe_for_card = pack.get("audit") or {}
+    asis_meth = (asis_for_card.get("methodology") or {})
+    tobe_meth = (tobe_for_card.get("methodology") or {})
+    frac = tobe_meth.get("quality_fraction") or asis_meth.get("quality_fraction") or ""
+    if frac:
+        st.caption(f"Доля без нарушений: {frac}")
+    try:
+        from ai_generator import notation_removed_remaining
+        removed_v, remain_v = notation_removed_remaining(asis_for_card, tobe_for_card)
+    except Exception:  # noqa: BLE001
+        removed_v, remain_v = [], list((tobe_meth.get("violation_items") or tobe_meth.get("violations") or []))
+    st.markdown('<div class="ir-title" style="margin-top:8px">Снято</div>', unsafe_allow_html=True)
+    if not removed_v:
+        st.markdown(
+            '<div class="tobe-act">Принятые ходы эти нарушения не снимают</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        for item in removed_v[:5]:
+            if isinstance(item, dict):
+                msg = str(item.get("message") or "")
+                quote = str(item.get("quote") or "")
+                bit = f" — «{quote}»" if quote else ""
+                st.markdown(f'<div class="tobe-act">{esc(msg)}{esc(bit)}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="tobe-act">{esc(item)}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ir-title" style="margin-top:8px">Осталось</div>', unsafe_allow_html=True)
+    if not remain_v:
+        st.caption("Нарушений не осталось.")
+    for item in remain_v[:5]:
+        msg = str(item.get("message") if isinstance(item, dict) else item)
+        st.markdown(f'<div class="tobe-act">{esc(msg)}</div>', unsafe_allow_html=True)
     st.caption(
         f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
         f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
@@ -2938,8 +3030,9 @@ def main() -> None:
             ]
         )
         with tab_audit:
-            render_audit(result["audit"])
-            render_details(result["audit"])
+            # Качество To-Be — строго из To-Be audit активной схемы, не из As-Is.
+            render_audit(audit, asis_audit=result["audit"])
+            render_details(audit)
         with tab_tobe:
             render_tobe_tab()
         with tab_raci:
