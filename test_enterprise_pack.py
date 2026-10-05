@@ -515,7 +515,7 @@ pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
 DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
 DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
 sp = DIAGRAM.create_subprocess("Провести диагностику оборудования", lanes[0])
-prev = DIAGRAM.nodes[sp].inner_start_id
+prev = DIAGRAM.subprocess_entry(sp)
 for title in (
     "Принять заявку диспетчера",
     "Зафиксировать запись в журнале",
@@ -527,7 +527,7 @@ for title in (
     step = DIAGRAM.add_user_task(title, sp)
     DIAGRAM.add_link(prev, step)
     prev = step
-DIAGRAM.add_link(prev, DIAGRAM.nodes[sp].inner_end_id)
+DIAGRAM.add_link(prev, DIAGRAM.subprocess_exit(sp))
 DIAGRAM.add_link(ROOT_START_TASK_ID, sp)
 DIAGRAM.add_link(sp, ROOT_END_TASK_ID)
 """
@@ -755,6 +755,60 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert time.time() - started < 3, time.time() - started
     assert not xml_hang
     assert "таймаут" in err_hang.lower(), err_hang
+
+    import ast
+    import threading
+    from ai_generator import (
+        REGULATION_MAX_CHARS,
+        UnsafeCodeError,
+        _to_hours,
+        _validate_ast,
+        build_prompt,
+    )
+
+    probes = [
+        "g = (x for x in [1]); n = g.gi_frame.f_code.co_name",
+        'g = (x for x in [1]); s = "{0.gi_frame}".format(g)',
+        's = "{0.__class__}".format(1)',
+        "x = [[[0 for a in range(2000)] for b in range(2000)] for c in range(2000)]",
+    ]
+    for src in probes:
+        try:
+            _validate_ast(ast.parse(src))
+            raise AssertionError("проба песочницы должна быть отклонена: " + src)
+        except UnsafeCodeError:
+            pass
+    _validate_ast(ast.parse(
+        "pool, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ['А'])\n"
+        "a = DIAGRAM.add_user_task('Шаг', lanes[0])\n"
+        "DIAGRAM.set_sla(a, 1)\n"
+        "DIAGRAM.add_link(ROOT_START_TASK_ID, a)\n"
+    ))
+
+    hang_thread: dict = {}
+    def _run_hang() -> None:
+        os.environ["DIAGRAM_EXEC_TIMEOUT"] = "0.5"
+        try:
+            xml_t, _, err_t = execute_generated_code(hang, "Поток")
+            hang_thread["xml"] = xml_t
+            hang_thread["err"] = err_t
+        finally:
+            os.environ.pop("DIAGRAM_EXEC_TIMEOUT", None)
+    th = threading.Thread(target=_run_hang)
+    t0 = time.time()
+    th.start()
+    th.join(6)
+    assert not th.is_alive()
+    assert time.time() - t0 < 5
+    assert not hang_thread.get("xml")
+    assert "таймаут" in str(hang_thread.get("err") or "").lower(), hang_thread
+
+    long_reg = "Регламент: длинный\nSLA: 8 часов\n1. Диспетчер принимает заявку (1 час).\n" + ("слово " * (REGULATION_MAX_CHARS // 5))
+    xml_long, _, err_long = generate_bpmn_from_text(long_reg, use_llm=False)
+    assert not xml_long and "слишком длинный" in err_long, err_long
+    prompt = build_prompt("секретный текст регламента")
+    assert "<<<REGULATION_DATA" in prompt and "REGULATION_DATA>>>" in prompt
+    assert "не инструкции" in prompt and "секретный текст регламента" in prompt
 
     from ai_generator import _iter_tobe_selections
 
@@ -1565,6 +1619,61 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     second_step = parse_regulation(named_text).steps[1]
     assert second_step.title == "Записать аварию в журнал" and second_step.role == "Диспетчер"
     assert len(parse_regulation(named_text).steps) == len(parse_regulation(text1).steps)
+
+    # Честность сроков: недели, месяцы, подпись N из M, плашка без цели. Числа примера 1 те же.
+    assert abs(_to_hours("2", "рабочих недели") - 80.0) < 1e-6
+    assert abs(_to_hours("1", "календарная неделя") - 168.0) < 1e-6
+    month_text = (
+        "Регламент: учёт месяцев\nSLA: 8 часов\n"
+        "1. Диспетчер принимает заявку (2 месяца).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    parsed_m = parse_regulation(month_text)
+    assert parsed_m.month_durations_ignored and parsed_m.steps[0].hours is None
+    xml_m, audit_m, err_m = generate_bpmn_from_text(month_text, use_llm=False)
+    assert not err_m and xml_m and audit_m.get("sla_month_ignored")
+    note_m = str(audit_m.get("sla_hours_note") or "")
+    assert "Срок указан в регламенте у" in note_m and " из " in note_m and "по умолчанию" in note_m
+    assert opened["audit"]["sla"]["critical_path_hours"] == 9.7
+    assert opened["audit"]["sla"]["with_rework_hours"] == 12.55
+    assert "Срок указан в регламенте у" in str(opened["audit"].get("sla_hours_note") or "")
+    no_tgt = (
+        "Регламент: без цели\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    _, audit_ns, err_ns = generate_bpmn_from_text(no_tgt, use_llm=False)
+    assert not err_ns
+    sla_ns = audit_ns["sla"]
+    tgt = sla_ns.get("target_hours")
+    if sla_ns["breach"]:
+        pill = "Риск срыва SLA"
+    elif float(sla_ns["rework_share"]) > 0.25:
+        pill = "Возвраты съедают запас"
+    elif tgt in (None, ""):
+        pill = "Цель SLA не задана"
+    else:
+        pill = "В пределах SLA"
+    assert pill == "Цель SLA не задана", (pill, tgt)
+    app_src = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+    assert "этапов схемы" in app_src and "слоёв согласования" not in app_src
+
+    calls = {"n": 0}
+    orig_gen = bpmn_app.generate_bpmn_from_text
+
+    def _fake_fallback(text: str, use_llm: bool = True) -> tuple:
+        calls["n"] += 1
+        return "<xml/>", {"generation": {"engine": "semantic-emulator", "fallback": True}, "sla": {}}, ""
+
+    bpmn_app.generate_bpmn_from_text = _fake_fallback
+    try:
+        bpmn_app._cached_llm_generate_bpmn.clear()
+        bpmn_app.cached_generate_bpmn("hash-fallback", "текст", True)
+        bpmn_app.cached_generate_bpmn("hash-fallback", "текст", True)
+        assert calls["n"] == 2, calls
+    finally:
+        bpmn_app.generate_bpmn_from_text = orig_gen
+        bpmn_app._cached_llm_generate_bpmn.clear()
 
     # Явная команда добавления по-прежнему правит регламент и пересобирает схему.
     eco_side, eco_text, eco_xml, _ = _side("Добавь согласование со службой экологии после шага 3")
