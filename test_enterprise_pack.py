@@ -1087,7 +1087,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert reg_rows[0]["role_after"] == "Информационная система" and "роль" in reg_rows[0]["label"]
     assert proc_cmp["counts"]["removed"] == 0 and proc_cmp["counts"]["added"] == 0
     proc_auto = next(p for p in proc_cmp["parts"] if p["kind"] == "automation")
-    assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
+    assert reg_rows[0]["hours_after"] == reg_rows[0]["hours_before"] and proc_auto["hours"] == 0.0
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
     # 2е. Подсветка на схеме: только изменившиеся шаги, «исчез» и «появился» не размечаются, по клику одна строка.
@@ -1147,7 +1147,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             canv = canvas_copilot_reply(hq, *proc_args, proc_pack["delta"])
             assert side == canv, (hq, side, canv)
             assert "Зарегистрировать заявки" in side and "Роль «Закупочная служба» сменилась на «Информационная система»" in side, side
-            assert "120 ч" in side and "→ 5 мин" in side and "шаг передан системе" in side, side
+            assert "шаг передан системе" in side and "5 мин" not in side and "120 ч" not in side, side
             assert "нет данных" not in side.lower() and "Подсвеченных шагов нет" not in side, side
         # Та же строка, что в фиолетовой карточке; пакет холста несёт тот же текст.
         proc_cat_tb = build_diagram_catalog(proc_pack["tobe_xml"], proc_pack["tobe_audit"], proc_pack["tobe_text"])
@@ -1165,9 +1165,11 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
         assert one == f"**«{proc_marked[0][1]['name']}»**: {proc_marked[0][1]['change']}", one
         plain_id = next(k for k, v in proc_cat_tb.items() if not v.get("changed") and v.get("kind") in _agen._TASK_TAGS)
         assert canvas_copilot_reply("почему подсвечен", *proc_args, proc_pack["delta"], plain_id, proc_cat_tb) == "Этот шаг не подсвечен"
-        # Срок стал короче: карточка не пишет, что задержка на шаге сдвигает весь срок.
-        assert "задержка сдвигает" not in proc_marked[0][1]["comment"], proc_marked[0][1]["comment"]
-        assert "Срок шага сокращён" in proc_marked[0][1]["comment"]
+        # Срок из регламента на шаге тот же: карточка не пишет, что срок сокращён.
+        assert "Срок шага сокращён" not in proc_marked[0][1]["comment"], proc_marked[0][1]["comment"]
+        shortened = {"comment": "Узел на критическом пути: задержка сдвигает весь срок."}
+        _agen._drop_delay_claim(shortened, {"hours_changed": True, "hours_before": 120.0, "hours_after": 0.083})
+        assert "задержка" not in shortened["comment"].lower() and "Срок шага сокращён" in shortened["comment"]
         # Подсвеченных шагов нет: нет To-Be-дельты → одна фраза.
         no_hl, *_rest = assistant_chat("какие узлы подсвечены", [], *proc_args, use_llm=True)
         assert no_hl == "Подсвеченных шагов нет", no_hl
@@ -1191,7 +1193,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             rargs = (rp["xml"], rp["audit"], proc_text)
             asked = "какие узлы подсвечены фиолетовым"
             before_hl, *_b = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert "заявк" in before_hl and "120 ч (≈ 15 раб. дн.) → 5 мин" in before_hl, before_hl
+            assert "заявк" in before_hl and "шаг передан системе" in before_hl and "5 мин" not in before_hl, before_hl
             facts_before = _agen.process_facts(rp["audit"], rd)
             rev_reply, rev_text, rev_xml, rev_audit = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
             assert rev_text is None and rev_xml is None and rev_audit is None, rq  # As-Is не менялся
@@ -1207,7 +1209,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             assert canvas_copilot_reply(asked, *rargs, rd) == "Подсвеченных шагов нет"
             # Карточка и раскладка экономии пересчитаны: сумма строк равна новой экономии.
             tuned = bpmn_app.retune_tobe(rp["audit"], rd)
-            assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] != facts_before["rw_after"]
+            assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] == facts_before["rw_after"]
             tuned_cmp = compare_asis_tobe(
                 str(rp["audit"].get("result_text") or proc_text), tuned["tobe_text"], rp["audit"],
                 tuned["tobe_audit"], tuned["facts"])
