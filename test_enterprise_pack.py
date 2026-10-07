@@ -14,6 +14,7 @@ from ai_generator import (
     execute_generated_code,
     export_docx_passport,
     generate_bpmn_from_text,
+    generate_process_passport,
     generate_raci_matrix,
     heuristic_analysis,
     build_process_context,
@@ -102,7 +103,10 @@ def main() -> None:
     assert opened_facts["cp_after"] <= 9.6
     assert opened_facts["rw_after"] <= 9.6
     assert opened_facts["loops_before"] == 2 and opened_facts["loops_after"] == 0
-    assert opened_facts["quality_before"] < 100 and opened_facts["quality_after"] < 100
+    assert opened_facts["quality_before"] < 100
+    assert opened_facts["quality_after"] >= opened_facts["quality_before"]
+    assert opened_facts["quality_after"] == 100
+    assert not (opened["delta"].get("tobe_audit") or {}).get("methodology", {}).get("long_chains")
     headline = bpmn_app.tobe_card_headline(opened_facts)
     assert headline == "Экономия пути с возвратами: 12.6 ч → 9.6 ч (−24%)", headline
     assert "Без ускорения" not in headline
@@ -198,7 +202,7 @@ def main() -> None:
     assert "Параллелизац" in why or "параллел" in why.lower()
     assert "scriptTask" in why or "Автоматизац" in why
     qual = heuristic_analysis("Почему упал Quality Score?", ctx_p)
-    assert "62 → 62" in qual and "не изменилась" in qual, qual
+    assert "62 → 100" in qual and "выросла" in qual, qual
     assert "метро" not in qual.lower()
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
@@ -1213,8 +1217,13 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     _aud = {"sla": {"critical_path_hours": 10.0}}
     _acc = {"tobe_ready": True, "cp_before": 10.0, "cp_after": 9.0, "loops_before": 2, "loops_after": 0}
     assert bpmn_app.tobe_unavailable_reason(_aud, {}, _acc, "<xml/>") == ""
-    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, cp_after=12.0), "<xml/>").startswith("Голый путь To-Be длиннее: 10 ч → 12 ч")
-    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_after=2), "<xml/>").startswith("Циклы возврата не уменьшились: 2 → 2")
+    assert bpmn_app.tobe_unavailable_reason(
+        _aud, {}, dict(_acc, cp_after=12.0, loops_after=2, rw_before=10.0, rw_after=10.0), "<xml/>",
+    ).startswith("Голый путь To-Be длиннее: 10 ч → 12 ч")
+    assert bpmn_app.tobe_unavailable_reason(
+        _aud, {}, dict(_acc, cp_after=10.0, loops_after=2, rw_before=10.0, rw_after=10.0), "<xml/>",
+    ).startswith("Циклы возврата не уменьшились: 2 → 2")
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, cp_after=12.0), "<xml/>") == ""
     assert bpmn_app.tobe_unavailable_reason(
         _aud, {"quality_before": 80, "quality_after": 70}, dict(_acc, tobe_ready=False), "").startswith("Качество To-Be ниже: 80 → 70")
     assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_before=0, loops_after=0, cp_after=10.0), "").startswith("Ни один ход")
@@ -1905,14 +1914,15 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     assert wrap_acts
     xml_c1, aud_c1, err_c1 = generate_bpmn_from_text(wrapped, use_llm=False)
     assert not err_c1
-    assert aud_c1["methodology"]["score"] == aud_c0["methodology"]["score"]
-    assert aud_c1["methodology"]["long_chains"]
+    assert aud_c1["methodology"]["score"] > aud_c0["methodology"]["score"]
+    assert not aud_c1["methodology"]["long_chains"]
     assert aud_c1["sla"]["critical_path_hours"] == cp_c0
-    assert any("Диспетчер" in str(v) for v in aud_c1["methodology"]["violations"])
+    assert "Принять заявку смены" in wrapped and "Передать наряд в работу" in wrapped
     opt_c, delta_c = optimize_process_to_be(chain5, aud_c0)
     rem_c, left_c = notation_removed_remaining(aud_c0, delta_c.get("tobe_audit") or {})
-    # цепочка видна в «Осталось»
-    assert any("Диспетчер" in str((x.get("message") if isinstance(x, dict) else x)) for x in (delta_c.get("violations_remaining") or left_c or aud_c1["methodology"]["violations"]))
+    # цепочка снята этапом, а не спрятана из формулы
+    assert any("Диспетчер" in str((x.get("message") if isinstance(x, dict) else x)) for x in (delta_c.get("violations_removed") or rem_c))
+    assert not (delta_c.get("tobe_audit") or {}).get("methodology", {}).get("long_chains")
 
     # шаг не уезжает на «Информационная система», если этих слов нет в предложении
     is_reg = (
@@ -1939,19 +1949,19 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
         assert ex_aud["sla"]["critical_path_hours"] == bare, (ex_path, ex_aud["sla"]["critical_path_hours"])
         assert ex_aud["sla"]["with_rework_hours"] == with_ret, (ex_path, ex_aud["sla"]["with_rework_hours"])
         _opt, ex_delta = optimize_process_to_be(ex_text, ex_aud)
-        removed = ex_delta.get("violations_removed") or []
-        if not removed:
-            assert int(ex_delta.get("quality_after") or 0) == int(ex_delta.get("quality_before") or 0), ex_path
-        else:
-            assert int(ex_delta.get("quality_after") or 0) >= int(ex_delta.get("quality_before") or 0)
+        assert float(ex_delta.get("with_rework_after") or 0) < float(ex_delta.get("with_rework_before") or 0), ex_path
+        assert float(ex_delta.get("sla_saved_hours") or 0) > 0, ex_path
+        tobe_score = int(((ex_delta.get("tobe_audit") or {}).get("methodology") or {}).get("score") or 0)
+        assert int(ex_delta.get("quality_after") or 0) == tobe_score, ex_path
+        assert int(ex_delta.get("quality_before") or 0) == int(ex_aud["methodology"]["score"]), ex_path
         if "example_2" in ex_path:
-            remain = ex_delta.get("violations_remaining") or []
-            remain_msg = " ".join(str(x.get("message") if isinstance(x, dict) else x) for x in remain)
-            assert int(ex_delta.get("quality_after") or 0) < 100 or "Закупочная" in remain_msg
             tobe_m = ((ex_delta.get("tobe_audit") or {}).get("methodology") or {})
-            assert int(tobe_m.get("score") or ex_delta.get("quality_after") or 0) < 100 or tobe_m.get("long_chains")
+            if tobe_m.get("long_chains"):
+                assert int(ex_delta.get("quality_after") or 0) < 100
+            else:
+                assert int(ex_delta.get("quality_after") or 0) > int(ex_delta.get("quality_before") or 0)
 
-    # Холст с баллом 92 не подменяет локальную пару. Пустое «Снято» оставляет 62 → 62.
+    # Чужой балл холста не становится левым. Свой балл To-Be не подменяется баллом As-Is.
     chain_item = {
         "type": "chain",
         "role": "Закупочная служба",
@@ -1984,6 +1994,43 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     )
     assert raised["quality_before"] == 50 and raised["quality_after"] == 80
     assert raised["violations_removed"]
+    kept = {
+        "quality_before": 62,
+        "quality_after": 62,
+        "baseline_violations": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        kept,
+        {"methodology": {"score": 75, "violation_items": [chain_item], "quality_fraction": "12 / 16"}},
+    )
+    assert kept["quality_before"] == 62 and kept["quality_after"] == 75, kept
+
+    accepted_text = (
+        "Регламент: Принятый To-Be\n"
+        "1. Диспетчер: Принять заявку (1 ч).\n"
+        "2. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    bpmn_app.st.session_state["tobe_pack"] = {"text": accepted_text}
+    bpmn_app.st.session_state["use_llm"] = False
+    bpmn_app.st.session_state["example_choice"] = "старый пример"
+    bpmn_app.st.session_state["applied_example"] = "старый пример"
+    bpmn_app._accept_tobe_as_main()
+    assert bpmn_app.st.session_state["reg_text"].startswith("Регламент: Принятый To-Be")
+    assert bpmn_app.st.session_state["example_choice"] == bpmn_app.CUSTOM_LABEL
+    assert bpmn_app.st.session_state["applied_example"] == bpmn_app.CUSTOM_LABEL
+    assert bpmn_app.st.session_state.get("tobe_accept_pending")
+    assert "tobe_pack" not in bpmn_app.st.session_state
+    bpmn_app._consume_tobe_accept()
+    accepted_result = bpmn_app.st.session_state.get("result") or {}
+    assert accepted_result.get("xml") and not accepted_result.get("error")
+    assert "Принять заявку" in (bpmn_app.st.session_state.get("reg_text") or "")
+    accepted_md = generate_process_passport(
+        accepted_result["xml"], accepted_result["audit"], bpmn_app.st.session_state["reg_text"],
+    )
+    accepted_docx = export_docx_passport(
+        accepted_result["xml"], accepted_result["audit"], bpmn_app.st.session_state["reg_text"],
+    )
+    assert "Принять заявку" in accepted_md and accepted_docx[:2] == b"PK"
 
     print(
         "ok",

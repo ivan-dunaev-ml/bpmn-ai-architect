@@ -1781,20 +1781,21 @@ def render_details(audit: Dict[str, Any]) -> None:
 # Приложение
 # --------------------------------------------------------------------------- #
 def _tobe_accepted(facts: Dict[str, Any]) -> bool:
-    """Кандидат длиннее голого As-Is или с живыми циклами на вкладку не попадает."""
+    """To-Be на холсте, если есть экономия срока, хотя бы один снятый цикл или более короткий голый путь."""
     if not facts.get("tobe_ready"):
         return False
     cp_before = float(facts.get("cp_before") or 0)
     cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
-    if cp_after > cp_before + 1.0 / 60.0:
-        return False
+    rw_before = float(facts.get("rw_before") or 0)
+    rw_after = float(facts.get("rw_after") if facts.get("rw_after") is not None else rw_before)
     loops_before = int(facts.get("loops_before") or 0)
     loops_after = int(facts.get("loops_after") or 0)
-    if loops_after > loops_before:
+    rw_win = rw_before > 0 and rw_after < rw_before * 0.95
+    fewer_loops = loops_after < loops_before
+    shorter_cp = cp_after + 1e-9 < cp_before
+    if cp_after > cp_before + 1.0 / 60.0 and not rw_win and not fewer_loops:
         return False
-    if loops_before > 0 and loops_after >= loops_before:
-        return False
-    return True
+    return bool(rw_win or fewer_loops or shorter_cp)
 
 
 def tobe_unavailable_reason(
@@ -1810,11 +1811,16 @@ def tobe_unavailable_reason(
     if f.get("tobe_ready"):
         cp_before = float(f.get("cp_before") or 0)
         cp_after = float(f.get("cp_after") if f.get("cp_after") is not None else cp_before)
-        if cp_after > cp_before + 1.0 / 60.0:
-            return f"Голый путь To-Be длиннее: {fmt_hours(cp_before)} → {fmt_hours(cp_after)}." + _rejected_move_note(d)
+        rw_before = float(f.get("rw_before") or 0)
+        rw_after = float(f.get("rw_after") if f.get("rw_after") is not None else rw_before)
         loops_before = int(f.get("loops_before") or 0)
         loops_after = int(f.get("loops_after") or 0)
-        if loops_after > loops_before or (loops_before > 0 and loops_after >= loops_before):
+        rw_win = rw_before > 0 and rw_after < rw_before * 0.95
+        fewer_loops = loops_after < loops_before
+        shorter_cp = cp_after + 1e-9 < cp_before
+        if cp_after > cp_before + 1.0 / 60.0 and not rw_win and not fewer_loops:
+            return f"Голый путь To-Be длиннее: {fmt_hours(cp_before)} → {fmt_hours(cp_after)}." + _rejected_move_note(d)
+        if loops_before > 0 and not fewer_loops and not shorter_cp and not rw_win:
             return f"Циклы возврата не уменьшились: {loops_before} → {loops_after}." + _rejected_move_note(d)
     q_before, q_after = d.get("quality_before"), d.get("quality_after")
     if q_before is not None and q_after is not None and int(q_after) < int(q_before):
@@ -1881,10 +1887,10 @@ def _delta_matches_edges(delta: Dict[str, Any], audit: Dict[str, Any]) -> bool:
 
 
 def _keep_local_tobe_quality(delta: Dict[str, Any], shown_audit: Dict[str, Any]) -> None:
-    """Балл карточки — локальная модель до и после. Балл холста сюда не подставляется.
+    """Левый балл — локальный As-Is, правый — балл показанной схемы To-Be.
 
-    Холст может быть собран другой моделью. Пустое «Снято» оставляет балл равным
-    баллу локальной модели до ходов. Балл не падает, если нарушение не снято.
+    Балл холста, собранного другой моделью, в карточку не попадает.
+    Правый процент не подменяется левым: он равен methodology score схемы To-Be.
     """
     from ai_generator import notation_removed_remaining
 
@@ -1897,13 +1903,13 @@ def _keep_local_tobe_quality(delta: Dict[str, Any], shown_audit: Dict[str, Any])
         )
         delta["violations_removed"] = removed
         delta["violations_remaining"] = remaining
-    removed = list(delta.get("violations_removed") or [])
-    paste_after = int((((shown_audit or {}).get("methodology") or {}).get("score") or 0))
-    if not removed or paste_after < local_before:
-        paste_after = local_before
+    meth = (shown_audit or {}).get("methodology") if isinstance((shown_audit or {}).get("methodology"), dict) else {}
+    if "score" in meth:
+        delta["quality_after"] = int(meth.get("score") or 0)
+    if meth.get("quality_fraction"):
+        delta["quality_fraction_after"] = str(meth.get("quality_fraction"))
     delta["quality_before"] = local_before
-    delta["quality_after"] = paste_after
-    delta["quality_gain"] = max(0, paste_after - local_before)
+    delta["quality_gain"] = max(0, int(delta.get("quality_after") or 0) - local_before)
 
 
 def prepare_regulation(
@@ -1918,7 +1924,7 @@ def prepare_regulation(
     """
     _ = previous
     xml, audit, error = cached_generate_bpmn(
-        _reg_hash(text or "", bool(use_llm), "edges-v7"),
+        _reg_hash(text or "", bool(use_llm), "edges-v9"),
         text or "",
         bool(use_llm),
     )
@@ -1941,7 +1947,7 @@ def prepare_regulation(
         pack["tobe_reason"] = tobe_unavailable_reason(audit, {}, pack["facts"], "")
         return pack
     opt_text, delta = cached_optimize_to_be(
-        _reg_hash(text or "", _audit_cache_slice(audit), "edges-v7"),
+        _reg_hash(text or "", _audit_cache_slice(audit), "edges-v9"),
         text or "",
         audit,
     )
@@ -2313,7 +2319,7 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
         }
         return st.session_state["tobe_pack"]
     opt_text, delta = cached_optimize_to_be(
-        _reg_hash(text, _audit_cache_slice(audit), "edges-v7"),
+        _reg_hash(text, _audit_cache_slice(audit), "edges-v9"),
         text,
         audit,
     )
@@ -2435,6 +2441,42 @@ def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
             )
 
 
+def _accept_tobe_as_main() -> None:
+    """Текст To-Be становится полем регламента. Сборка As-Is идёт на следующем прогоне."""
+    pack = st.session_state.get("tobe_pack") or {}
+    text = str(pack.get("text") or "").strip()
+    if not text:
+        return
+    st.session_state["reg_text"] = text
+    st.session_state["_keep_custom_text"] = True
+    st.session_state["example_choice"] = CUSTOM_LABEL
+    st.session_state["applied_example"] = CUSTOM_LABEL
+    st.session_state["tobe_accept_pending"] = True
+    st.session_state["tobe_accepted_note"] = True
+    st.session_state.pop("tobe_pack", None)
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+    st.session_state.pop("gen_fingerprint", None)
+
+
+def _consume_tobe_accept() -> None:
+    """Перестраивает принятый текст To-Be как основной As-Is."""
+    if not st.session_state.pop("tobe_accept_pending", False):
+        return
+    text = st.session_state.get("reg_text") or ""
+    if not text.strip():
+        return
+    run_generation(text, bool(st.session_state.get("use_llm")), show_progress=False)
+
+
+def _tobe_export_slot(token: str) -> Dict[str, Any]:
+    bucket = st.session_state.setdefault("tobe_export_cache", {})
+    if token not in bucket:
+        bucket.clear()
+        bucket[token] = {}
+    return bucket[token]
+
+
 def render_tobe_tab() -> None:
     st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
     st.caption("Переключатель As-Is / To-Be на холсте меняет схему. Карточка — эффект реинжиниринга.")
@@ -2457,6 +2499,9 @@ def render_tobe_tab() -> None:
     loops_after = int(facts.get("loops_after") or 0)
     quality_before = int(facts.get("quality_before") or 0)
     quality_after = int(facts.get("quality_after") or 0)
+    frac_before = str(delta.get("quality_fraction_before") or "")
+    frac_after = str(delta.get("quality_fraction_after") or "")
+    quality_sub = f"{frac_before} → {frac_after}" if frac_before and frac_after else f"quality {quality_before} → {quality_after}"
     eco_value = tobe_card_headline(facts) or (
         f"Путь с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
     )
@@ -2475,7 +2520,7 @@ def render_tobe_tab() -> None:
         f'<div class="s">устранено петель: {removed}</div></div>'
         f'<div class="tobe-card"><div class="k">Качество нотации</div>'
         f'<div class="v">{quality_before}% → {quality_after}%</div>'
-        f'<div class="s">quality {quality_before} → {quality_after}</div></div>'
+        f'<div class="s">{esc(quality_sub)}</div></div>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -2604,14 +2649,78 @@ def render_tobe_tab() -> None:
     st.write("")
     stem = st.session_state.get("file_stem", "process")
     tobe_xml = pack.get("xml") or ""
-    st.download_button(
-        "⬇️  Скачать To-Be .bpmn",
-        data=tobe_xml,
-        file_name=f"{stem}_tobe.bpmn",
-        mime="application/xml",
-        disabled=not bool(tobe_xml),
-        key="dl_tobe_bpmn",
-    )
+    tobe_text = str(pack.get("text") or "")
+    tobe_ready = bool(tobe_xml and tobe_text.strip())
+    export_token = _reg_hash(tobe_xml, tobe_text) if tobe_ready else ""
+    export_slot = _tobe_export_slot(export_token) if tobe_ready else {}
+
+    def _materialize_tobe(kind: str) -> Any:
+        if kind in export_slot:
+            return export_slot[kind]
+        try:
+            export_slot[kind] = (
+                generate_process_passport(tobe_xml, tobe_audit, tobe_text)
+                if kind == "md"
+                else export_docx_passport(tobe_xml, tobe_audit, tobe_text)
+            )
+        except Exception:  # noqa: BLE001 — кнопка остаётся, страница не падает
+            export_slot[kind] = "" if kind == "md" else b""
+        return export_slot[kind]
+
+    accept_col, bpmn_col = st.columns(2, gap="small")
+    with accept_col:
+        st.button(
+            "✅ Принять целевой регламент (Сделать основным)",
+            key="accept_tobe_as_asis",
+            disabled=not tobe_text.strip(),
+            on_click=_accept_tobe_as_main,
+            use_container_width=True,
+        )
+    with bpmn_col:
+        st.download_button(
+            "⬇️  Скачать To-Be .bpmn",
+            data=tobe_xml,
+            file_name=f"{stem}_tobe.bpmn",
+            mime="application/xml",
+            disabled=not bool(tobe_xml),
+            key="dl_tobe_bpmn",
+            use_container_width=True,
+        )
+    docx_col, md_col = st.columns(2, gap="small")
+    with docx_col:
+        docx_data = export_slot.get("docx") if tobe_ready else None
+        if not tobe_ready:
+            st.button("⬇️ Паспорт To-Be (.docx)", disabled=True, key="dl_tobe_docx_off", use_container_width=True)
+        elif docx_data is None and st.button(
+            "⬇️ Паспорт To-Be (.docx)", key="dl_tobe_docx_build", use_container_width=True,
+        ):
+            docx_data = _materialize_tobe("docx")
+        if docx_data:
+            st.download_button(
+                "⬇️ Паспорт To-Be (.docx)",
+                data=docx_data,
+                file_name=f"{stem}_tobe_reglament.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_tobe_docx",
+                use_container_width=True,
+            )
+    with md_col:
+        md_data = export_slot.get("md") if tobe_ready else None
+        if not tobe_ready:
+            st.button("⬇️ Регламент To-Be (.md)", disabled=True, key="dl_tobe_md_off", use_container_width=True)
+        elif md_data is None and st.button(
+            "⬇️ Регламент To-Be (.md)", key="dl_tobe_md_build", use_container_width=True,
+        ):
+            md_data = _materialize_tobe("md")
+        if md_data:
+            st.download_button(
+                "⬇️ Регламент To-Be (.md)",
+                data=md_data,
+                file_name=f"{stem}_tobe_passport.md",
+                mime="text/markdown",
+                key="dl_tobe_md",
+                use_container_width=True,
+            )
     with st.expander("Целевой текст регламента To-Be"):
         st.code(pack.get("text") or "", language="text")
 
@@ -3005,6 +3114,7 @@ def main() -> None:
     if "use_llm" not in st.session_state:
         st.session_state["use_llm"] = USE_LLM_ON_OPEN
     _align_choice_text()
+    _consume_tobe_accept()
 
     st.markdown(_hero_html(), unsafe_allow_html=True)
     view = st.radio(
@@ -3020,6 +3130,11 @@ def main() -> None:
     if st.session_state.pop("diagram_updated_by_assistant", False):
         st.markdown(
             '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
+            unsafe_allow_html=True,
+        )
+    if st.session_state.pop("tobe_accepted_note", False):
+        st.markdown(
+            '<div class="ir-toast">✨ Целевой процесс To-Be принят в качестве основного регламента!</div>',
             unsafe_allow_html=True,
         )
     if wide:

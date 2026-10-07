@@ -6987,27 +6987,54 @@ def _ot_order_ok(text: str) -> bool:
     return True
 
 
+def _tobe_time_win(asis: Dict[str, float], cand: Dict[str, float]) -> bool:
+    """Экономия пути с возвратами больше 10% исходного срока."""
+    rw_base = float(asis.get("rw") or 0)
+    if rw_base <= 0:
+        return False
+    return (rw_base - float(cand.get("rw") or 0)) > 0.10 * rw_base
+
+
 def _tobe_known_block(base: Dict[str, float], cand: Dict[str, float]) -> str:
     """Причина отказа из уже существующих формулировок. Новых причин нет."""
     if cand["cp"] > base["cp"] + _TOBE_MINUTE:
         return f"Голый путь To-Be длиннее: {_fh(base['cp'])} → {_fh(cand['cp'])}."
     loops_b, loops_a = int(base["loops"]), int(cand["loops"])
-    if loops_a > loops_b or (loops_b > 0 and loops_a >= loops_b):
+    if loops_a > loops_b:
         return f"Циклы возврата не уменьшились: {loops_b} → {loops_a}."
-    if cand["q"] + 1e-9 < base["q"]:
+    dropped = cand["q"] + 1e-9 < base["q"]
+    if dropped and cand["q"] + 1e-9 < 75.0 and not _tobe_time_win(base, cand):
         return f"Качество To-Be ниже: {int(base['q'])} → {int(cand['q'])}."
+    if (
+        loops_b > 0
+        and loops_a >= loops_b
+        and cand["rw"] >= base["rw"] - 1e-9
+        and cand["cp"] + 1e-9 >= base["cp"]
+    ):
+        return f"Циклы возврата не уменьшились: {loops_b} → {loops_a}."
     return ""
 
 
 def _tobe_feasible(asis: Dict[str, float], cand: Dict[str, float], asis_text: str, cand_text: str) -> bool:
-    """Жёсткие ограничения + лексикографические откаты (голый путь, возвраты, циклы, quality, ОТ)."""
+    """Голый путь не длиннее As-Is. Падение балла допустимо, если он остаётся от 75 или срок с возвратами короче на 10%+.
+
+    Снятие хотя бы одного цикла достаточно: обнулять все петли не требуется.
+    """
     if cand["cp"] > asis["cp"] + _TOBE_MINUTE:
-        return False
-    if asis["loops"] > 0 and cand["rw"] >= asis["rw"] - 1e-9:
         return False
     if cand["loops"] > asis["loops"]:
         return False
-    if cand["q"] + 1e-9 < asis["q"]:
+    dropped = cand["q"] + 1e-9 < asis["q"]
+    if dropped and cand["q"] + 1e-9 < 75.0 and not _tobe_time_win(asis, cand):
+        return False
+    loops_cut = int(cand["loops"]) < int(asis["loops"])
+    shorter_cp = cand["cp"] + 1e-9 < asis["cp"]
+    if (
+        asis["loops"] > 0
+        and not loops_cut
+        and cand["rw"] >= asis["rw"] - 1e-9
+        and not shorter_cp
+    ):
         return False
     if not _ot_order_ok(cand_text):
         return False
@@ -7210,8 +7237,10 @@ def _collect_tobe_actions(old_text: str, new_text: str) -> List[Dict[str, str]]:
 
 
 def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[str]:
-    """Облачная перепись To-Be только при BPMN_TOBE_LLM=1 — иначе 25 с лишней генерации."""
-    if os.getenv("BPMN_TOBE_LLM", "").strip().lower() not in ("1", "true", "yes"):
+    """Облачная перепись To-Be, если задан ключ модели. Нет ключа или пустой ответ — эмулятор."""
+    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+        return None
+    if not _cloud_prefixes():
         return None
     ctx = build_process_context(regulation_text, "", audit_data or {})
     messages = [
@@ -7270,6 +7299,8 @@ def _tobe_delta(old_audit: dict, new_audit: dict, actions: List[Dict[str, str]],
         "role_after_estimate": bool(new_sla.get("role_hours_estimate")),
         "quality_before": q_b,
         "quality_after": q_a,
+        "quality_fraction_before": str((old_a.get("methodology") or {}).get("quality_fraction") or ""),
+        "quality_fraction_after": str((new_a.get("methodology") or {}).get("quality_fraction") or ""),
         "quality_gain": max(0, q_a - q_b),
         "breach_before": bool(old_sla.get("breach")),
         "breach_after": bool(new_sla.get("breach")),
@@ -7825,8 +7856,56 @@ def apply_notation_moves_text(regulation_text: str) -> Tuple[str, List[Dict[str,
     return cand, actions
 
 
+def _chain_wrap_slices(steps: Sequence, start: int, end: int) -> List[Tuple[int, int]]:
+    """Куски по 2…CHAIN_THRESHOLD, чтобы ни снаружи, ни внутри не осталось серии длиннее порога.
+
+    Шаг с развилкой, цель перехода и шаг с уже заданным этапом остаются снаружи.
+    """
+    targets = set()
+    for st in steps:
+        decision = getattr(st, "decision", None)
+        if decision is None:
+            continue
+        if decision.no_ref:
+            targets.add(int(decision.no_ref))
+        if decision.yes_ref:
+            targets.add(int(decision.yes_ref))
+
+    def _safe(idx: int) -> bool:
+        st = steps[idx]
+        if getattr(st, "parallel", False) or getattr(st, "decision", None) is not None:
+            return False
+        if getattr(st, "stage", None):
+            return False
+        if int(getattr(st, "num", 0) or 0) in targets:
+            return False
+        return True
+
+    def _search(pos: int, gap: int, acc: List[Tuple[int, int]]) -> Optional[List[Tuple[int, int]]]:
+        if pos >= end:
+            return acc if gap <= CHAIN_THRESHOLD else None
+        if _safe(pos):
+            for length in range(CHAIN_THRESHOLD, 1, -1):
+                stop = pos + length
+                if stop > end or not all(_safe(k) for k in range(pos, stop)):
+                    continue
+                found = _search(stop, 0, acc + [(pos, stop)])
+                if found is not None:
+                    return found
+        if gap + 1 <= CHAIN_THRESHOLD:
+            return _search(pos + 1, gap + 1, acc)
+        return None
+
+    found = _search(start, 0, [])
+    return found or []
+
+
 def apply_chain_wrap_text(regulation_text: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Цепочка одной роли длиннее CHAIN_THRESHOLD → этап-подпроцесс. Балл не растёт. Нарушение остаётся."""
+    """Серия одной роли длиннее 4 шагов режется на этапы по ≤4. Внутренние шаги остаются в формуле.
+
+    Этап не длиннее порога снимает нарушение цепочки. Часы шагов не меняются.
+    Развилка и цель возврата в этап не входят.
+    """
     raw = normalize_regulation(regulation_text or "")
     header, raw_steps = _split_steps(raw)
     try:
@@ -7838,35 +7917,38 @@ def apply_chain_wrap_text(regulation_text: str) -> Tuple[str, List[Dict[str, str
         return raw, []
     bodies = [raw_steps[i]["body"] for i in range(n)]
     actions: List[Dict[str, str]] = []
+    used_names = {st.stage for st in parsed.steps if getattr(st, "stage", None)}
     i = 0
     while i < n:
         role = parsed.steps[i].role
-        if not role or parsed.steps[i].stage:
+        if not role or parsed.steps[i].parallel:
             i += 1
             continue
         j = i
-        while j < n and parsed.steps[j].role == role and not parsed.steps[j].stage:
-            # не рвём на развилке/параллели — только монотонные step без decision
-            if parsed.steps[j].decision is not None or parsed.steps[j].parallel:
-                break
+        while j < n and parsed.steps[j].role == role and not parsed.steps[j].parallel:
             j += 1
-        run = j - i
-        if run > CHAIN_THRESHOLD:
-            stage_name = (parsed.steps[i].title or f"Этап {parsed.steps[i].num}").strip()
-            stage_name = stage_name[:60]
-            for k in range(i, j):
-                if re.search(r"\(\s*этап\s*«", bodies[k], re.I):
+        if j - i > CHAIN_THRESHOLD:
+            for a, b in _chain_wrap_slices(parsed.steps, i, j):
+                title = (parsed.steps[a].title or f"Этап {parsed.steps[a].num}").strip()
+                stage_name = title[:60] or f"Этап {parsed.steps[a].num}"
+                if stage_name in used_names:
+                    stage_name = f"{title[:48].rstrip()} {parsed.steps[a].num}".strip()
+                used_names.add(stage_name)
+                marked = 0
+                for k in range(a, b):
+                    if re.search(r"\(\s*этап\s*«", bodies[k], re.I):
+                        continue
+                    bodies[k] = bodies[k].rstrip() + f" (этап «{stage_name}»)"
+                    marked += 1
+                if marked < 2:
                     continue
-                bodies[k] = bodies[k].rstrip() + f" (этап «{stage_name}»)"
-            actions.append({
-                "kind": "notation_wrap",
-                "detail": (
-                    f"Цепочка «{role}» ({run} шагов) свёрнута в подпроцесс «{stage_name}». "
-                    "Внутренние шаги остаются в формуле качества."
-                ),
-            })
-            i = j
-            continue
+                actions.append({
+                    "kind": "notation_wrap",
+                    "detail": (
+                        f"Цепочка «{role}» ({j - i} шагов): этап «{stage_name}», "
+                        f"{marked} шага внутри. Внутренние шаги остаются в формуле качества."
+                    ),
+                })
         i = j if j > i else i + 1
     if not actions:
         return raw, []
@@ -8029,7 +8111,7 @@ def _apply_notation_and_wrap(text: str) -> Tuple[str, List[Dict[str, str]]]:
         if not e0 and not e1 and a0 and a1:
             q0 = int(((a0.get("methodology") or {}).get("score") or 0))
             q1 = int(((a1.get("methodology") or {}).get("score") or 0))
-            if q1 > q0:
+            if q1 < q0:
                 return cur, actions
             cp0 = float(((a0.get("sla") or {}).get("critical_path_hours") or 0))
             cp1 = float(((a1.get("sla") or {}).get("critical_path_hours") or 0))
@@ -8048,7 +8130,7 @@ def optimize_process_to_be(
     Лексикография после жёстких ограничений: короче путь с возвратами, затем короче голый КП, затем меньше шагов.
     Сначала считаются прежние наборы классов ходов — это текущий To-Be. Затем перебираются сочетания отдельных ходов.
     Сочетание заменяет текущий To-Be только если оно строго лучше. Если ни один кандидат не принят — возвращается As-Is.
-    Облачная LLM включается только переменной BPMN_TOBE_LLM=1 и проходит ту же проверку.
+    Облачная LLM вызывается, когда задан ключ модели, и проходит ту же проверку. Без ключа остаётся эмулятор.
     skip_auto — номера шагов As-Is (с нуля), которые нельзя передавать информационной системе: шаг остаётся
     с прежней ролью и сроком. С этим набором облако не вызывается, без него результат прежний.
     """
@@ -8232,10 +8314,6 @@ def optimize_process_to_be(
         delta["baseline_violations"] = _methodology_items(base_audit)
         delta["violations_removed"] = removed
         delta["violations_remaining"] = remaining
-        if not removed:
-            q_b = int(delta.get("quality_before") or 0)
-            delta["quality_after"] = q_b
-            delta["quality_gain"] = 0
         return _finish(delta, optimized)
 
     _score, optimized, actions, xml, new_audit, engine, move_spec = best
@@ -8271,11 +8349,6 @@ def optimize_process_to_be(
     delta["baseline_violations"] = _methodology_items(base_audit)
     delta["violations_removed"] = removed
     delta["violations_remaining"] = remaining
-    # Балл растёт только вместе со строкой «Снято»
-    if not removed:
-        q_b = int(delta.get("quality_before") or 0)
-        delta["quality_after"] = q_b
-        delta["quality_gain"] = 0
     return _finish(delta, optimized)
 
 
