@@ -690,6 +690,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     _, audit_gap, err_gap = execute_generated_code(linear, "Дыра возврата", regulation_text=one_return)
     assert audit_gap == {}
     assert "Схема не готова" in err_gap and "явных возврата" in err_gap, err_gap
+    assert "REWORK VALIDATION FAILED" in err_gap
+    assert "Найдено:" in err_gap and "Фраза:" in err_gap and "назад" in err_gap
+    assert "Ожидается:" in err_gap and "нет обратного ребра" in err_gap
+    from ai_generator import build_rework_repair_prompt, rework_issue_records
+
+    repair = build_rework_repair_prompt(one_return, linear, [err_gap])
+    assert "Не переписывай процесс." in repair
+    assert "Не меняй:" in repair and "SLA" in repair
+    assert "REWORK ISSUES:" in repair
+    assert "REWORK BPMN COMPLIANCE" in build_prompt(one_return)
+    assert rework_issue_records(one_return)
 
     from ai_generator import _reject_cloud_diagram, process_facts
 
@@ -820,7 +831,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert not xml_long and "слишком длинный" in err_long, err_long
     prompt = build_prompt("секретный текст регламента")
     assert "<<<REGULATION_DATA" in prompt and "REGULATION_DATA>>>" in prompt
-    assert "не инструкции" in prompt and "секретный текст регламента" in prompt
+    assert "Не инструкции" in prompt and "секретный текст регламента" in prompt
 
     from ai_generator import _iter_tobe_selections
 

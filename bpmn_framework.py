@@ -41,7 +41,7 @@ TASK_H_MAX = 150.0             # длинное название — блок в
 GATEWAY_S = 50.0
 EVENT_S = 36.0
 SUBPROCESS_MIN_W, SUBPROCESS_MIN_H = 560.0, 240.0
-COLUMN_GAP_X = 84.0            # зазор между колонками слоёв на верхнем уровне
+COLUMN_GAP_X = 72.0            # зазор между колонками: плотнее, без «пустых зон»
 SUB_PAD_X = 56.0               # горизонтальный padding внутри подпроцесса
 SUB_PAD_TOP = 64.0             # место под заголовок подпроцесса
 SUB_PAD_BOTTOM = 44.0
@@ -88,6 +88,8 @@ LANE_COLORS = (("#1565C0", "#F4F8FD"), ("#1565C0", "#FFFFFF"))
 GROUP_COLORS = ("#64748B", "#F8FAFC")
 EDGE_COLOR = "#64748B"
 REWORK_EDGE_COLOR = "#C62828"
+CRITICAL_PATH_EDGE_COLOR = "#E65100"
+IMPROVED_PATH_EDGE_COLOR = "#2E7D32"
 
 GATEWAY_KINDS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway"}
 EVENT_KINDS = {"startEvent", "endEvent"}
@@ -376,6 +378,8 @@ class BPMNDiagramBuilder:
         self.warnings: List[str] = []
         self.skipped_links: List[Dict[str, str]] = []
         self.healed: List[str] = []
+        self.critical_path_ids: Set[str] = set()
+        self.highlight_improved: bool = False
 
         self._seq: Dict[str, int] = defaultdict(int)
         self._used_ids: Set[str] = set()
@@ -1357,6 +1361,12 @@ class BPMNDiagramBuilder:
             overlap = sum(_overlap_len(s, p) > 6.0 for s in segs for p in placed)
             length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in segs)
             cost = (len(path) - 2) * 15.0 + length * 0.02 + overlap * 40.0 + hits * 1000.0
+            if is_back:
+                # Компактный loop-back: длинная красная дуга через весь пул дороже короткой U-петли.
+                cost += length * 0.06
+                bottom = max(p[1] for p in path)
+                local_floor = max(src.y + src.height, tgt.y + tgt.height)
+                cost += max(0.0, bottom - local_floor - REWORK_PAD) * 0.45
             if cost < best_cost:
                 best, best_cost = path, cost
         if best is None:
@@ -2309,7 +2319,19 @@ class BPMNDiagramBuilder:
             out.append("      </bpmndi:BPMNShape>")
 
         for link in self.links:
-            color = REWORK_EDGE_COLOR if link.is_back else EDGE_COLOR
+            on_critical = (
+                link.source_id in self.critical_path_ids
+                and link.target_id in self.critical_path_ids
+                and not link.is_back
+            )
+            if link.is_back:
+                color = REWORK_EDGE_COLOR
+            elif on_critical and self.highlight_improved:
+                color = IMPROVED_PATH_EDGE_COLOR
+            elif on_critical:
+                color = CRITICAL_PATH_EDGE_COLOR
+            else:
+                color = EDGE_COLOR
             out.append(
                 f'      <bpmndi:BPMNEdge id="{link.id}_di" bpmnElement="{link.id}"{_color_attrs(color)}>'
             )
