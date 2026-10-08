@@ -41,6 +41,7 @@ from ai_generator import (
     parse_regulation,
     process_facts,
 )
+from bpmn_quality import jury_scorecard, normalize_optimization_actions, process_health_issues
 
 
 def _secrets_to_env() -> List[str]:
@@ -67,8 +68,9 @@ ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
 USE_LLM_ON_OPEN = True
 GENERATION_BUSY_LABEL = "Генерация BPMN 2.0…"
-DIAGRAM_HEIGHT = 580  # ноутбук ~900 px: холст + карточки без бесконечной прокрутки
-DIAGRAM_HEIGHT_WIDE = 640
+# После Generate холст жёстко clamp'ится в _diagram_height (240–300).
+DIAGRAM_HEIGHT = 260
+DIAGRAM_HEIGHT_WIDE = 280
 VIEW_WIDE = "🖥  Широкий вид"
 VIEW_SPLIT = "🗂  Раздельный вид"
 ASIS_LABEL = "Текущий процесс (As-Is)"
@@ -238,6 +240,11 @@ button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
   display: flex; justify-content: space-between; align-items: center; gap: 24px;
   margin-bottom: 10px;
 }}
+.ir-hero.compact {{
+  min-height: 0; padding: 10px 18px; margin-bottom: 6px;
+}}
+.ir-hero.compact h1 {{ font-size:1.2rem; }}
+.ir-hero.compact p {{ display:none; }}
 .ir-hero h1 {{
   color:#fff; font-size:1.55rem; font-weight:800; margin:0; padding:0;
   letter-spacing:.15px; line-height:1.2;
@@ -268,7 +275,7 @@ button, a, [role="button"], [data-baseweb="tab"], [data-baseweb="select"],
 }}
 [data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) p {{ color:#fff; }}
 .ir-title {{ color:{BLUE_DARK}; font-weight:700; font-size:1.05rem; margin:0 0 10px 0; }}
-.ir-section {{ color:{BLUE_DARK}; font-weight:800; font-size:1.35rem; margin:26px 0 12px 0; display:flex; align-items:center; gap:10px; }}
+.ir-section {{ color:{BLUE_DARK}; font-weight:800; font-size:1.35rem; margin:18px 0 10px 0; display:flex; align-items:center; gap:10px; }}
 .ir-section:before {{ content:""; width:6px; height:26px; background:{BLUE}; border-radius:3px; display:inline-block; }}
 .stButton > button, .stDownloadButton > button {{
   width:100%; border-radius:12px; font-weight:700; padding:.5rem .7rem; height:40px;
@@ -332,6 +339,49 @@ div[data-testid="stDownloadButton"] button, .stDownloadButton > button {{
   border: 0 !important;
   background: transparent !important;
 }}
+/* To-Be actions: Accept = primary; .bpmn/.docx/.md — одинаковый secondary */
+.st-key-tobe_actions .stButton > button:not([kind="primary"]),
+.st-key-tobe_actions [data-testid="stDownloadButton"] button,
+.st-key-tobe_actions .stDownloadButton > button {{
+  width: 100% !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  max-height: 40px !important;
+  box-sizing: border-box !important;
+  border: 1px solid #C5D4E8 !important;
+  border-radius: 12px !important;
+  color: {BLUE_DARK} !important;
+  background: #fff !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+  padding: 0 0.7rem !important;
+  box-shadow: none !important;
+  white-space: nowrap !important;
+  line-height: 1.1 !important;
+}}
+.st-key-tobe_actions .stButton > button:not([kind="primary"]):hover,
+.st-key-tobe_actions [data-testid="stDownloadButton"] button:hover,
+.st-key-tobe_actions .stDownloadButton > button:hover {{
+  background: #F4F7FB !important;
+  border-color: {BLUE} !important;
+  color: {BLUE_DARK} !important;
+}}
+.st-key-tobe_actions .stButton > button:not([kind="primary"]) p,
+.st-key-tobe_actions .stButton > button:not([kind="primary"]) span,
+.st-key-tobe_actions [data-testid="stDownloadButton"] button p,
+.st-key-tobe_actions [data-testid="stDownloadButton"] button span,
+.st-key-tobe_actions .stDownloadButton > button p,
+.st-key-tobe_actions .stDownloadButton > button span {{
+  color: inherit !important;
+  font-weight: 700 !important;
+  font-size: 0.82rem !important;
+}}
+.st-key-tobe_actions .stButton > button[kind="primary"] {{
+  height: 40px !important;
+  min-height: 40px !important;
+  border-radius: 12px !important;
+  font-size: 0.82rem !important;
+}}
 textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {{
   font-size:.9rem !important; line-height:1.45 !important; border-radius:14px !important;
   transition: all 0.2s ease !important;
@@ -385,19 +435,6 @@ textarea, [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input
 table.loops {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
 table.loops th {{ text-align:left; color:#607D8B; font-weight:700; border-bottom:2px solid #DCE6F3; padding:6px 8px; }}
 table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#263238; }}
-[data-testid="stRadio"] div[role="radiogroup"] {{
-  display:inline-flex; gap:0; background:#E8EEF7; border:1px solid #D3DFF0; border-radius:999px; padding:3px;
-}}
-[data-testid="stRadio"] div[role="radiogroup"] > label {{
-  margin:0; padding:5px 14px; border-radius:999px; cursor:pointer; transition: all 0.2s ease;
-}}
-[data-testid="stRadio"] div[role="radiogroup"] > label > div:first-child {{ display:none; }}
-[data-testid="stRadio"] div[role="radiogroup"] > label p {{ color:{BLUE_DARK}; font-weight:700; font-size:.95rem; }}
-[data-testid="stRadio"] div[role="radiogroup"] > label:hover {{ background:rgba(21,101,192,.10); }}
-[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) {{
-  background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); box-shadow:0 4px 12px rgba(21,101,192,.35);
-}}
-[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) p {{ color:#fff; }}
 .land-cap {{ color:#607D8B; font-size:.76rem; text-transform:uppercase; letter-spacing:.6px; font-weight:700; margin:10px 0 4px 0; }}
 .chip-sys, .chip-doc {{ display:inline-block; border-radius:999px; padding:6px 14px; margin:4px 6px 4px 0; font-size:.86rem; font-weight:600; }}
 .chip-sys {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; }}
@@ -408,11 +445,17 @@ table.loops td {{ padding:7px 8px; border-bottom:1px solid #EEF3FA; color:#26323
 .ir-toast {{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; border-radius:12px; padding:10px 14px; font-weight:700; margin:8px 0 14px 0; }}
 .file-badge {{ background:#E3F2FD; border:1px solid #90CAF9; color:{BLUE_DARK}; border-radius:12px; padding:8px 12px; font-size:.86rem; margin:8px 0 4px 0; }}
 .file-badge b {{ color:{BLUE}; }}
-.meth-row {{ display:flex; flex-wrap:wrap; gap:10px; margin:8px 0 14px 0; align-items:stretch; }}
-.meth-badge {{ flex:1; min-width:180px; background:#fff; border:1px solid #DCE6F3; border-radius:14px; padding:12px 14px; border-top:4px solid var(--c); }}
+.meth-badge {{
+  background:#fff; border:1px solid #DCE6F3; border-radius:14px; padding:12px 14px;
+  border-top:4px solid var(--c); min-height:110px; display:flex; flex-direction:column;
+}}
 .meth-badge .h {{ font-weight:800; color:{BLUE_DARK}; font-size:.92rem; }}
 .meth-badge .d {{ color:#546E7A; font-size:.8rem; margin-top:4px; }}
-.meth-score {{ background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); color:#fff; border-radius:16px; padding:16px 20px; min-width:160px; }}
+.meth-score {{
+  background:linear-gradient(105deg,{BLUE_DARK},{BLUE}); color:#fff; border-radius:16px;
+  padding:16px 20px; min-width:160px; min-height:110px;
+  display:flex; flex-direction:column; justify-content:center;
+}}
 .meth-score .v {{ font-size:2.2rem; font-weight:800; line-height:1; }}
 .insp-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
 .insp-card {{ background:#fff; border:1px solid #DCE6F3; border-radius:14px; padding:14px 16px; }}
@@ -429,10 +472,10 @@ table.raci td.cell {{ text-align:center; white-space:nowrap; }}
 .raci-b {{ display:inline-block; min-width:22px; height:22px; line-height:22px; text-align:center; border-radius:6px; font-weight:800; font-size:.72rem; color:#fff; margin:0 2px; padding:0 5px; }}
 .raci-b.R {{ background:{BLUE}; }} .raci-b.A {{ background:{OK}; }} .raci-b.C {{ background:{WARN}; }} .raci-b.I {{ background:#607D8B; }}
 .raci-legend {{ color:#546E7A; font-size:.82rem; margin:6px 0 10px 0; }}
-.tobe-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:8px 0 14px 0; }}
+.tobe-grid {{ display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin:8px 0 14px 0; }}
 .tobe-card {{ background:#E8F5E9; border:1px solid #A5D6A7; border-radius:16px; padding:14px 16px; color:#1B5E20; }}
 .tobe-card .k {{ font-size:.75rem; font-weight:800; letter-spacing:.4px; text-transform:uppercase; opacity:.8; }}
-.tobe-card .v {{ font-size:1.7rem; font-weight:800; line-height:1.15; margin:4px 0; }}
+.tobe-card .v {{ font-size:1.7rem; font-weight:800; line-height:1.15; margin:4px 0; font-variant-numeric:tabular-nums; }}
 .tobe-card .s {{ font-size:.84rem; }}
 .tobe-act {{ background:#fff; border:1px solid #DCE6F3; border-left:6px solid {OK}; border-radius:12px; padding:10px 14px; margin:6px 0; font-size:.92rem; color:#263238; }}
 @media (max-width: 900px) {{ .insp-grid {{ grid-template-columns:1fr; }} .tobe-grid {{ grid-template-columns:1fr; }} }}
@@ -478,6 +521,33 @@ div[data-testid="stTab"]:focus {{
 div[data-testid="stTab"][aria-selected="true"]:focus {{
   box-shadow: 0 4px 12px rgba(0, 51, 102, .22) !important;
 }}
+
+
+.ir-panel-label {{
+  color:{BLUE_DARK}; font-weight:750; font-size:.92rem; margin:0 0 8px 0;
+}}
+.kpi-row {{
+  display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:6px 0 4px 0;
+}}
+.kpi-row .ir-card {{ margin:0; padding:12px 14px; }}
+.kpi-row .ir-card .v {{ font-size:1.7rem; }}
+.change-line {{
+  background:#fff; border:1px solid #DCE6F3; border-left:4px solid {BLUE};
+  border-radius:12px; padding:11px 14px; margin:6px 0; font-size:.9rem; color:#334155;
+}}
+.change-line b {{ color:{BLUE_DARK}; font-weight:700; }}
+.health-line {{
+  color:#7C2D12; background:#FFF7ED; border:1px solid #FED7AA;
+  border-radius:10px; padding:8px 12px; margin:6px 0 10px 0; font-size:.88rem;
+}}
+.canvas-empty {{
+  background:#fff; border:1px dashed #B0C4DE; border-radius:16px;
+  padding:48px 24px; text-align:center; color:#546E7A; font-size:.95rem;
+  margin:4px 0 8px 0;
+}}
+.canvas-empty b {{ color:{BLUE_DARK}; display:block; margin-bottom:6px; font-size:1.05rem; }}
+.meth-row {{ display:grid; grid-template-columns:minmax(160px,220px) repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin:8px 0 14px 0; align-items:stretch; }}
+@media (max-width: 900px) {{ .kpi-row {{ grid-template-columns:1fr; }} .meth-row {{ grid-template-columns:1fr; }} }}
 </style>
 """
 
@@ -530,18 +600,21 @@ def viewer_html(
     copilot_js = json.dumps(copilot or {}, ensure_ascii=False).replace("</", "<\\/")
     asis_on = " on" if not canvas_tobe else ""
     tobe_on = " on" if canvas_tobe else ""
+    start_mode = "tobe" if (canvas_tobe and xml_tobe) else "asis"
+    start_xml_js = "XML_TOBE" if start_mode == "tobe" else "XML_ASIS"
     tobe_disabled = "" if xml_tobe else " disabled"
     why_text = "" if xml_tobe else html.escape(str(tobe_reason or "").strip(), quote=True)
     tobe_title = "Целевой оптимизированный" if xml_tobe else (why_text or "To-Be ещё не готов")
     tobe_why = f'<div class="tobe-why" id="tobe-why">{why_text}</div>' if why_text else ""
+    fingerprint = hashlib.sha256(f"{xml or ''}|{xml_tobe or ''}|{start_mode}".encode()).hexdigest()[:12]
     return f"""
-<!doctype html><html><head><meta charset="utf-8">{css_tag}
+<!doctype html><html><head><meta charset="utf-8"><!-- ir-canvas:{fingerprint} -->{css_tag}
 <style>
   html,body {{ margin:0; height:100%; width:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter",sans-serif; background:#fff; }}
-  #wrap {{ position:relative; width:100%; height:{height}px; box-sizing:border-box; border:1px solid rgba(0,51,102,.10); border-radius:18px; overflow:hidden;
+  #wrap {{ position:relative; width:100%; height:{height}px; box-sizing:border-box; border:1px solid rgba(0,51,102,.14); border-radius:16px; overflow:hidden;
       background-color:#fff;
-      background-image: radial-gradient(circle, #D0DCEB 1.5px, transparent 1.5px);
-      background-size: 24px 24px; }}
+      background-image: radial-gradient(circle, #C5D4E8 1.25px, transparent 1.25px);
+      background-size: 22px 22px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.4); }}
   #canvas {{ position:absolute; inset:0; cursor:grab; }}
   #canvas:active {{ cursor:grabbing; }}
   .bar {{
@@ -587,11 +660,12 @@ def viewer_html(
   .djs-element.ir-match-all .djs-visual > :nth-child(1) {{
     stroke: #90CAF9 !important; stroke-width: 2px !important;
   }}
-  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:12px; color:#455A64;
-      background:rgba(255,255,255,.85); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
-      border:1px solid rgba(0,51,102,.10); border-radius:999px; padding:5px 12px;
-      box-shadow:0 4px 16px rgba(0,51,102,.06); }}
-  #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828; padding:24px; text-align:center; font-weight:600; }}
+  .hint {{ position:absolute; left:12px; bottom:10px; z-index:5; font-size:11.5px; color:#455A64;
+      background:rgba(255,255,255,.92); border:1px solid rgba(0,51,102,.12); border-radius:999px;
+      padding:4px 11px; max-width:min(420px, calc(100% - 100px)); pointer-events:none;
+      box-shadow:0 2px 10px rgba(0,51,102,.08); }}
+  #err {{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:#C62828;
+      padding:24px; text-align:center; font-weight:650; background:rgba(255,255,255,.92); z-index:30; }}
   .bjs-powered-by {{ opacity:.55; }}
   .djs-element.ir-changed .djs-visual > :nth-child(1) {{
     stroke:#7B1FA2 !important; stroke-width:3px !important;
@@ -744,8 +818,14 @@ def viewer_html(
   const CATALOG_ASIS = {catalog_asis_js};
   const CATALOG_TOBE = {catalog_tobe_js};
   const COPILOT = {copilot_js};
-  let CATALOG = CATALOG_ASIS;
-  let activeMode = 'asis';
+  let activeMode = '{start_mode}';
+  let CATALOG = activeMode === 'tobe' ? CATALOG_TOBE : CATALOG_ASIS;
+  if (typeof BpmnJS === 'undefined') {{
+    const el = document.getElementById('err');
+    el.style.display = 'flex';
+    el.textContent = 'Библиотека bpmn-js не загрузилась. Обновите страницу.';
+    throw new Error('BpmnJS missing');
+  }}
   const viewer = new BpmnJS({{ container: '#canvas' }});
   const canvas = () => viewer.get('canvas');
   const wrap = document.getElementById('wrap');
@@ -989,6 +1069,13 @@ def viewer_html(
     resetSearch();
     const errEl = document.getElementById('err');
     if (errEl) errEl.style.display = 'none';
+    if (!xml || !String(xml).trim()) {{
+      if (errEl) {{
+        errEl.style.display = 'flex';
+        errEl.textContent = 'XML схемы пуст — повторите генерацию.';
+      }}
+      return Promise.reject(new Error('empty XML'));
+    }}
     return viewer.importXML(xml).then(() => {{
       emphasizeSubprocessTitles();
       markChanged();
@@ -1033,8 +1120,11 @@ def viewer_html(
     if (!/Task|Gateway|Event|SubProcess/i.test(t)) {{ clearPick(); return; }}
     showPick(el, e.originalEvent);
   }});
-  applyXml(XML_ASIS).catch(e => {{
-    const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'Ошибка отображения BPMN: ' + e.message;
+  const BOOT_XML = {start_xml_js};
+  applyXml(BOOT_XML).catch(e => {{
+    const el = document.getElementById('err');
+    el.style.display = 'flex';
+    el.textContent = 'Ошибка отображения BPMN: ' + (e && e.message ? e.message : e);
   }});
   document.getElementById('tip-x').onclick = ev => {{ ev.stopPropagation(); clearPick(); }};
   tip.addEventListener('mousedown', ev => ev.stopPropagation());
@@ -1303,7 +1393,7 @@ def svg_export_html(xml: str, file_name: str) -> str:
 # --------------------------------------------------------------------------- #
 # Аудит: визуальные блоки
 # --------------------------------------------------------------------------- #
-def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
+def card(title: str, value: str, sub: str, color: str, pill: str = "") -> str:
     if color == OK:
         tone = "tone-ok"
     elif color == BAD:
@@ -1312,11 +1402,12 @@ def card(title: str, value: str, sub: str, color: str, pill: str) -> str:
         tone = "tone-warn"
     else:
         tone = "tone-ok"
+    pill_html = f'<span class="pill">{esc(pill)}</span>' if pill else ""
     return (
         f'<div class="ir-card {tone}" style="--c:{color}">'
         f'<div class="k"><span class="ir-dot" aria-hidden="true"></span>{esc(title)}</div>'
         f'<div class="v">{esc(value)}</div><div class="s">{sub}</div>'
-        f'<span class="pill">{esc(pill)}</span></div>'
+        f"{pill_html}</div>"
     )
 
 
@@ -1325,6 +1416,123 @@ def _bus_threshold(bus: Optional[Dict[str, Any]]) -> float:
         return float((bus or {}).get("threshold") or 0.45)
     except (TypeError, ValueError):
         return 0.45
+
+
+def _kpi_triplet(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Единый источник правды для трёх KPI: CP hours, число циклов, bus max_share."""
+    sla = audit.get("sla") if isinstance(audit.get("sla"), dict) else {}
+    bus = audit.get("bus_factor") if isinstance(audit.get("bus_factor"), dict) else {}
+    loops = list(audit.get("rework_loops") or [])
+    base_h = float(sla.get("critical_path_hours") or 0)
+    rework_share = float(sla.get("rework_share") or 0)
+    share = float(bus.get("max_share") or 0)
+    role = str(bus.get("top_role") or "—")
+    threshold = _bus_threshold(bus)
+    total_h = float(sla.get("with_rework_hours") or base_h)
+
+    if sla.get("breach"):
+        sla_color, sla_pill = BAD, "Риск срыва SLA"
+    elif rework_share > 0.25:
+        sla_color, sla_pill = WARN, "Возвраты съедают запас"
+    else:
+        sla_color, sla_pill = (BLUE if base_h >= 48 else OK), "Базовый путь"
+    loop_color = OK if not loops else (BAD if len(loops) >= 3 else WARN)
+    loop_pill = "Возвратов нет" if not loops else f"Доля в сроке {rework_share:.0%}"
+    role_color = BAD if share >= threshold else (WARN if share >= 0.40 else OK)
+    role_pill = "Риск исполнителя" if share >= threshold else "Нагрузка в норме"
+
+    return (
+        {
+            "title": "Критический путь",
+            "value": fmt_hours(base_h),
+            "sub": f"с возвратами {fmt_hours(total_h)}" if loops else "без возвратов",
+            "color": sla_color,
+            "pill": sla_pill,
+        },
+        {
+            "title": "Возвраты",
+            "value": str(len(loops)),
+            "sub": f"вклад {rework_share:.0%}" if loops else "циклов нет",
+            "color": loop_color,
+            "pill": loop_pill,
+        },
+        {
+            "title": "Нагрузка ролей",
+            "value": f"{share:.0%}",
+            "sub": role,
+            "color": role_color,
+            "pill": role_pill,
+        },
+    )
+
+
+def render_kpi_row(audit: Dict[str, Any]) -> None:
+    """Единственный ряд из 3 метрик — один HTML-блок, один расчёт (_kpi_triplet)."""
+    cells = []
+    for item in _kpi_triplet(audit):
+        cells.append(
+            card(item["title"], item["value"], item["sub"], item["color"], item.get("pill") or "")
+        )
+    st.markdown(f'<div class="kpi-row">{"".join(cells)}</div>', unsafe_allow_html=True)
+
+
+def _dedupe_tobe_changes(actions: List[Dict[str, Any]], limit: int = 3) -> List[Tuple[str, str]]:
+    """Схлопывает одинаковые title; отдаёт «Что · Зачем»."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for act in actions:
+        title = str(act.get("title") or "").strip() or "Изменение"
+        if title not in groups:
+            order.append(title)
+            groups[title] = []
+        groups[title].append(act)
+    lines: List[Tuple[str, str]] = []
+    for title in order:
+        items = groups[title]
+        why = str(items[0].get("business_reason") or items[0].get("sla_effect") or "").strip()
+        steps: List[str] = []
+        for it in items:
+            blob = " ".join(
+                str(it.get(k) or "") for k in ("decision", "description", "detail", "problem")
+            )
+            for m in re.finditer(r"(?:шаг(?:а|и|ов)?|step)\s*№?\s*(\d+)", blob, flags=re.I):
+                if m.group(1) not in steps:
+                    steps.append(m.group(1))
+        if len(items) > 1 and steps:
+            what = f"{title} (шаги {', '.join(steps)})"
+        elif len(items) > 1:
+            what = f"{title} (×{len(items)})"
+        else:
+            what = title
+        lines.append((what, why))
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _scoring_captions(
+    audit: Dict[str, Any],
+    xml: str = "",
+    tobe_delta: Optional[dict] = None,
+    regulation_text: str = "",
+) -> Dict[str, Any]:
+    """Метрики жюри — только текст для служебного блока, без отдельного expander."""
+    pack = jury_scorecard(audit, xml, regulation_text, None, tobe_delta)
+    bq = audit.get("bpmn_quality") if isinstance(audit.get("bpmn_quality"), dict) else {}
+    fidelity = int(pack.get("asis_fidelity") or bq.get("asis_fidelity") or 0)
+    conf = pack.get("ai_confidence") or bq.get("ai_confidence") or {}
+    conf_score = int(conf.get("score") or 0)
+    maturity = pack.get("maturity") or {}
+    level = int(maturity.get("level") or bq.get("maturity_level") or 1)
+    visual = pack.get("visual") or {}
+    st.caption(
+        f"Соответствие регламенту {fidelity}% · модель {conf_score}% · "
+        f"L{level} · routing {int(visual.get('routing_quality') or 0)}% · "
+        f"XSD {'да' if audit.get('xsd_valid') else 'нет'}"
+    )
+    for line in (pack.get("warnings") or [])[:4]:
+        st.caption(str(line))
+    return pack
 
 
 def _share_by_role(lane_load: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
@@ -1577,10 +1785,6 @@ def render_methodology(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any
                 extra = f"<br><span style='opacity:.85'>цитата: «{esc(quote)}»</span>" if quote else ""
                 st.markdown(f'<div class="rec bad">{esc(msg)}{extra}</div>', unsafe_allow_html=True)
 
-    result_text = str(audit.get("result_text") or "").strip()
-    if result_text:
-        st.caption("Текст результата — его вставка собирает схему с тем же баллом.")
-        st.code(result_text, language="text")
     for gap in meth.get("violations") or []:
         if "явных возврата" in str(gap):
             st.markdown(f'<div class="rec bad">{esc(gap)}</div>', unsafe_allow_html=True)
@@ -1592,9 +1796,6 @@ def render_methodology(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any
 
 
 def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
-    """🔍 Операционный инспектор задачи — карточка рабочего регламента по выбранному шагу."""
-    st.markdown('<div class="ir-section">🔍 Операционный инспектор задачи</div>', unsafe_allow_html=True)
-    st.caption("Выберите шаг схемы — квалификацию исполнителя, порядок действий, СИЗ и результат.")
     try:
         struct = parse_bpmn_structure(xml)
     except Exception:  # noqa: BLE001
@@ -1636,97 +1837,74 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
     )
 
 
-def render_audit(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any]] = None) -> None:
-    st.markdown('<div class="ir-section">Аудит бизнес-архитектуры</div>', unsafe_allow_html=True)
-    render_methodology(audit, asis_audit=asis_audit)
-    bus = audit["bus_factor"]
-    sla = audit["sla"]
-    loops: List[Dict[str, Any]] = audit["rework_loops"]
-    stats = audit["stats"]
-
-    bus_color = BAD if bus["status"] == "risk" else OK
-    bus_pill = "Риск ключевого исполнителя" if bus["status"] == "risk" else "Нагрузка сбалансирована"
-
-    base_h, total_h = float(sla["critical_path_hours"]), float(sla["with_rework_hours"])
-    target = sla.get("target_hours")
-    if sla["breach"]:
-        sla_color, sla_pill = BAD, "Риск срыва SLA"
-    elif float(sla["rework_share"]) > 0.25:
-        sla_color, sla_pill = WARN, "Возвраты съедают запас"
-    elif target in (None, ""):
-        sla_color, sla_pill = BLUE, "Цель SLA не задана"
-    else:
-        sla_color, sla_pill = OK, "В пределах SLA"
-    sla_value = fmt_hours(base_h) if base_h < 48 else fmt_days(base_h)
-    sla_sub = f"{stats['critical_path_layers']} этапов схемы"
-    if target:
-        sla_sub += f" · цель {fmt_hours(float(target)) if float(target) < 48 else fmt_days(float(target))}"
-    rework_value = fmt_hours(total_h) if total_h < 48 else fmt_days(total_h)
-    rework_sub = (
-        "возвратов в модели нет — срок совпадает с базовым КП"
-        if not loops
-        else f"циклов: {len(loops)} · худший: +{fmt_hours(float(sla['rework_hours']))} к КП"
-    )
-
-    loop_color = OK if not loops else (BAD if len(loops) >= 3 else WARN)
-    loop_pill = "Возвратов нет" if not loops else f"Доля в сроке: {float(sla['rework_share']):.0%}"
-
-    c1, c2, c3, c4 = st.columns(4, gap="medium")
-    c1.markdown(
-        card(
-            "Bus-factor",
-            f"{float(bus['max_share']):.0%}",
-            f"Роль «{esc(bus['top_role'])}» · порог {float(bus['threshold']):.0%}"
-            f" · по часам {_role_hours_share(audit.get('lane_load'), str(bus.get('top_role') or '')):.0%}",
-            bus_color,
-            bus_pill,
-        ),
-        unsafe_allow_html=True,
-    )
-    c2.markdown(
-        card("Критический путь (базовый, без возвратов)", sla_value, sla_sub, sla_color, sla_pill),
-        unsafe_allow_html=True,
-    )
-    c3.markdown(
-        card("Срок с худшим возвратом (rework)", rework_value, rework_sub, loop_color, loop_pill),
-        unsafe_allow_html=True,
-    )
-    c4.markdown(
-        card(
-            "Структура процесса",
-            f"{stats['nodes']} узлов",
-            f"{stats['lanes']} ролей · {stats['subprocesses']} подпроцессов<br>{stats['valid_links']} потоков управления",
-            BLUE,
-            "Декомпозиция применена" if stats["subprocesses"] else "Без декомпозиции",
-        ),
-        unsafe_allow_html=True,
-    )
-    if sla.get("role_hours") is not None:
-        role_est = " · оценка" if sla.get("role_hours_estimate") else ""
+def render_details(audit: Dict[str, Any]) -> None:
+    """Служебные техдетали — единственный глубокий expander аудита."""
+    gen = audit.get("generation", {})
+    with st.expander("Служебное", expanded=False):
         st.markdown(
-            card(
-                "Срок с учётом ролей",
-                fmt_role_hours(float(sla["role_hours"])) + role_est,
-                "Параллельные ветки идут одновременно только если на них разные роли. "
-                "Одна роль делает свои шаги по очереди.",
-                BLUE,
-                "по ролям",
-            ),
-            unsafe_allow_html=True,
+            f"**Движок:** `{gen.get('engine', '—')}` · время {gen.get('elapsed_s', 0)} с · "
+            f"fail-safe: {'да' if gen.get('fallback') else 'нет'}"
         )
-    if audit.get("sla_hours_note"):
-        note = str(audit["sla_hours_note"])
-        if audit.get("sla_hours_approximate"):
-            note += " Итоговые часы ориентировочные."
-        st.caption(note)
-    if audit.get("sla_month_ignored"):
-        st.caption("срок в месяцах не учтён")
+        if gen.get("trace"):
+            st.markdown("**Трасса:**\n" + "\n".join(f"- {t}" for t in gen["trace"][:8]))
+        if audit.get("auto_healed"):
+            st.markdown("**Самовосстановление:**\n" + "\n".join(f"- {t}" for t in audit["auto_healed"][:6]))
+        if audit.get("engine_warnings"):
+            st.markdown("**Предупреждения:**\n" + "\n".join(f"- {t}" for t in audit["engine_warnings"][:6]))
+        if gen.get("code"):
+            st.markdown("**Код DIAGRAM:**")
+            st.code(gen["code"], language="python")
+        for item in gen.get("rejected", [])[:3]:
+            st.markdown(
+                f"**Отклонён {item.get('engine')}, попытка {item.get('attempt')}:** "
+                + "; ".join((item.get("problems") or [])[:5])
+            )
+        result_text = str(audit.get("result_text") or "").strip()
+        if result_text:
+            st.markdown("**Текст результата**")
+            st.caption("Вставка этого текста собирает схему с тем же баллом Quality Score.")
+            st.code(result_text, language="text")
+        st.markdown("**Как считали**")
+        tobe_delta = None
+        pack = st.session_state.get("tobe_pack") or {}
+        if isinstance(pack.get("delta"), dict) and pack.get("delta"):
+            tobe_delta = pack["delta"]
+        xml = str((st.session_state.get("result") or {}).get("xml") or "")
+        text = _active_regulation_text()
+        _scoring_captions(audit, xml, tobe_delta=tobe_delta, regulation_text=text)
+        st.markdown("**JSON аудита**")
+        st.json({k: v for k, v in audit.items() if k != "generation"}, expanded=False)
 
-    st.write("")
-    render_load_and_path(audit)
 
+def render_audit(
+    audit: Dict[str, Any],
+    asis_audit: Optional[Dict[str, Any]] = None,
+    xml: str = "",
+    regulation_text: str = "",
+) -> None:
+    """Один проход first-class: health → meth → циклы → path → landscape → структура → рекомендации → Служебное."""
+    _ = (xml, regulation_text)
+    # ir-title вместо тяжёлого ir-section — Quality Score сразу в кадре под табами.
+    st.markdown(
+        '<div class="ir-title" style="margin:4px 0 8px 0;font-size:1.15rem">Аудит бизнес-архитектуры</div>',
+        unsafe_allow_html=True,
+    )
+    asis = (st.session_state.get("result") or {}).get("audit") or audit
+    loops: List[Dict[str, Any]] = list(asis.get("rework_loops") or [])
+    stats = asis.get("stats") or {}
+    sla = asis.get("sla") or {}
+
+    health = process_health_issues(asis)
+    if health:
+        st.markdown(f'<div class="health-line">{esc(health[0])}</div>', unsafe_allow_html=True)
+
+    render_methodology(asis, asis_audit=asis_audit)
+
+    st.markdown(
+        '<div class="ir-title" style="margin-top:14px">Циклы возврата на доработку</div>',
+        unsafe_allow_html=True,
+    )
     if loops:
-        st.markdown('<div class="ir-title" style="margin-top:14px">Циклы возврата на доработку</div>', unsafe_allow_html=True)
         body = "".join(
             f"<tr><td><b>{esc(l['label'])}</b></td><td>{esc(l['from'])}</td><td>→ {esc(l['to'])}</td>"
             f"<td>{esc(l['lane'])}</td><td><b>{fmt_hours(float(l['cycle_hours']))}</b></td></tr>"
@@ -1738,43 +1916,49 @@ def render_audit(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any]] = N
             + "</table>",
             unsafe_allow_html=True,
         )
+    else:
+        st.caption("Циклов возврата в модели нет.")
 
-    render_landscape(audit)
+    render_load_and_path(asis)
+    render_landscape(asis)
 
-    st.markdown('<div class="ir-title" style="margin-top:18px">Рекомендации по оптимизации</div>', unsafe_allow_html=True)
-    risk_messages = [r for r in audit["sla_risks"] if r.get("severity") == "high"]
+    nodes = int(stats.get("nodes") or 0)
+    lanes = int(stats.get("lanes") or 0)
+    subs = int(stats.get("subprocesses") or 0)
+    links = int(stats.get("valid_links") or 0)
+    st.markdown(
+        card(
+            "Структура процесса",
+            f"{nodes} узлов",
+            f"{lanes} ролей · {subs} подпроцессов · {links} потоков",
+            BLUE,
+            "Декомпозиция" if subs else "Без декомпозиции",
+        ),
+        unsafe_allow_html=True,
+    )
+    if sla.get("role_hours") is not None:
+        role_est = " · оценка" if sla.get("role_hours_estimate") else ""
+        st.caption(f"Срок с учётом ролей: {fmt_role_hours(float(sla['role_hours']))}{role_est}")
+    if asis.get("sla_hours_note"):
+        st.caption(str(asis["sla_hours_note"]))
+
+    st.markdown('<div class="ir-title" style="margin-top:18px">Рекомендации</div>', unsafe_allow_html=True)
+    risk_messages = [r for r in (asis.get("sla_risks") or []) if r.get("severity") == "high"]
     recs = "".join(f'<div class="rec bad">{esc(r["message"])}</div>' for r in risk_messages)
-    for text in audit["recommendations"]:
-        css = "ok" if text.startswith("Существенных") else ("warn" if text.startswith(("Цикл", "Bus")) else "")
+    for text in asis.get("recommendations") or []:
+        css = (
+            "ok"
+            if str(text).startswith("Существенных")
+            else ("warn" if str(text).startswith(("Цикл", "Bus")) else "")
+        )
         recs += f'<div class="rec {css}">{esc(text)}</div>'
-    if audit["dead_ends"]:
-        recs += "".join(f'<div class="rec bad">{esc(d["message"])}</div>' for d in audit["dead_ends"])
+    for d in asis.get("dead_ends") or []:
+        recs += f'<div class="rec bad">{esc(d.get("message") or d)}</div>'
+    if not recs:
+        recs = '<div class="rec ok">Дополнительных рекомендаций нет</div>'
     st.markdown(recs, unsafe_allow_html=True)
 
-
-def render_details(audit: Dict[str, Any]) -> None:
-    gen = audit.get("generation", {})
-    with st.expander("Технические детали: движок генерации, самовосстановление, код, JSON аудита"):
-        st.markdown(
-            f"**Движок:** `{gen.get('engine', '—')}` · время {gen.get('elapsed_s', 0)} с · "
-            f"fail-safe: {'да' if gen.get('fallback') else 'нет'}"
-        )
-        if gen.get("trace"):
-            st.markdown("**Трасса выбора движка:**\n" + "\n".join(f"- {t}" for t in gen["trace"]))
-        if audit.get("auto_healed"):
-            st.markdown("**Самовосстановление графа:**\n" + "\n".join(f"- {t}" for t in audit["auto_healed"]))
-        if audit.get("engine_warnings"):
-            st.markdown("**Предупреждения движка:**\n" + "\n".join(f"- {t}" for t in audit["engine_warnings"]))
-        if gen.get("code"):
-            st.markdown("**Сгенерированный код для DIAGRAM:**")
-            st.code(gen["code"], language="python")
-        for item in gen.get("rejected", []):
-            st.markdown(
-                f"**Отклонённый ответ {item['engine']}, попытка {item['attempt']}:** " + "; ".join(item["problems"][:5])
-            )
-            st.code(item["code"], language="python")
-        st.markdown("**JSON аудита:**")
-        st.json({k: v for k, v in audit.items() if k != "generation"}, expanded=False)
+    render_details(asis)
 
 
 # --------------------------------------------------------------------------- #
@@ -2038,32 +2222,153 @@ def _store_regulation_pack(pack: Dict[str, Any]) -> None:
         "audit": pack.get("audit") or {},
         "error": pack.get("error") or "",
     }
-    st.session_state["tobe_pack"] = {
-        "source_xml": pack.get("xml") or "",
-        "text": pack.get("tobe_text") or "",
-        "delta": pack.get("delta") or {},
-        "xml": pack.get("tobe_xml") or "",
-        "audit": pack.get("tobe_audit") or {},
-        "error": "",
-        "facts": pack.get("facts") or {},
-        "tobe_ok": bool(pack.get("tobe_ok")),
-        "asis_text": pack.get("asis_text") or "",
-        "reason": pack.get("tobe_reason") or "",
-    }
+    _store_tobe_pack(
+        source_xml=pack.get("xml") or "",
+        tobe_text=pack.get("tobe_text") or "",
+        tobe_xml=pack.get("tobe_xml") or "",
+        tobe_audit=pack.get("tobe_audit") or {},
+        delta=pack.get("delta") or {},
+        facts=pack.get("facts") or {},
+        tobe_ok=bool(pack.get("tobe_ok")),
+        asis_text=pack.get("asis_text") or "",
+        reason=pack.get("tobe_reason") or "",
+    )
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
 
 
+def _store_tobe_pack(
+    *,
+    source_xml: str,
+    tobe_text: str,
+    tobe_xml: str,
+    tobe_audit: Dict[str, Any],
+    delta: Dict[str, Any],
+    facts: Dict[str, Any],
+    tobe_ok: bool,
+    asis_text: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Кладёт tobe_pack в сессию (As-Is result не трогает)."""
+    pack = {
+        "source_xml": source_xml or "",
+        "text": tobe_text or "",
+        "delta": delta or {},
+        "xml": tobe_xml or "",
+        "audit": tobe_audit or {},
+        "error": "",
+        "facts": facts or {},
+        "tobe_ok": bool(tobe_ok),
+        "asis_text": asis_text or "",
+        "reason": reason or "",
+    }
+    st.session_state["tobe_pack"] = pack
+    return pack
+
+
+def _finalize_auto_tobe() -> Optional[Dict[str, Any]]:
+    """Эффект бывшей кнопки трансформации: To-Be XML/audit/delta/facts в кэше, холст остаётся As-Is."""
+    pack = ensure_tobe_pack()
+    # После Generate пользователь видит As-Is; To-Be — переключателем на холсте.
+    st.session_state["canvas_variant"] = ASIS_LABEL
+    try:
+        st.query_params["cv"] = "asis"
+    except Exception:  # noqa: BLE001
+        pass
+    return pack
+
+
 def run_generation(text: str, use_llm: bool, show_progress: bool = True) -> None:
-    progress = st.progress(0, text="Запуск конвейера…") if show_progress else None
-    if progress:
-        progress.progress(45, text="Генерация BPMN 2.0…")
+    """As-Is + To-Be одним Generate: prepare_regulation → store → ensure_tobe_pack."""
+    progress = st.progress(0, text="1/3 As-Is по регламенту…") if show_progress else None
     pack = prepare_regulation(text, use_llm=bool(use_llm))
     if progress:
-        progress.progress(100, text="Аудит узких мест готов")
-        progress.empty()
+        progress.progress(55, text="2/3 To-Be · оптимизация…")
     _store_regulation_pack(pack)
+    _finalize_auto_tobe()
+    if progress:
+        progress.progress(100, text="3/3 Схема и To-Be готовы")
+        progress.empty()
     st.session_state["gen_fingerprint"] = _reg_hash(text or "", bool(use_llm))
+
+
+def _clear_demo_mode() -> None:
+    """Сбрасывает Demo Mode. Ключи виджетов (example_choice, reg_text) не трогает."""
+    st.session_state.pop("demo_mode", None)
+    st.session_state.pop("demo_example", None)
+    st.session_state.pop("demo_regulation", None)
+
+
+def _active_regulation_text() -> str:
+    """Текст регламента для пайплайна: в Demo Mode — demo_regulation, иначе поле ввода."""
+    if st.session_state.get("demo_mode") and st.session_state.get("demo_regulation"):
+        return str(st.session_state.get("demo_regulation") or "")
+    return str(st.session_state.get("reg_text") or "")
+
+
+def _pick_demo_example() -> Optional[Tuple[str, Dict[str, str]]]:
+    examples = load_examples()
+    choice = next(
+        (
+            name
+            for name, meta in examples.items()
+            if "закуп" in name.lower()
+            or "procurement" in str(meta.get("stem") or "").lower()
+            or "equipment" in str(meta.get("stem") or "").lower()
+        ),
+        next(iter(examples), None),
+    )
+    if not choice:
+        return None
+    return choice, examples[choice]
+
+
+def run_demo_mode() -> None:
+    """Внутренний демо-пайплайн (тесты/жюри): Generate + авто-To-Be, затем переключение холста на To-Be.
+
+    В primary UI кнопки нет — тот же To-Be строится из «Сгенерировать BPMN 2.0».
+    """
+    picked = _pick_demo_example()
+    if not picked:
+        st.warning("Нет примеров для Demo Mode.")
+        return
+    choice, meta = picked
+    text = str(meta.get("text") or "")
+    st.session_state["demo_mode"] = True
+    st.session_state["demo_example"] = choice
+    st.session_state["demo_regulation"] = text
+    st.session_state["file_stem"] = str(meta.get("stem") or "demo")
+    st.session_state["quickstart"] = False
+    st.session_state.pop("tobe_pack", None)
+    with st.status("Demo: AS-IS → анализ → TO-BE", expanded=True) as status:
+        status.write(f"1/5 Регламент: {choice}")
+        run_generation(text, use_llm=False, show_progress=False)
+        status.write("2/5 AS-IS восстановлен точно по документу")
+        pack = ensure_tobe_pack()
+        status.write("3/5 Найдены бизнес-проблемы процесса")
+        status.write("4/5 AI применил объяснимые улучшения")
+        if pack and pack.get("tobe_ok"):
+            st.session_state["canvas_variant"] = TOBE_LABEL
+            try:
+                st.query_params["cv"] = "tobe"
+            except Exception:  # noqa: BLE001
+                pass
+            facts = pack.get("facts") or {}
+            before = facts.get("rw_before")
+            after = facts.get("rw_after")
+            if before is not None and after is not None:
+                status.write(f"5/5 Эффект: {fmt_hours(float(before))} → {fmt_hours(float(after))}")
+                st.session_state["demo_toast"] = (
+                    f"To-Be · {fmt_hours(float(before))} → {fmt_hours(float(after))}"
+                )
+            else:
+                status.write("5/5 TO-BE на холсте — измеримый эффект")
+                st.session_state["demo_toast"] = "To-Be готов на холсте"
+        else:
+            st.session_state["canvas_variant"] = ASIS_LABEL
+            status.write("5/5 Честный AS-IS: существенного выигрыша нет")
+            st.session_state["demo_toast"] = "To-Be: существенного выигрыша нет"
+        status.update(label="To-Be готов", state="complete", expanded=False)
 
 
 def on_example_change() -> None:
@@ -2089,6 +2394,7 @@ def on_example_change() -> None:
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("tobe_pack", None)
     st.session_state["applied_example"] = choice
+    _clear_demo_mode()
 
 
 def _align_choice_text() -> None:
@@ -2299,25 +2605,36 @@ def render_downloads(key: str) -> None:
 
 
 def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
-    """To-Be для уже посчитанного As-Is. Повторно схему не генерирует и LLM не включает."""
+    """To-Be для уже посчитанного As-Is. Тот же optimize/align-путь, что в prepare_regulation."""
     result = st.session_state.get("result")
     if not result or result.get("error"):
         return None
     src = result.get("xml") or ""
     cached = st.session_state.get("tobe_pack")
-    if cached and cached.get("source_xml") == src and cached.get("facts"):
+    # Кэш валиден, если facts есть и при tobe_ok есть реальный XML схемы.
+    if (
+        cached
+        and cached.get("source_xml") == src
+        and cached.get("facts") is not None
+        and (not cached.get("tobe_ok") or bool(cached.get("xml")))
+    ):
         return cached
-    text = st.session_state.get("reg_text") or ""
+    text = _active_regulation_text()
     audit = result.get("audit") or {}
+    use_llm = bool(st.session_state.get("use_llm"))
     if not audit.get("sla"):
-        # Схему не пересобираем и облачный As-Is эмулятором не заменяем: только пометка, почему To-Be нет.
         facts = _annotate_tobe_facts(process_facts(audit, None), audit, {}, show_steps=False)
-        st.session_state["tobe_pack"] = {
-            "source_xml": src, "text": "", "delta": {}, "xml": "", "audit": {}, "error": "",
-            "facts": facts, "tobe_ok": False, "asis_text": text,
-            "reason": tobe_unavailable_reason(audit, {}, facts, ""),
-        }
-        return st.session_state["tobe_pack"]
+        return _store_tobe_pack(
+            source_xml=src,
+            tobe_text="",
+            tobe_xml="",
+            tobe_audit={},
+            delta={},
+            facts=facts,
+            tobe_ok=False,
+            asis_text=text,
+            reason=tobe_unavailable_reason(audit, {}, facts, ""),
+        )
     opt_text, delta = cached_optimize_to_be(
         _reg_hash(text, _audit_cache_slice(audit), "edges-v9"),
         text,
@@ -2330,29 +2647,39 @@ def ensure_tobe_pack() -> Optional[Dict[str, Any]]:
     facts = process_facts(audit, delta)
     tobe_xml = str((delta or {}).get("tobe_xml") or "")
     tobe_audit = dict((delta or {}).get("tobe_audit") or {})
-    pack = {
-        "xml": src,
-        "audit": audit,
-        "error": "",
-        "asis_text": text,
-        "use_llm": False,
-        "tobe_text": "",
-        "tobe_xml": "",
-        "tobe_audit": {},
-        "delta": delta or {},
-        "tobe_ok": False,
-    }
-    if _tobe_accepted(facts) and tobe_xml:
-        pack["tobe_text"] = opt_text or ""
-        pack["tobe_xml"] = tobe_xml
-        pack["tobe_audit"] = tobe_audit
-        pack["tobe_ok"] = True
-        pack["facts"] = _annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True)
-    else:
-        pack["facts"] = _annotate_tobe_facts(facts, audit, {}, show_steps=False)
-        pack["tobe_reason"] = tobe_unavailable_reason(audit, delta, facts, tobe_xml)
-    _store_regulation_pack(pack)
-    return st.session_state.get("tobe_pack")
+    if not (_tobe_accepted(facts) and tobe_xml):
+        return _store_tobe_pack(
+            source_xml=src,
+            tobe_text="",
+            tobe_xml="",
+            tobe_audit={},
+            delta=delta or {},
+            facts=_annotate_tobe_facts(facts, audit, {}, show_steps=False),
+            tobe_ok=False,
+            asis_text=text,
+            reason=tobe_unavailable_reason(audit, delta, facts, tobe_xml),
+        )
+    shown_tobe, tobe_view = align_result_quality(opt_text or "", tobe_xml, tobe_audit, use_llm)
+    rebuilt_xml = str(tobe_view.get("result_xml") or "")
+    rebuilt_audit = tobe_view.get("result_audit") if isinstance(tobe_view.get("result_audit"), dict) else None
+    if rebuilt_xml and rebuilt_audit:
+        tobe_xml, tobe_audit = rebuilt_xml, rebuilt_audit
+    elif isinstance(tobe_view.get("methodology"), dict):
+        tobe_audit = dict(tobe_audit)
+        tobe_audit["methodology"] = dict(tobe_view["methodology"])
+    _keep_local_tobe_quality(delta, tobe_audit)
+    facts = process_facts(audit, delta)
+    return _store_tobe_pack(
+        source_xml=src,
+        tobe_text=shown_tobe or opt_text or "",
+        tobe_xml=tobe_xml,
+        tobe_audit=tobe_audit,
+        delta=delta or {},
+        facts=_annotate_tobe_facts(facts, audit, tobe_audit, show_steps=True),
+        tobe_ok=True,
+        asis_text=text,
+        reason="",
+    )
 
 
 def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
@@ -2360,7 +2687,7 @@ def _active_canvas() -> Tuple[str, Dict[str, Any], str]:
     result = st.session_state.get("result") or {}
     asis_xml = result.get("xml") or ""
     asis_audit = result.get("audit") or {}
-    asis_text = st.session_state.get("reg_text") or ""
+    asis_text = _active_regulation_text()
     if st.session_state.get("canvas_variant") != TOBE_LABEL:
         return asis_xml, asis_audit, asis_text
     pack = st.session_state.get("tobe_pack") or {}
@@ -2478,122 +2805,71 @@ def _tobe_export_slot(token: str) -> Dict[str, Any]:
 
 
 def render_tobe_tab() -> None:
-    st.markdown('<div class="ir-section">Оптимизация As-Is → To-Be</div>', unsafe_allow_html=True)
-    st.caption("Переключатель As-Is / To-Be на холсте меняет схему. Карточка — эффект реинжиниринга.")
+    st.markdown('<div class="ir-section">To-Be · целевой процесс</div>', unsafe_allow_html=True)
     pack = ensure_tobe_pack()
     if not pack:
-        st.info("Сначала сгенерируйте диаграмму As-Is.")
+        st.caption("To-Be строится вместе с «Сгенерировать BPMN 2.0».")
         return
     delta = pack.get("delta") or {}
-    facts = pack.get("facts") or process_facts(
-        (st.session_state.get("result") or {}).get("audit") or {},
-        delta,
-    )
+    asis_audit = (st.session_state.get("result") or {}).get("audit") or {}
+    facts = pack.get("facts") or process_facts(asis_audit, delta)
     if pack.get("error") and not pack.get("xml"):
-        st.warning(f"Целевую диаграмму построить не удалось: {pack['error']}")
-    cp_before = float(facts.get("cp_before") or 0)
-    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+        st.error(str(pack.get("error") or "To-Be не построен").splitlines()[0][:240])
+        return
+    if not pack.get("tobe_ok") and pack.get("reason"):
+        st.caption(str(pack.get("reason") or ""))
+
     rw_before = float(facts.get("rw_before") or 0)
     rw_after = float(facts.get("rw_after") if facts.get("rw_after") is not None else rw_before)
     loops_before = int(facts.get("loops_before") or 0)
     loops_after = int(facts.get("loops_after") or 0)
-    quality_before = int(facts.get("quality_before") or 0)
-    quality_after = int(facts.get("quality_after") or 0)
-    frac_before = str(delta.get("quality_fraction_before") or "")
-    frac_after = str(delta.get("quality_fraction_after") or "")
-    quality_sub = f"{frac_before} → {frac_after}" if frac_before and frac_after else f"quality {quality_before} → {quality_after}"
-    eco_value = tobe_card_headline(facts) or (
-        f"Путь с возвратами: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
-    )
-    eco_sub = (
-        f"КП без возвратов: {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
-        f"rework: {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
-    )
-    removed = max(0, loops_before - loops_after)
+    cp_before = float(facts.get("cp_before") or 0)
+    cp_after = float(facts.get("cp_after") if facts.get("cp_after") is not None else cp_before)
+    sla_before = rw_before if rw_before > 0 else cp_before
+    sla_after = rw_after if facts.get("rw_after") is not None else cp_after
+
+    # 1) Impact
     st.markdown(
         f'<div class="tobe-grid">'
-        f'<div class="tobe-card"><div class="k">Экономия SLA</div>'
-        f'<div class="v">{esc(eco_value)}</div>'
-        f'<div class="s">{esc(eco_sub)}</div></div>'
-        f'<div class="tobe-card"><div class="k">Циклы доработки</div>'
+        f'<div class="tobe-card"><div class="k">SLA</div>'
+        f'<div class="v">{esc(fmt_hours(sla_before))} → {esc(fmt_hours(sla_after))}</div>'
+        f'<div class="s">срок с учётом возвратов</div></div>'
+        f'<div class="tobe-card"><div class="k">Возвраты</div>'
         f'<div class="v">{loops_before} → {loops_after}</div>'
-        f'<div class="s">устранено петель: {removed}</div></div>'
-        f'<div class="tobe-card"><div class="k">Качество нотации</div>'
-        f'<div class="v">{quality_before}% → {quality_after}%</div>'
-        f'<div class="s">{esc(quality_sub)}</div></div>'
+        f'<div class="s">число циклов</div></div>'
         f"</div>",
         unsafe_allow_html=True,
     )
-    tobe_for_card = pack.get("audit") or {}
-    tobe_meth = (tobe_for_card.get("methodology") or {})
-    frac = tobe_meth.get("quality_fraction") or ""
-    if frac:
-        st.caption(f"Доля без нарушений: {frac}")
-    # Списки той же локальной пары, что и баллы карточки. Холст As-Is сюда не подмешивается.
-    removed_v = delta.get("violations_removed")
-    remain_v = delta.get("violations_remaining")
-    if not isinstance(removed_v, list) or not isinstance(remain_v, list):
-        removed_v = []
-        remain_v = list(tobe_meth.get("violation_items") or [])
-    st.markdown('<div class="ir-title" style="margin-top:8px">Снято</div>', unsafe_allow_html=True)
-    if not removed_v:
-        st.markdown(
-            '<div class="tobe-act">Принятые ходы эти нарушения не снимают</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        for item in removed_v[:5]:
-            if isinstance(item, dict):
-                msg = str(item.get("message") or "")
-                quote = str(item.get("quote") or "")
-                bit = f" — «{quote}»" if quote else ""
-                st.markdown(f'<div class="tobe-act">{esc(msg)}{esc(bit)}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="tobe-act">{esc(item)}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="ir-title" style="margin-top:8px">Осталось</div>', unsafe_allow_html=True)
-    if not remain_v:
-        st.caption("Нарушений не осталось.")
-    for item in remain_v[:5]:
-        msg = str(item.get("message") if isinstance(item, dict) else item)
-        st.markdown(f'<div class="tobe-act">{esc(msg)}</div>', unsafe_allow_html=True)
-    st.caption(
-        f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
-        f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
-    )
-    role_before = delta.get("role_before")
-    role_after = delta.get("role_after")
-    if role_before is not None and role_after is not None:
-        role_est = ""
-        if delta.get("role_before_estimate") or delta.get("role_after_estimate"):
-            role_est = " · оценка"
-        st.markdown(
-            f'<div class="ir-title" style="margin-top:8px">Срок с учётом ролей: '
-            f'{fmt_role_hours(float(role_before))} → {fmt_role_hours(float(role_after))}{role_est}</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "Параллельные ветки идут одновременно только если на них разные роли. "
-            "Одна роль делает свои шаги по очереди."
-        )
-    engine = delta.get("engine") or "semantic-optimizer"
-    st.caption(f"Движок оптимизации: {'облачная LLM' if engine == 'llm' else 'семантический оптимизатор'} · {engine}")
-    if delta.get("local_model"):
-        st.caption(
-            "Эффект посчитан по одной локальной модели регламента, до оптимизации и после. "
-            "Схема слева построена отдельно, моделью по тексту."
-        )
-    actions = [
-        act for act in (facts.get("tobe_actions") or delta.get("actions") or [])
-        if "узких мест" not in str(act.get("detail") or "")
-        and act.get("kind") != "stable"
-    ]
-    if actions:
-        st.markdown('<div class="ir-title" style="margin-top:8px">Применённые мероприятия</div>', unsafe_allow_html=True)
-        for act in actions:
-            st.markdown(f'<div class="tobe-act">{esc(act.get("detail") or act.get("kind"))}</div>', unsafe_allow_html=True)
+    st.caption("На схеме: красный — возвраты · оранжевый — прежний путь · зелёный — улучшенный")
 
-    asis_audit = ((st.session_state.get("result") or {}).get("audit") or {})
     tobe_audit = pack.get("audit") or {}
+    asis_text = str((st.session_state.get("result") or {}).get("text") or _active_regulation_text())
+
+    # 2) Quality Score To-Be + сравнение с As-Is (Снято / Осталось внутри render_methodology)
+    if isinstance(tobe_audit.get("methodology"), dict):
+        asis_score = int(((asis_audit.get("methodology") or {}).get("score") or 0))
+        tobe_score = int(((tobe_audit.get("methodology") or {}).get("score") or 0))
+        st.caption(f"Quality Score: As-Is {asis_score}% → To-Be {tobe_score}%")
+        render_methodology(tobe_audit, asis_audit=asis_audit)
+    elif isinstance((asis_audit.get("methodology") or {}), dict) and not pack.get("tobe_ok"):
+        st.caption("Quality Score To-Be недоступен — показан As-Is для ориентира.")
+        render_methodology(asis_audit)
+
+    # 3) Что изменили ≤3
+    actions = normalize_optimization_actions(list(delta.get("actions") or []), limit=8)
+    changes = _dedupe_tobe_changes(actions, limit=3)
+    if changes:
+        st.markdown('<div class="ir-title">Что изменилось</div>', unsafe_allow_html=True)
+        for what, why in changes:
+            why_bit = f" · {esc(why)}" if why else ""
+            st.markdown(
+                f'<div class="tobe-act"><b>{esc(what)}</b>{why_bit}</div>',
+                unsafe_allow_html=True,
+            )
+    elif pack.get("tobe_ok"):
+        st.caption("Существенных изменений не найдено.")
+
+    # 4) Снятые возвраты / экономия + 5) нагрузка / путь
     if facts.get("show_steps") and pack.get("text"):
         render_asis_tobe_compare(
             compare_asis_tobe(
@@ -2605,47 +2881,24 @@ def render_tobe_tab() -> None:
             )
         )
     if facts.get("show_steps") and (tobe_audit.get("lane_load") or tobe_audit.get("critical_path")):
-        threshold = float(facts.get("bus_threshold") or 0.45)
         before_share = float(facts.get("bus_share") or 0)
-        after_share = float(facts.get("bus_share_after") if facts.get("bus_share_after") is not None else before_share)
-        prev_shares = _share_by_role(asis_audit.get("lane_load") or [])
-        relieved = [
-            str(item.get("role") or "")
-            for item in (tobe_audit.get("lane_load") or [])
-            if prev_shares.get(str(item.get("role") or ""), 0) > threshold
-            and float(item.get("share") or 0) <= threshold
-        ]
-        hours_before = float(facts.get("bus_hours_share") or 0)
-        hours_after = float(
-            facts.get("bus_hours_share_after") if facts.get("bus_hours_share_after") is not None else hours_before
-        )
-        load_bits = [
-            f"Bus-factor {before_share:.0%} → {after_share:.0%} шагов · по часам {hours_before:.0%} → {hours_after:.0%}"
-        ]
-        if relieved:
-            load_bits.append("разгружены: " + ", ".join(f"«{r}»" for r in relieved) + f" (выход из зоны >{threshold:.0%})")
-        elif facts.get("bus_status_after") == "ok" or facts.get("bus_status") == "ok":
-            load_bits.append("нагрузка сбалансирована")
-        path_n_before = int(facts.get("path_n_before") or 0)
-        path_n_after = int(facts.get("path_n_after") or 0)
-        shortened = path_n_after < path_n_before or cp_after + 1e-6 < cp_before
-        path_label = "Цепочка спрямилась" if shortened else "Критический путь"
-        path_cap = (
-            f"{path_label}: {path_n_before} шагов / {fmt_hours(cp_before)}"
-            f" → {path_n_after} шагов / {fmt_hours(cp_after)}. "
-            f"Критический путь (базовый, без возвратов): {fmt_hours(cp_before)} → {fmt_hours(cp_after)}. "
-            f"Срок с худшим возвратом (rework): {fmt_hours(rw_before)} → {fmt_hours(rw_after)}."
+        after_share = float(
+            facts.get("bus_share_after") if facts.get("bus_share_after") is not None else before_share
         )
         render_load_and_path(
             tobe_audit,
-            load_title="Новое распределение нагрузки по ролям в To-Be",
-            path_title="Новый критический путь To-Be (Беллман — Форд)",
+            load_title="Нагрузка ролей после улучшения",
+            path_title="Новый критический путь",
             prev_audit=asis_audit,
-            load_caption=" · ".join(load_bits),
-            path_caption=path_cap,
+            load_caption=f"{before_share:.0%} → {after_share:.0%}",
+            path_caption=(
+                f"{fmt_hours(cp_before)} → {fmt_hours(cp_after)} · "
+                f"rework {fmt_hours(rw_before)} → {fmt_hours(rw_after)}"
+            ),
             path_variant="tobe",
         )
 
+    # 6) Downloads / accept
     st.write("")
     stem = st.session_state.get("file_stem", "process")
     tobe_xml = pack.get("xml") or ""
@@ -2667,72 +2920,84 @@ def render_tobe_tab() -> None:
             export_slot[kind] = "" if kind == "md" else b""
         return export_slot[kind]
 
-    accept_col, bpmn_col = st.columns(2, gap="small")
-    with accept_col:
-        st.button(
-            "✅ Принять целевой регламент (Сделать основным)",
-            key="accept_tobe_as_asis",
-            disabled=not tobe_text.strip(),
-            on_click=_accept_tobe_as_main,
-            use_container_width=True,
-        )
-    with bpmn_col:
-        st.download_button(
-            "⬇️  Скачать To-Be .bpmn",
-            data=tobe_xml,
-            file_name=f"{stem}_tobe.bpmn",
-            mime="application/xml",
-            disabled=not bool(tobe_xml),
-            key="dl_tobe_bpmn",
-            use_container_width=True,
-        )
-    docx_col, md_col = st.columns(2, gap="small")
-    with docx_col:
-        docx_data = export_slot.get("docx") if tobe_ready else None
-        if not tobe_ready:
-            st.button("⬇️ Паспорт To-Be (.docx)", disabled=True, key="dl_tobe_docx_off", use_container_width=True)
-        elif docx_data is None and st.button(
-            "⬇️ Паспорт To-Be (.docx)", key="dl_tobe_docx_build", use_container_width=True,
-        ):
-            docx_data = _materialize_tobe("docx")
-        if docx_data:
-            st.download_button(
-                "⬇️ Паспорт To-Be (.docx)",
-                data=docx_data,
-                file_name=f"{stem}_tobe_reglament.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_tobe_docx",
+    with st.container(key="tobe_actions"):
+        accept_col, bpmn_col = st.columns(2, gap="small")
+        with accept_col:
+            st.button(
+                "Принять To-Be как основной",
+                key="accept_tobe_as_asis",
+                type="primary",
+                disabled=not tobe_text.strip(),
+                on_click=_accept_tobe_as_main,
                 use_container_width=True,
             )
-    with md_col:
-        md_data = export_slot.get("md") if tobe_ready else None
-        if not tobe_ready:
-            st.button("⬇️ Регламент To-Be (.md)", disabled=True, key="dl_tobe_md_off", use_container_width=True)
-        elif md_data is None and st.button(
-            "⬇️ Регламент To-Be (.md)", key="dl_tobe_md_build", use_container_width=True,
-        ):
-            md_data = _materialize_tobe("md")
-        if md_data:
+        with bpmn_col:
             st.download_button(
-                "⬇️ Регламент To-Be (.md)",
-                data=md_data,
-                file_name=f"{stem}_tobe_passport.md",
-                mime="text/markdown",
-                key="dl_tobe_md",
+                "Скачать To-Be .bpmn",
+                data=tobe_xml,
+                file_name=f"{stem}_tobe.bpmn",
+                mime="application/xml",
+                disabled=not bool(tobe_xml),
+                key="dl_tobe_bpmn",
                 use_container_width=True,
             )
-    with st.expander("Целевой текст регламента To-Be"):
-        st.code(pack.get("text") or "", language="text")
+        docx_col, md_col = st.columns(2, gap="small")
+        with docx_col:
+            docx_data = export_slot.get("docx") if tobe_ready else None
+            if not tobe_ready:
+                st.button("Паспорт To-Be (.docx)", disabled=True, key="dl_tobe_docx_off", use_container_width=True)
+            elif docx_data is None and st.button(
+                "Паспорт To-Be (.docx)", key="dl_tobe_docx_build", use_container_width=True,
+            ):
+                docx_data = _materialize_tobe("docx")
+            if docx_data:
+                st.download_button(
+                    "Паспорт To-Be (.docx)",
+                    data=docx_data,
+                    file_name=f"{stem}_tobe_reglament.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_tobe_docx",
+                    use_container_width=True,
+                )
+        with md_col:
+            md_data = export_slot.get("md") if tobe_ready else None
+            if not tobe_ready:
+                st.button("Регламент To-Be (.md)", disabled=True, key="dl_tobe_md_off", use_container_width=True)
+            elif md_data is None and st.button(
+                "Регламент To-Be (.md)", key="dl_tobe_md_build", use_container_width=True,
+            ):
+                md_data = _materialize_tobe("md")
+            if md_data:
+                st.download_button(
+                    "Регламент To-Be (.md)",
+                    data=md_data,
+                    file_name=f"{stem}_tobe_passport.md",
+                    mime="text/markdown",
+                    key="dl_tobe_md",
+                    use_container_width=True,
+                )
+    with st.expander("Служебное", expanded=False):
+        _scoring_captions(
+            tobe_audit,
+            str(pack.get("xml") or ""),
+            tobe_delta=delta,
+            regulation_text=str(pack.get("text") or asis_text),
+        )
+        if pack.get("text"):
+            st.markdown("**Текст регламента To-Be**")
+            st.code(pack.get("text") or "", language="text")
+        if tobe_audit:
+            st.markdown("**JSON аудита To-Be**")
+            st.json({k: v for k, v in tobe_audit.items() if k != "generation"}, expanded=False)
 
 
 def render_raci_tab(xml: str, audit: Dict[str, Any], text: str) -> None:
-    st.markdown('<div class="ir-section">Матрица ответственности RACI</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="raci-legend">'
-        '<span class="raci-b R" title="Responsible">R</span> исполнитель · '
-        '<span class="raci-b A" title="Accountable">A</span> итоговая ответственность · '
-        '<span class="raci-b C" title="Consulted">C</span> консультирует · '
-        '<span class="raci-b I" title="Informed">I</span> уведомляется'
+        '<span class="raci-b R">R</span> · '
+        '<span class="raci-b A">A</span> · '
+        '<span class="raci-b C">C</span> · '
+        '<span class="raci-b I">I</span>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -2798,10 +3063,21 @@ def _raci_tip(letter: str, role: str) -> str:
     return titles.get(letter, letter)
 
 
-def render_input_panel(labels: List[str], compact: bool = False) -> None:
-    """Блок «регламент + генерация». compact=True — двухколоночная компоновка для аккордеона."""
-    box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
-    with box_left:
+def render_input_panel(labels: List[str], compact: bool = False, rail: bool = False) -> None:
+    """Параметры всегда на экране. rail=True — узкая колонка слева после Generate (textarea ~78px)."""
+    st.markdown('<div class="ir-panel-label">Параметры регламента</div>', unsafe_allow_html=True)
+    has_result = bool(
+        (st.session_state.get("result") or {}).get("xml")
+        and not (st.session_state.get("result") or {}).get("error")
+    )
+    if rail:
+        text_h = 78
+    elif has_result:
+        text_h = 88 if compact else 110
+    else:
+        text_h = 160 if compact else 220
+
+    def _reg_fields() -> None:
         uploaded = st.file_uploader(
             "Загрузить регламент (.docx, .pdf, .txt)",
             type=["docx", "pdf", "txt"],
@@ -2813,7 +3089,7 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
         if badge.get("name"):
             chars = f"{int(badge.get('chars') or 0):,}".replace(",", " ")
             st.markdown(
-                f'<div class="file-badge">📄 <b>{esc(badge["name"])}</b> · распознано {chars} символов</div>',
+                f'<div class="file-badge"><b>{esc(badge["name"])}</b> · {chars} символов</div>',
                 unsafe_allow_html=True,
             )
         st.selectbox(
@@ -2824,11 +3100,12 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             help="Выберите эталонный кейс или введите свой текст ниже.",
         )
         st.text_area(
-            "Вставьте свой регламент или выберите пример слева",
+            "Текст регламента",
             key="reg_text",
-            height=220 if compact else 360,
+            height=text_h,
         )
-    with box_right:
+
+    def _gen_controls() -> None:
         if "use_llm" not in st.session_state:
             st.session_state["use_llm"] = USE_LLM_ON_OPEN
         use_llm = st.checkbox(
@@ -2837,20 +3114,22 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
             help="При открытии страницы галочка включена. Снимите её — кнопка соберёт схему эмулятором и не пойдёт в облако. "
             "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
         )
-        # Имена секретов — только если ключа нет (диагностика настройки), иначе строка для жюри лишняя.
-        secrets_note = f" · найдены секреты: {', '.join(SECRET_NAMES)}" if SECRET_NAMES and not os.getenv("OPENAI_API_KEY") else ""
+        secrets_note = (
+            f" · найдены секреты: {', '.join(SECRET_NAMES)}"
+            if SECRET_NAMES and not os.getenv("OPENAI_API_KEY")
+            else ""
+        )
         st.caption(f"Облачная модель: {cloud_engine_status()}{secrets_note}")
-        if st.button("🚀  Сгенерировать BPMN 2.0", type="primary"):
+        if st.button("Сгенерировать BPMN 2.0", type="primary", use_container_width=True):
             st.session_state["quickstart"] = False
+            _clear_demo_mode()
             if not st.session_state["reg_text"].strip():
                 st.warning("Введите текст регламента.")
             else:
-                # Одна и та же анимация с галочкой LLM и без неё: видна, пока схема не готова.
-                with st.status(GENERATION_BUSY_LABEL, expanded=True) as gen_status:
-                    run_generation(st.session_state["reg_text"], use_llm)
-                    gen_status.update(label="Схема готова", state="complete", expanded=False)
+                run_generation(st.session_state["reg_text"], use_llm, show_progress=True)
+                ensure_tobe_pack()
+                st.rerun()
         _sync_generation()
-
         result = st.session_state.get("result")
         if result and not result["error"]:
             gen = result["audit"].get("generation", {})
@@ -2862,18 +3141,31 @@ def render_input_panel(labels: List[str], compact: bool = False) -> None:
                 if any("лимит облачной модели" in str(r).lower() for r in reasons):
                     st.info("Лимит облачной модели исчерпан, схема построена локально")
                 safe = [r for r in reasons if "Traceback" not in str(r) and 'File "' not in str(r)]
-                note = "<br>⚠️ fail-safe: " + "<br>".join(f"· {esc(r)}" for r in safe)
+                if safe:
+                    note = "<br>" + "<br>".join(f"· {esc(r)}" for r in safe[:3])
             elif gen.get("attempts", 1) > 1:
                 note = f" · исправлено со {gen['attempts']}-й попытки"
-            xsd = " · ✓ XSD BPMN 2.0" if result["audit"].get("xsd_valid") else ""
+            xsd = " · XSD OK" if result["audit"].get("xsd_valid") else ""
             st.markdown(
                 f'<div class="engine">Движок: <b>{esc(engine)}</b> · {elapsed} с{xsd}{note}</div>',
                 unsafe_allow_html=True,
             )
 
+    if rail:
+        # Узкая колонка: всё в один столбец, без горизонтального 3+2.
+        _reg_fields()
+        _gen_controls()
+        return
+
+    box_left, box_right = st.columns([3, 2], gap="large") if compact else (st.container(), st.container())
+    with box_left:
+        _reg_fields()
+    with box_right:
+        _gen_controls()
+
 
 def _diagram_height(wide: bool) -> int:
-    """Автоподгонка высоты холста по числу дорожек и узлов, чтобы схема не сжималась в точку."""
+    """Единственная высота холста: max(240, min(300, base+extra)). Один return."""
     result = st.session_state.get("result") or {}
     audit = result.get("audit") or {}
     if st.session_state.get("canvas_variant") == TOBE_LABEL:
@@ -2883,8 +3175,8 @@ def _diagram_height(wide: bool) -> int:
     lanes = int(stats.get("lanes") or 3)
     nodes = int(stats.get("nodes") or 12)
     base = DIAGRAM_HEIGHT_WIDE if wide else DIAGRAM_HEIGHT
-    extra = min(140, max(0, (lanes - 3) * 40 + max(0, nodes - 18) * 4))
-    return int(min(720, max(580, base + extra)))
+    extra = min(20, max(0, (lanes - 3) * 6 + max(0, nodes - 18)))
+    return max(240, min(300, int(base + extra)))
 
 
 def _sync_canvas_from_query() -> None:
@@ -2930,13 +3222,14 @@ def _hero_engine_badge() -> str:
     return engine_badge_text(str(gen.get("engine") or ""), bool(gen.get("fallback")))
 
 
-def _hero_html() -> str:
+def _hero_html(*, compact: bool = False) -> str:
     engine = _hero_engine_badge()
+    cls = "ir-hero compact" if compact else "ir-hero"
     return (
-        '<div class="ir-hero">'
-        "<div><h1>⚡ Архитектор BPMN-диаграмм</h1>"
+        f'<div class="{cls}">'
+        "<div><h1>Архитектор BPMN-диаграмм</h1>"
         "<p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · "
-        "Трансформация регламентов в BPMN 2.0.2 и аудит процессов</p></div>"
+        "регламент → BPMN 2.0.2 · аудит SLA и узких мест</p></div>"
         f'<div class="ir-badges"><span>{esc(engine)}</span>'
         "<span>BPMN 2.0.2</span><span>XSD Valid</span></div></div>"
     )
@@ -2958,67 +3251,82 @@ def _migrate_view_mode() -> None:
 def render_diagram(canvas_height: int) -> None:
     result = st.session_state.get("result")
     if not result:
-        st.info("Выберите регламент и нажмите «Сгенерировать BPMN 2.0».")
-    elif result["error"]:
-        st.error(str(result["error"]).splitlines()[0][:300])
-    else:
-        pack = ensure_tobe_pack()
-        if pack and pack.get("error") and not pack.get("xml"):
-            st.warning("To-Be недоступен — на холсте остаётся As-Is. " + str(pack.get("error") or ""))
-        xml_asis = result.get("xml") or ""
-        audit_asis = result.get("audit") or {}
-        text_asis = st.session_state.get("reg_text") or ""
-        xml_tobe = ""
-        if pack and pack.get("xml") and not pack.get("error"):
-            xml_tobe = str(pack.get("xml") or "")
-        catalog = build_diagram_catalog(xml_asis, audit_asis, text_asis)
-        catalog_tb = (
-            build_diagram_catalog(
-                xml_tobe,
-                pack.get("audit") or audit_asis,
-                pack.get("text") or text_asis,
-            )
-            if xml_tobe
-            else {}
+        st.markdown(
+            '<div class="canvas-empty"><b>Схема ещё не построена</b>'
+            "Выберите регламент и нажмите «Сгенерировать BPMN 2.0».</div>",
+            unsafe_allow_html=True,
         )
-        if xml_tobe and pack:
-            # Подсветка на текущей схеме: шаги, изменившиеся в сравнении (роль, срок). «Исчез» и «появился» не трогаем.
-            try:
-                tobe_facts = pack.get("facts") or process_facts(audit_asis, pack.get("delta"))
-                if tobe_facts.get("show_steps") and pack.get("text"):
-                    mark_changed_steps(
-                        catalog,
-                        catalog_tb,
-                        compare_asis_tobe(
-                            str(audit_asis.get("result_text") or text_asis),
-                            str(pack.get("text") or ""),
-                            audit_asis,
-                            pack.get("audit") or {},
-                            tobe_facts,
-                        ),
-                    )
-            except Exception:  # noqa: BLE001 — подсветка не должна ломать холст
-                pass
-        copilot = build_canvas_copilot(
-            xml_asis,
-            audit_asis,
-            text_asis,
-            (pack or {}).get("delta"),
+        render_downloads("under_canvas")
+        return
+    if result.get("error"):
+        st.error(str(result["error"]).splitlines()[0][:240])
+        render_downloads("under_canvas")
+        return
+
+    xml_asis = str(result.get("xml") or "").strip()
+    if not xml_asis:
+        st.error("Схема сгенерирована без XML — повторите генерацию.")
+        render_downloads("under_canvas")
+        return
+
+    pack = ensure_tobe_pack()
+    if pack and pack.get("error") and not pack.get("xml"):
+        st.caption("To-Be недоступен — на холсте As-Is.")
+    audit_asis = result.get("audit") or {}
+    text_asis = _active_regulation_text()
+    xml_tobe = ""
+    if pack and pack.get("xml") and not pack.get("error"):
+        xml_tobe = str(pack.get("xml") or "")
+    catalog = build_diagram_catalog(xml_asis, audit_asis, text_asis)
+    catalog_tb = (
+        build_diagram_catalog(
+            xml_tobe,
+            pack.get("audit") or audit_asis,
+            pack.get("text") or text_asis,
         )
-        page = viewer_html(
-            xml_asis,
-            canvas_height,
-            catalog,
-            copilot,
-            xml_tobe=xml_tobe,
-            catalog_tobe=catalog_tb,
-            tobe_reason="" if xml_tobe else str((pack or {}).get("reason") or ""),
-        )
-        if hasattr(st, "iframe"):  # Streamlit ≥ 1.5x: st.components.v1.html объявлен устаревшим
-            st.iframe(page, width="stretch", height=canvas_height + 16)
-        else:
-            components.html(page, height=canvas_height + 16, scrolling=False)
+        if xml_tobe
+        else {}
+    )
+    if xml_tobe and pack:
+        try:
+            tobe_facts = pack.get("facts") or process_facts(audit_asis, pack.get("delta"))
+            if tobe_facts.get("show_steps") and pack.get("text"):
+                mark_changed_steps(
+                    catalog,
+                    catalog_tb,
+                    compare_asis_tobe(
+                        str(audit_asis.get("result_text") or text_asis),
+                        str(pack.get("text") or ""),
+                        audit_asis,
+                        pack.get("audit") or {},
+                        tobe_facts,
+                    ),
+                )
+        except Exception:  # noqa: BLE001 — подсветка не должна ломать холст
+            pass
+    copilot = build_canvas_copilot(
+        xml_asis,
+        audit_asis,
+        text_asis,
+        (pack or {}).get("delta"),
+    )
+    canvas_tobe = st.session_state.get("canvas_variant") == TOBE_LABEL and bool(xml_tobe)
+    page = viewer_html(
+        xml_asis,
+        canvas_height,
+        catalog,
+        copilot,
+        xml_tobe=xml_tobe,
+        catalog_tobe=catalog_tb,
+        canvas_tobe=canvas_tobe,
+        tobe_reason="" if xml_tobe else str((pack or {}).get("reason") or ""),
+    )
+    # components.html стабильнее для bpmn-js + крупного XML, чем st.iframe(srcdoc).
+    # height чуть зависит от fingerprint — форсирует перерисовку после новой генерации.
+    bump = int(hashlib.sha256(xml_asis.encode()).hexdigest()[:2], 16) % 3
+    components.html(page, height=canvas_height + 16 + bump, scrolling=False)
     render_downloads("under_canvas")
+    render_kpi_row(audit_asis)
 
 
 def _send_assistant(prompt: str) -> None:
@@ -3095,7 +3403,6 @@ def main() -> None:
     )
     st.markdown(CSS, unsafe_allow_html=True)
     render_assistant()
-    # Часть виджетов не рисуется в отдельных режимах — не даём Streamlit стереть их состояние.
     for _k in ("reg_text", "example_choice"):
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
@@ -3116,7 +3423,26 @@ def main() -> None:
     _align_choice_text()
     _consume_tobe_accept()
 
-    st.markdown(_hero_html(), unsafe_allow_html=True)
+    if st.session_state.pop("diagram_updated_by_assistant", False):
+        st.markdown(
+            '<div class="ir-toast">Диаграмма обновлена ассистентом</div>',
+            unsafe_allow_html=True,
+        )
+    if st.session_state.pop("tobe_accepted_note", False):
+        st.markdown(
+            '<div class="ir-toast">To-Be принят как основной регламент</div>',
+            unsafe_allow_html=True,
+        )
+    chat_cleared = st.session_state.pop("chat_cleared_toast", False)
+
+    # 1) Hero — только peek для compact; gate tabs ниже, после radio
+    _peek = st.session_state.get("result")
+    _hero_compact = bool(_peek) and not (_peek or {}).get("error") and bool(
+        str((_peek or {}).get("xml") or "").strip()
+    )
+    st.markdown(_hero_html(compact=_hero_compact), unsafe_allow_html=True)
+
+    # 2) Radio
     view = st.radio(
         "Режим отображения",
         [VIEW_WIDE, VIEW_SPLIT],
@@ -3124,54 +3450,54 @@ def main() -> None:
         horizontal=True,
         label_visibility="collapsed",
     )
-
     wide = view == VIEW_WIDE
     canvas_h = _diagram_height(wide)
-    if st.session_state.pop("diagram_updated_by_assistant", False):
-        st.markdown(
-            '<div class="ir-toast">✨ Диаграмма обновлена ассистентом в диалоге</div>',
-            unsafe_allow_html=True,
-        )
-    if st.session_state.pop("tobe_accepted_note", False):
-        st.markdown(
-            '<div class="ir-toast">✨ Целевой процесс To-Be принят в качестве основного регламента!</div>',
-            unsafe_allow_html=True,
-        )
-    if wide:
-        with st.expander("Параметры регламента", expanded=True):
-            render_input_panel(labels, compact=True)
-        if st.session_state.pop("chat_cleared_toast", False):
+
+    # Gate ПОСЛЕ hero+radio (не кешировать ready до button / вверху main)
+    result = st.session_state.get("result")
+    has_diagram = bool(result) and not result.get("error") and bool(
+        str(result.get("xml") or "").strip()
+    )
+
+    def _chat_cleared_toast() -> None:
+        if chat_cleared:
             st.markdown(
                 '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
                 unsafe_allow_html=True,
             )
-        render_diagram(canvas_h)
-    else:
-        left, right = st.columns([5, 7], gap="large")
-        with left:
-            render_input_panel(labels)
-            if st.session_state.pop("chat_cleared_toast", False):
-                st.markdown(
-                    '<div class="ir-toast">Диалог очищен: выбран другой регламент</div>',
-                    unsafe_allow_html=True,
-                )
-        with right:
+
+    def _params_and_canvas() -> None:
+        """Wide = полная ширина params→canvas; Split = [rail | canvas]."""
+        if wide:
+            render_input_panel(labels, compact=True, rail=False)
+            _chat_cleared_toast()
+            render_diagram(canvas_h)
+            return
+        rail_col, canvas_col = st.columns([1, 2.6], gap="medium")
+        with rail_col:
+            render_input_panel(labels, compact=True, rail=True)
+            _chat_cleared_toast()
+        with canvas_col:
             render_diagram(canvas_h)
 
-    result = st.session_state.get("result")
-    if result and not result["error"]:
+    if has_diagram:
+        asis_audit = result.get("audit") or {}
+        qs = int(((asis_audit.get("methodology") or {}).get("score") or 0))
+        n_loops = len(asis_audit.get("rework_loops") or [])
         xml, audit, text = _active_canvas()
+
+        _params_and_canvas()
+
+        st.markdown(
+            f'<div class="engine">Quality Score As-Is: <b>{qs}%</b> · циклов: <b>{n_loops}</b>'
+            f" · вкладки ниже</div>",
+            unsafe_allow_html=True,
+        )
         tab_audit, tab_tobe, tab_raci, tab_inspector = st.tabs(
-            [
-                "📊 Аудит и SLA",
-                "⚡ Оптимизация As-Is → To-Be",
-                "👥 Матрица RACI",
-                "🔍 Инспектор задачи",
-            ]
+            ["Аудит", "To-Be", "RACI", "Инспектор"]
         )
         with tab_audit:
-            render_audit(audit)
-            render_details(audit)
+            render_audit(audit, xml=xml, regulation_text=text)
         with tab_tobe:
             render_tobe_tab()
         with tab_raci:
@@ -3182,5 +3508,11 @@ def main() -> None:
             )
         with tab_inspector:
             render_task_inspector(xml, audit, text)
+        return
 
-main()
+    # До Generate: та же wide/split логика, empty canvas, без tabs
+    _params_and_canvas()
+
+
+if __name__ == "__main__":
+    main()
