@@ -3475,7 +3475,9 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                 prompt = build_repair_prompt(text, _strip_markdown(raw), problems)
 
     if incomplete_model:
-        return "", {}, incomplete_model
+        # Модель потеряла возвраты на доработку: не показываем ошибку, а пробуем локальный разбор —
+        # execute_generated_code всё равно не пропустит схему без всех возвратов регламента.
+        trace.append("Облачная модель потеряла возвраты на доработку — схема собрана локальным разбором")
 
     try:
         from process_blueprint import analyze_process, compile_blueprint
@@ -3483,10 +3485,12 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
         ready = analyze_process(text)
         code, info = compile_blueprint(ready)
     except Exception as exc:  # noqa: BLE001
-        return "", {}, _UNRECOGNIZED_PROCESS
+        return "", {}, incomplete_model or _UNRECOGNIZED_PROCESS
     xml, audit, err = execute_generated_code(
         code, process_name, sla, regulation_text=text, blueprint=ready,
     )
+    if err and incomplete_model:
+        return "", {}, incomplete_model
     if err:
         if (
             err == _UNRECOGNIZED_PROCESS
