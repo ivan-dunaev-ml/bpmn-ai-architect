@@ -1822,7 +1822,13 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
     cache_key = f"{node['name']}|{node.get('lane') or ''}"
     if cache_key not in cache:
         with st.spinner("Собираем операционную карточку…"):
-            cache[cache_key] = inspect_task_details(str(node["name"]), str(node.get("lane") or ""), ctx)
+            engine = str(((audit or {}).get("generation") or {}).get("engine") or "")
+            cloud_ok = bool(engine) and not engine.startswith("semantic")
+            # Облако недоступно (схему строил встроенный движок) — карточка по правилам, без ожидания LLM:
+            # иначе вкладка (Streamlit рисует все вкладки) держит страницу до CHAT_TIMEOUT × провайдеры.
+            cache[cache_key] = inspect_task_details(
+                str(node["name"]), str(node.get("lane") or ""), ctx, use_llm=cloud_ok
+            )
     card_data = cache[cache_key]
     steps_html = "".join(f"<li>{esc(s)}</li>" for s in (card_data.get("procedure_steps") or []))
     st.markdown(
@@ -3222,6 +3228,13 @@ def _hero_engine_badge() -> str:
     return engine_badge_text(str(gen.get("engine") or ""), bool(gen.get("fallback")))
 
 
+def _hero_xsd_badge() -> str:
+    """«XSD Valid» — только если текущая схема реально прошла проверку по XSD BPMN 2.0."""
+    result = st.session_state.get("result") or {}
+    ok = bool(result.get("xml")) and not result.get("error") and (result.get("audit") or {}).get("xsd_valid") is True
+    return "<span>XSD Valid</span>" if ok else ""
+
+
 def _hero_html(*, compact: bool = False) -> str:
     engine = _hero_engine_badge()
     cls = "ir-hero compact" if compact else "ir-hero"
@@ -3231,7 +3244,7 @@ def _hero_html(*, compact: bool = False) -> str:
         "<p>ПАО «Интер РАО» · Дирекция бизнес-архитектуры · "
         "регламент → BPMN 2.0.2 · аудит SLA и узких мест</p></div>"
         f'<div class="ir-badges"><span>{esc(engine)}</span>'
-        "<span>BPMN 2.0.2</span><span>XSD Valid</span></div></div>"
+        f"<span>BPMN 2.0.2</span>{_hero_xsd_badge()}</div></div>"
     )
 
 

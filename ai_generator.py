@@ -6842,7 +6842,7 @@ def _heuristic_inspect(task_name: str, task_role: str, ctx: Dict[str, Any]) -> D
     }
 
 
-def inspect_task_details(task_name: str, task_role: str, process_context: dict) -> dict:
+def inspect_task_details(task_name: str, task_role: str, process_context: dict, use_llm: bool = True) -> dict:
     """Развёрнутая операционная инструкция исполнителя по шагу BPMN.
 
     Облачная модель (Groq/OpenAI) → эвристики процесса. Всегда возвращает словарь с ключами
@@ -6850,7 +6850,7 @@ def inspect_task_details(task_name: str, task_role: str, process_context: dict) 
     """
     ctx = process_context if isinstance(process_context, dict) else {}
     fallback = _heuristic_inspect(task_name or "", task_role or "", ctx)
-    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+    if not use_llm or os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return fallback
     payload = {
         "task": task_name,
@@ -7994,6 +7994,10 @@ def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return None
     if not _cloud_prefixes():
+        return None
+    engine = str(((audit_data or {}).get("generation") or {}).get("engine") or "")
+    if engine.startswith("semantic"):
+        # As-Is только что собран встроенным движком — облако недоступно; не ждём ещё CHAT_TIMEOUT.
         return None
     ctx = build_process_context(regulation_text, "", audit_data or {})
     messages = [
