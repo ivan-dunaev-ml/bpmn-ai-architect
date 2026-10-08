@@ -28,3 +28,11 @@ compact_dump.txt
 code.txt
 project_code.txt
 compact_dump.txt
+
+# local dumps / agent leftovers
+*.diff
+*_dump.txt
+*dump*.txt
+code.txt
+project_code.txt
+compact_dump.txt
