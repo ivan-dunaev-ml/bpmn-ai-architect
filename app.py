@@ -1526,10 +1526,13 @@ def _scoring_captions(
     level = int(maturity.get("level") or bq.get("maturity_level") or 1)
     visual = pack.get("visual") or {}
     st.caption(
-        f"Соответствие регламенту {fidelity}% · модель {conf_score}% · "
+        f"Соответствие регламенту {fidelity}% · обоснованность {conf_score}% · "
         f"L{level} · routing {int(visual.get('routing_quality') or 0)}% · "
         f"XSD {'да' if audit.get('xsd_valid') else 'нет'}"
     )
+    # Ответ на «а как вы это считаете?» — прямо под цифрами.
+    if pack.get("fidelity_caption"):
+        st.caption(f"Соответствие: {pack['fidelity_caption']}. Обоснованность = {conf.get('method') or 'взвешенная сумма проверок'}.")
     for line in (pack.get("warnings") or [])[:4]:
         st.caption(str(line))
     return pack

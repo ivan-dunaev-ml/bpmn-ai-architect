@@ -226,38 +226,79 @@ def compute_visual_score(xml: str, audit: Optional[Dict[str, Any]] = None) -> Di
     }
 
 
+def _stems(text: str) -> set:
+    """Основы слов (6 букв) без служебных: «Провести визуальный осмотр» ≈ «Визуальный осмотр провести»."""
+    return {word[:6] for word in re.findall(r"[А-Яа-яЁёA-Za-z]{3,}", (text or "").lower())} - _STOP_STEMS
+
+
+_STOP_STEMS = {"для", "при", "или", "что", "это", "его", "так", "все", "без", "над", "под"}
+
+
+def _same_meaning(reference: str, candidate: str) -> bool:
+    """Шаг регламента представлен в BPMN: совпадает хотя бы половина основ его названия."""
+    ref, cand = _stems(reference), _stems(candidate)
+    if not ref or not cand:
+        return False
+    if reference.strip().lower() == candidate.strip().lower():
+        return True
+    return len(ref & cand) / len(ref) >= 0.5
+
+
+def _xml_inventory(xml: str) -> Dict[str, Any]:
+    names: List[str] = []
+    lanes: List[str] = []
+    xor = 0
+    try:
+        root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    except Exception:  # noqa: BLE001
+        return {"names": names, "lanes": lanes, "xor": xor}
+    for node in root.iter():
+        tag = _local(node.tag)
+        name = (node.get("name") or "").strip()
+        if tag in _WORK_TAGS or tag == "subProcess":
+            if name:
+                names.append(name)
+        elif tag == "lane" and name:
+            lanes.append(name)
+        elif tag == "exclusiveGateway":
+            xor += 1
+    return {"names": names, "lanes": lanes, "xor": xor}
+
+
+FIDELITY_METHOD = (
+    "Сверка схемы с детерминированным разбором текста регламента: шаги (по смыслу названия), "
+    "роли (дорожки), развилки (XOR) и возвраты (циклы). Процент — доля найденных элементов."
+)
+
+
 def regulation_trace(
     regulation_text: str,
     blueprint: Any = None,
     audit: Optional[Dict[str, Any]] = None,
     xml: str = "",
 ) -> Dict[str, Any]:
-    """Трассировка: фраза регламента → semantic/blueprint → BPMN. Потери — предупреждения."""
+    """Трассировка: фраза регламента → BPMN. Потери — предупреждения.
+
+    Эталон — разбор текста (номера шагов, роли, «если … иначе», «вернуть на п.N»), а не имена задач эмулятора:
+    модель, которая перефразировала шаг, его не теряет. Если схему собрал тот же разбор, сверка —
+    самопроверка (self_check=True), и интерфейс говорит об этом прямо.
+    """
     from ai_generator import normalize_regulation, parse_regulation
 
     warnings: List[str] = []
     rows: List[Dict[str, Any]] = []
     text = normalize_regulation(regulation_text or "")
+    empty = {"rows": [], "fidelity": 0, "covered": 0, "total": 0, "dimensions": {}, "method": FIDELITY_METHOD}
     if len(text) < 20:
-        return {"rows": [], "warnings": ["Регламент слишком короткий для трассировки."], "fidelity": 0, "covered": 0, "total": 0}
+        return {**empty, "warnings": ["Регламент слишком короткий для трассировки."]}
 
     try:
         parsed = parse_regulation(text)
     except Exception as exc:  # noqa: BLE001
-        return {"rows": [], "warnings": [f"Парсер не разобрал регламент: {exc}"], "fidelity": 0, "covered": 0, "total": 0}
+        return {**empty, "warnings": [f"Парсер не разобрал регламент: {exc}"]}
 
-    bpmn_names: List[str] = []
-    try:
-        if xml:
-            root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
-            for node in root.iter():
-                if _local(node.tag) in _WORK_TAGS:
-                    name = (node.get("name") or "").strip()
-                    if name:
-                        bpmn_names.append(name)
-    except Exception:  # noqa: BLE001
-        bpmn_names = []
-
+    inventory = _xml_inventory(xml) if xml else {"names": [], "lanes": [], "xor": 0}
+    bpmn_names = inventory["names"]
     bp_tasks = list(getattr(blueprint, "tasks", None) or [])
     bp_decisions = list(getattr(blueprint, "decisions", None) or [])
     by_num = {int(task.num): task for task in bp_tasks}
@@ -280,22 +321,14 @@ def regulation_trace(
         bp_el = by_num.get(step.num) or dec_by_num.get(step.num)
         bp_id = getattr(bp_el, "id", None) if bp_el is not None else None
         title = (step.title or "").strip()
-        bpmn_hit = ""
-        if title:
-            for name in bpmn_names:
-                if name == title or title.lower() in name.lower() or name.lower() in title.lower():
-                    bpmn_hit = name
-                    break
+        bpmn_hit = next((name for name in bpmn_names if title and _same_meaning(title, name)), "")
         status = "ok"
         if not title and not step.decision:
             status = "lost"
             warnings.append(f"Фраза регламента не получила BPMN-представление: «{sentence[:120]}»")
-        elif blueprint is not None and bp_el is None and title:
+        elif title and xml and not bpmn_hit:
             status = "lost"
-            warnings.append(f"Фраза регламента не получила BPMN-представление: «{sentence[:120]}»")
-        elif title and xml and not bpmn_hit and not step.decision:
-            status = "partial"
-            warnings.append(f"Шаг №{step.num} есть в чертеже, но имя задачи не найдено в BPMN XML.")
+            warnings.append(f"Шаг №{step.num} «{title[:80]}» не найден в схеме.")
         else:
             covered += 1
 
@@ -311,14 +344,46 @@ def regulation_trace(
             }
         )
 
-    total = len(parsed.steps) or 1
-    fidelity = _clip(100.0 * covered / total)
+    data = audit or {}
+    roles = [role for role in (parsed.roles or []) if role]
+    roles_hit = sum(1 for role in roles if any(_same_meaning(role, lane) for lane in inventory["lanes"])) if xml else 0
+    for role in roles:
+        if xml and not any(_same_meaning(role, lane) for lane in inventory["lanes"]):
+            warnings.append(f"Роль «{role}» из регламента не получила дорожку.")
+    decisions = sum(1 for step in parsed.steps if step.decision)
+    decisions_hit = min(decisions, int(inventory["xor"]))
+    try:
+        from ai_generator import _explicit_return_count
+
+        returns = int(_explicit_return_count(regulation_text or ""))
+    except Exception:  # noqa: BLE001
+        returns = 0
+    returns_hit = min(returns, len(data.get("rework_loops") or [])) if data else 0
+    if returns_hit < returns:
+        warnings.append(f"Возвратов в регламенте {returns}, циклов в схеме {returns_hit}.")
+
+    dimensions = {
+        "steps": {"found": covered, "total": len(parsed.steps)},
+        "roles": {"found": roles_hit, "total": len(roles)},
+        "decisions": {"found": decisions_hit, "total": decisions},
+        "returns": {"found": returns_hit, "total": returns},
+    }
+    total_items = sum(item["total"] for item in dimensions.values())
+    found_items = sum(item["found"] for item in dimensions.values())
+    fidelity = _clip(100.0 * found_items / total_items) if total_items else 0
+    engine = str(((data.get("generation") or {}).get("engine")) or "")
     return {
         "rows": rows,
         "warnings": warnings[:12],
         "fidelity": fidelity,
         "covered": covered,
         "total": len(parsed.steps),
+        "dimensions": dimensions,
+        "method": FIDELITY_METHOD,
+        # Эталон и схема из одного разбора: 100% подтверждает перенос без потерь, а не понимание текста.
+        "self_check": engine.startswith("semantic"),
+        # Пунктов мало — разбор текста ненадёжен как эталон (сплошной текст без нумерации).
+        "reference_weak": len(parsed.steps) < 3,
     }
 
 
@@ -522,26 +587,56 @@ def ai_confidence(
     audit: Optional[Dict[str, Any]] = None,
     fidelity: int = 0,
     tobe_delta: Optional[dict] = None,
+    trace: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Доверие к рекомендации — язык для руководителя, не техническая вероятность."""
+    """Обоснованность схемы и рекомендаций — взвешенная сумма проверяемых факторов, не вероятность модели.
+
+    40% полнота переноса регламента (fidelity) · 25% логика графа (тупики, возвраты) ·
+    20% структура (XSD, старт/конец, шлюзы) · 15% ясность регламента (у шагов есть роль и срок).
+    Самопроверка эмулятора и слабый эталон не меняют число, но дают оговорку caveat: их 100% не доказывают понимание текста.
+    """
     data = audit or {}
+    structural = compute_structural_quality(data)
+    logical = compute_logical_quality(data)
+    rows = list((trace or {}).get("rows") or [])
+    clarity = 100.0 * sum(1 for row in rows if row.get("role")) / len(rows) if rows else 50.0
+    hours_share = data.get("sla_from_regulation"), data.get("sla_work_nodes")
+    if hours_share[0] is not None and hours_share[1]:
+        clarity = 0.5 * clarity + 50.0 * float(hours_share[0]) / float(hours_share[1])
+    score = _clip(0.40 * float(fidelity) + 0.25 * logical + 0.20 * structural + 0.15 * clarity)
+    basis = [
+        {"factor": "Полнота переноса регламента", "value": int(fidelity), "weight": 40},
+        {"factor": "Логика графа", "value": int(logical), "weight": 25},
+        {"factor": "Структура и XSD", "value": int(structural), "weight": 20},
+        {"factor": "Ясность регламента (роли и сроки)", "value": _clip(clarity), "weight": 15},
+    ]
+    level = "Высокая" if score >= 85 else ("Средняя" if score >= 70 else "Ограниченная")
+    caveat = ""
+    if (trace or {}).get("reference_weak"):
+        caveat = "Регламент без явных пунктов — эталон для сверки слабый, нужна ручная проверка."
+    elif (trace or {}).get("self_check"):
+        caveat = "Схему собрал детерминированный разбор: сверка подтверждает перенос без потерь, не понимание текста."
     actions = normalize_optimization_actions(list((tobe_delta or {}).get("actions") or [])) if tobe_delta else []
-    health = process_health_issues(data)
-    xsd_ok = data.get("xsd_valid") is True
-    if fidelity >= 95 and actions and health:
-        level = "Высокая"
-        label = "Решение основано на найденных узких местах процесса"
-    elif fidelity >= 95 and xsd_ok:
-        level = "Высокая"
-        label = "Исходный процесс восстановлен полностью, рекомендации опираются на него"
-    elif fidelity >= 80:
-        level = "Средняя"
-        label = "Ключевые шаги восстановлены; отдельные формулировки регламента неоднозначны"
+    if level == "Высокая":
+        label = (
+            "Рекомендации опираются на измеренные узкие места процесса"
+            if actions
+            else "Процесс перенесён из регламента полностью, граф и XSD корректны"
+        )
+    elif level == "Средняя":
+        label = "Ключевые элементы перенесены; часть формулировок регламента неоднозначна"
     else:
-        level = "Ограниченная"
-        label = "Регламент разобран частично — рекомендациям нужна ручная проверка"
-    score = 92 if level == "Высокая" else (78 if level == "Средняя" else 55)
-    return {"score": score, "level": level, "label": label}
+        label = "Регламент разобран частично — схеме и рекомендациям нужна ручная проверка"
+    if caveat:
+        label = f"{label}. {caveat}"
+    return {
+        "score": score,
+        "level": level,
+        "label": label,
+        "caveat": caveat,
+        "basis": basis,
+        "method": "0.40·полнота + 0.25·логика + 0.20·структура + 0.15·ясность регламента",
+    }
 
 
 def process_improvement_score(
@@ -641,6 +736,23 @@ def bpmn_maturity_level(
     }
 
 
+def _fidelity_caption(trace: Dict[str, Any]) -> str:
+    dims = trace.get("dimensions") or {}
+    parts = [
+        f"{label} {dims[key]['found']}/{dims[key]['total']}"
+        for key, label in (("steps", "шаги"), ("roles", "роли"), ("decisions", "развилки"), ("returns", "возвраты"))
+        if key in dims and dims[key]["total"]
+    ]
+    head = " · ".join(parts) or "нет данных для сверки"
+    if trace.get("reference_weak"):
+        return f"{head} — регламент без явных пунктов, сверка приблизительная"
+    if trace.get("self_check"):
+        return f"{head} — самопроверка: схему собрал тот же разбор текста"
+    if int(trace.get("fidelity") or 0) >= 95:
+        return f"{head} — процесс перенесён из регламента без потерь"
+    return f"{head} — часть элементов регламента не найдена в схеме"
+
+
 def jury_scorecard(
     audit: Optional[Dict[str, Any]] = None,
     xml: str = "",
@@ -656,7 +768,7 @@ def jury_scorecard(
     actions = normalize_optimization_actions(list((tobe_delta or {}).get("actions") or [])) if tobe_delta else []
     visual = maturity.get("visual") or {}
     improvement = process_improvement_score(data, tobe_delta, int(visual.get("overall_visual_score") or 0))
-    confidence = ai_confidence(data, fidelity, tobe_delta)
+    confidence = ai_confidence(data, fidelity, tobe_delta, trace)
     health = list(maturity.get("health_issues") or process_health_issues(data))
     tobe_view = None
     if isinstance(tobe_delta, dict):
@@ -679,11 +791,7 @@ def jury_scorecard(
         }
     return {
         "asis_fidelity": fidelity,
-        "fidelity_caption": (
-            "AI восстановил процесс из регламента без потери шагов"
-            if fidelity >= 95
-            else "Часть фраз регламента требует уточнения"
-        ),
+        "fidelity_caption": _fidelity_caption(trace),
         "process_health": health,
         "ai_confidence": confidence,
         "process_improvement": improvement,
