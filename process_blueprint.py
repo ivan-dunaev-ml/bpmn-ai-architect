@@ -533,6 +533,11 @@ def _layout_units(blueprint: ProcessBlueprint) -> List[_EmitUnit]:
             units.append(_EmitUnit("step", [task]))
         consumed.add(num)
 
+    stage_marks: Dict[str, int] = {}
+    for task in blueprint.tasks:
+        if task.stage:
+            stage_marks[task.stage] = stage_marks.get(task.stage, 0) + 1
+
     staged: List[_EmitUnit] = []
     index = 0
     while index < len(units):
@@ -542,18 +547,24 @@ def _layout_units(blueprint: ProcessBlueprint) -> List[_EmitUnit]:
             staged.append(unit)
             index += 1
             continue
+        # Этап назван у одного шага («(этап «Диагностика»)») — отсюда он начинается и продолжается
+        # следующими шагами той же роли без своего этапа: до развилки, параллели, смены роли или нового этапа.
+        # Этап, отмеченный у нескольких шагов, перечислен явно — чужие шаги в него не добавляются.
+        carry = stage_marks.get(stage, 0) == 1
         nxt = index + 1
         while (
             nxt < len(units)
             and units[nxt].kind == "step"
             and units[nxt].tasks
-            and units[nxt].tasks[0].stage == stage
+            and (units[nxt].tasks[0].stage == stage or (carry and units[nxt].tasks[0].stage is None))
             and units[nxt].role == unit.role
+            and units[nxt].tasks[0].num not in pinned
         ):
             nxt += 1
         run = units[index:nxt]
-        while run and run[0].tasks[0].num in pinned:
-            staged.append(run.pop(0))
+        # Возврат на первый шаг этапа = повтор этапа целиком: ребро ведёт на подпроцесс, шаг остаётся внутри.
+        # Цель возврата в середине этапа в подпроцесс не попадает — внутрь подпроцесса ребро не проходит
+        # (такие шаги уже отрезаны условием цикла выше).
         if len(run) >= 2:
             staged.append(_EmitUnit("subprocess", [task for item in run for task in item.tasks], name=stage))
         else:
@@ -1000,6 +1011,28 @@ def _success_nums(diagram: Any, blueprint: ProcessBlueprint) -> List[int]:
             break
         if node.name in title_num:
             nums.append(title_num[node.name])
+        if node.kind == "subProcess":
+            # Шаги этапа идут внутри подпроцесса: от его старта до конца по единственному выходу.
+            inner = getattr(node, "inner_start_id", None)
+            if not any(link.source_id == inner for link in diagram.links):
+                # До лечения графа старт подпроцесса ещё не связан: первый шаг — без входящих рёбер.
+                targets = {link.target_id for link in diagram.links}
+                heads = sorted(
+                    (item for item in diagram.nodes.values()
+                     if item.owner_id == node.id and item.kind not in ("startEvent", "endEvent") and item.id not in targets),
+                    key=lambda item: item.order,
+                )
+                inner = heads[0].id if heads else None
+            guard = 0
+            while inner and guard < 60:
+                guard += 1
+                inner_node = diagram.nodes.get(inner)
+                if inner_node is None or inner_node.kind == "endEvent":
+                    break
+                if inner_node.name in title_num:
+                    nums.append(title_num[inner_node.name])
+                inner_outs = [link for link in diagram.links if link.source_id == inner]
+                inner = inner_outs[0].target_id if len(inner_outs) == 1 else None
         outs = [link for link in diagram.links if link.source_id == current]
         if not outs:
             break

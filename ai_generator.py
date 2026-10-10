@@ -1962,6 +1962,10 @@ def _subject_before_verb(text: str) -> Optional[Tuple[str, int]]:
                 return None
             if all(w.lower().strip(",") in _REL_PRONOUNS for w in words):
                 return None
+            # «проводит визуальный осмотр и составляет …» — два действия одной роли, а не подлежащее:
+            # роль не начинается с глагола и не кончается союзом.
+            if _is_verb(words[0]) or words[-1].lower().strip(",") in ("и", "или", "а", "но"):
+                return None
             return " ".join(words), offset + tok.start()
         if re.search(r"[.;:]$", tok.group()):
             break
@@ -8685,6 +8689,31 @@ def apply_chain_wrap_text(regulation_text: str) -> Tuple[str, List[Dict[str, str
     bodies = [raw_steps[i]["body"] for i in range(n)]
     actions: List[Dict[str, str]] = []
     used_names = {st.stage for st in parsed.steps if getattr(st, "stage", None)}
+    # Этап, названный у одного шага, продолжается следующими шагами той же роли без своего этапа — до развилки
+    # (то же правило, что в раскладке As-Is, process_blueprint._layout_units). Такие шаги уже в подпроцессе:
+    # новый этап с именем задачи для них не придумываем.
+    marks: Dict[str, int] = {}
+    for step in parsed.steps[:n]:
+        if getattr(step, "stage", None):
+            marks[step.stage] = marks.get(step.stage, 0) + 1
+    in_stage = set()
+    for k in range(n):
+        step = parsed.steps[k]
+        if getattr(step, "stage", None):
+            in_stage.add(k)
+            if marks.get(step.stage, 0) != 1:
+                continue  # этап перечислен явно у нескольких шагов — не продолжаем
+            m = k + 1
+            while (
+                m < n
+                and parsed.steps[m].role == step.role
+                and not getattr(parsed.steps[m], "stage", None)
+                and not parsed.steps[m].parallel
+                and parsed.steps[m - 1].decision is None
+                and parsed.steps[m].decision is None
+            ):
+                in_stage.add(m)
+                m += 1
     i = 0
     while i < n:
         role = parsed.steps[i].role
@@ -8703,7 +8732,7 @@ def apply_chain_wrap_text(regulation_text: str) -> Tuple[str, List[Dict[str, str
                 used_names.add(stage_name)
                 marked = 0
                 for k in range(a, b):
-                    if re.search(r"\(\s*этап\s*«", bodies[k], re.I):
+                    if k in in_stage or re.search(r"\(\s*этап\s*«", bodies[k], re.I):
                         continue
                     bodies[k] = bodies[k].rstrip() + f" (этап «{stage_name}»)"
                     marked += 1

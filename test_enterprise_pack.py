@@ -39,8 +39,10 @@ def main() -> None:
     assert audit["sla"]["with_rework_hours"] == 12.55
     assert audit["sla"]["role_hours"] >= audit["sla"]["critical_path_hours"]
     assert len(audit["rework_loops"]) == 2
-    assert audit["methodology"]["long_chains"]
-    assert audit["methodology"]["score"] < 100
+    # Этап «Комплексная диагностика повреждений» назван в регламенте → в As-Is это подпроцесс, не длинная цепочка.
+    assert audit["stats"]["subprocesses"] == 1, audit["stats"]
+    assert not audit["methodology"]["long_chains"], audit["methodology"]
+    assert 'name="Комплексная диагностика повреждений"' in xml
     assert 'name="СИЗ"' not in xml
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
     xor_ids = set(re.findall(r'<bpmn:exclusiveGateway\b[^>]*\bid="([^"]+)"', xml))
@@ -103,7 +105,8 @@ def main() -> None:
     assert opened_facts["cp_after"] <= 9.6
     assert opened_facts["rw_after"] <= 9.6
     assert opened_facts["loops_before"] == 2 and opened_facts["loops_after"] == 0
-    assert opened_facts["quality_before"] < 100
+    # Нотация As-Is уже чистая (этап — подпроцесс); эффект To-Be — срок и циклы, не исправление нотации.
+    assert opened_facts["quality_before"] == 100
     assert opened_facts["quality_after"] >= opened_facts["quality_before"]
     assert opened_facts["quality_after"] == 100
     assert not (opened["delta"].get("tobe_audit") or {}).get("methodology", {}).get("long_chains")
@@ -188,7 +191,7 @@ def main() -> None:
     opt_p, delta_p = optimize_process_to_be(proc, audit_p)
     q_after = int(delta_p.get("quality_after") or 0)
     q_before = int(delta_p.get("quality_before") or 0)
-    assert q_before < 100, q_before
+    assert q_before == 100, q_before  # этапы регламента — подпроцессы уже в As-Is
     assert q_after >= q_before, (q_after, q_before)
     assert audit_p["sla"]["critical_path_hours"] == 528.3
     assert audit_p["sla"]["with_rework_hours"] == 856.5
@@ -202,7 +205,7 @@ def main() -> None:
     assert "Параллелизац" in why or "параллел" in why.lower()
     assert "scriptTask" in why or "Автоматизац" in why
     qual = heuristic_analysis("Почему упал Quality Score?", ctx_p)
-    assert "62 → 100" in qual and "выросла" in qual, qual
+    assert "100 → 100" in qual and "не изменилась" in qual and "2 → 0" in qual, qual
     assert "метро" not in qual.lower()
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
@@ -644,7 +647,8 @@ DIAGRAM.add_link(sp, ROOT_END_TASK_ID)
     )
     assert named.steps[0].title == "Провести визуальный осмотр ячейки", named.steps[0].title
     assert named.steps[0].stage == "Комплексная диагностика повреждений"
-    assert any("визуальный осмотр" in item["to"] for item in audit["rework_loops"])
+    # Возврат «повторная диагностика → п.6» ведёт на этап целиком: п.6 — его первый шаг.
+    assert any(item["to"] == "Комплексная диагностика повреждений" for item in audit["rework_loops"])
     assert bpmn_app.GENERATION_BUSY_LABEL == "Генерация BPMN 2.0…"
     from ai_generator import build_prompt, _code_for_sandbox
 
@@ -1970,7 +1974,8 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
             if tobe_m.get("long_chains"):
                 assert int(ex_delta.get("quality_after") or 0) < 100
             else:
-                assert int(ex_delta.get("quality_after") or 0) > int(ex_delta.get("quality_before") or 0)
+                # Этап «Проведение конкурентной процедуры» уже подпроцесс в As-Is: нотация чистая до To-Be.
+                assert int(ex_delta.get("quality_after") or 0) >= int(ex_delta.get("quality_before") or 0)
 
     # Чужой балл холста не становится левым. Свой балл To-Be не подменяется баллом As-Is.
     chain_item = {

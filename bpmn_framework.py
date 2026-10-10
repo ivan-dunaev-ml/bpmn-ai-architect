@@ -425,6 +425,13 @@ class BPMNDiagramBuilder:
         node = self.nodes.get(pid)
         if node is not None and node.kind == "subProcess":
             return node.id, node.lane_id, node.group_id
+        if node is not None:
+            # LLM передала задачу или шлюз вместо дорожки («add_exclusive_gateway("…?", t5)»):
+            # ставим узел рядом с ним, в ту же роль, а не в первую дорожку пула.
+            self.warnings.append(
+                f"parent_id={pid!r} — узел потока, не дорожка: новый узел размещён в его дорожке (self-healing)."
+            )
+            return node.owner_id, node.lane_id, node.group_id
         if pid in self.pools:
             pool = self.pools[pid]
             return pool.process_id, (pool.lane_ids[0] if pool.lane_ids else None), None
@@ -1078,6 +1085,19 @@ class BPMNDiagramBuilder:
                     cx = x1 + (x2 - x1) * f
                     top = y + LABEL_LIFT - 4 + tier
                     below.append((cx - w / 2, top, cx + w / 2, top + h))
+        # Отрезок короче подписи (шлюз вплотную к высокому подпроцессу): центрированная подпись
+        # въезжает в соседний блок — запасной вариант прижать её к концу или началу отрезка.
+        for a, b in horizontal:
+            x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
+            if x2 - x1 >= w:
+                continue
+            for tier in (0.0, 18.0, 36.0):
+                lift = y - LABEL_LIFT - 2 - tier
+                above.append((x2 - 4 - w, lift - h, x2 - 4, lift))
+                above.append((x1 + 4, lift - h, x1 + 4 + w, lift))
+                drop = y + LABEL_LIFT - 4 + tier
+                below.append((x2 - 4 - w, drop, x2 - 4, drop + h))
+                below.append((x1 + 4, drop, x1 + 4 + w, drop + h))
         # Стрелка-обход «понизу» (U-маршрут возврата ниже обоих концов): подпись под линией — над ней
         # она упирается в блоки, мимо которых идёт обход, и читается как их подпись.
         goes_under = bool(horizontal) and points and horizontal[0][0][1] > max(points[0][1], points[-1][1]) + 0.01
