@@ -1696,7 +1696,9 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
         pill = "В пределах SLA"
     assert pill == "Цель SLA не задана", (pill, tgt)
     app_src = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
-    assert "этапов схемы" in app_src and "слоёв согласования" not in app_src
+    # KPI показывает часы пути, не фразу «N этапов схемы» и не «слои согласования».
+    assert "Критический путь" in app_src and "с возвратами" in app_src
+    assert "слоёв согласования" not in app_src
 
     calls = {"n": 0}
     orig_gen = bpmn_app.generate_bpmn_from_text

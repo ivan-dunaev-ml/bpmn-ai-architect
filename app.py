@@ -591,6 +591,7 @@ def viewer_html(
     catalog_tobe: Optional[Dict[str, Any]] = None,
     canvas_tobe: bool = False,
     tobe_reason: str = "",
+    assistant_label: str = "Ассистент процесса",
 ) -> str:
     js_tag, css_tag = _bpmn_js_tags()
     payload_asis = json.dumps(xml or "").replace("</", "<\\/")
@@ -606,6 +607,7 @@ def viewer_html(
     why_text = "" if xml_tobe else html.escape(str(tobe_reason or "").strip(), quote=True)
     tobe_title = "Целевой оптимизированный" if xml_tobe else (why_text or "To-Be ещё не готов")
     tobe_why = f'<div class="tobe-why" id="tobe-why">{why_text}</div>' if why_text else ""
+    assistant_label = html.escape(assistant_label or "Ассистент процесса", quote=True)
     fingerprint = hashlib.sha256(f"{xml or ''}|{xml_tobe or ''}|{start_mode}".encode()).hexdigest()[:12]
     return f"""
 <!doctype html><html><head><meta charset="utf-8"><!-- ir-canvas:{fingerprint} -->{css_tag}
@@ -800,9 +802,9 @@ def viewer_html(
     <div class="ai" id="t-ai"></div>
   </div>
   <div class="hint" id="hint"></div>
-  <button type="button" id="ai-fab" title="AI-Ассистент процесса">💬</button>
+  <button type="button" id="ai-fab" title="{assistant_label}">💬</button>
   <div id="copilot-box" class="copilot-box" aria-hidden="true">
-    <div class="ai-head"><div>💬 AI-Ассистент процесса</div><button type="button" id="ai-min">✕ Свернуть</button></div>
+    <div class="ai-head"><div>💬 {assistant_label}</div><button type="button" id="ai-min">✕ Свернуть</button></div>
     <div id="ai-chips"></div>
     <div id="copilot-messages" class="copilot-messages"></div>
     <form id="ai-form" autocomplete="off">
@@ -2778,11 +2780,21 @@ def render_asis_tobe_compare(cmp: Dict[str, Any]) -> None:
 
 
 def _accept_tobe_as_main() -> None:
-    """Текст To-Be становится полем регламента. Сборка As-Is идёт на следующем прогоне."""
+    """Текст To-Be становится полем регламента. Предыдущий As-Is остаётся в asis_backup."""
     pack = st.session_state.get("tobe_pack") or {}
     text = str(pack.get("text") or "").strip()
     if not text:
         return
+    st.session_state["asis_backup"] = {
+        "reg_text": str(st.session_state.get("reg_text") or ""),
+        "example_choice": st.session_state.get("example_choice"),
+        "applied_example": st.session_state.get("applied_example"),
+        "file_stem": st.session_state.get("file_stem"),
+        "result": copy.deepcopy(st.session_state.get("result")),
+        "tobe_pack": copy.deepcopy(pack),
+        "canvas_variant": st.session_state.get("canvas_variant"),
+        "gen_fingerprint": st.session_state.get("gen_fingerprint"),
+    }
     st.session_state["reg_text"] = text
     st.session_state["_keep_custom_text"] = True
     st.session_state["example_choice"] = CUSTOM_LABEL
@@ -2793,6 +2805,34 @@ def _accept_tobe_as_main() -> None:
     st.session_state.pop("inspector_cache", None)
     st.session_state.pop("inspector_choice", None)
     st.session_state.pop("gen_fingerprint", None)
+
+
+def _restore_asis() -> None:
+    """Возвращает As-Is, который был до «Принять To-Be»: текст, схему, аудит и pack."""
+    backup = st.session_state.get("asis_backup")
+    if not isinstance(backup, dict) or not backup.get("result"):
+        return
+    st.session_state["reg_text"] = str(backup.get("reg_text") or "")
+    st.session_state["_keep_custom_text"] = True
+    if backup.get("example_choice"):
+        st.session_state["example_choice"] = backup["example_choice"]
+        st.session_state["applied_example"] = backup.get("applied_example") or backup["example_choice"]
+    if backup.get("file_stem"):
+        st.session_state["file_stem"] = backup["file_stem"]
+    st.session_state["result"] = copy.deepcopy(backup["result"])
+    if backup.get("tobe_pack"):
+        st.session_state["tobe_pack"] = copy.deepcopy(backup["tobe_pack"])
+    else:
+        st.session_state.pop("tobe_pack", None)
+    if backup.get("canvas_variant"):
+        st.session_state["canvas_variant"] = backup["canvas_variant"]
+    if backup.get("gen_fingerprint"):
+        st.session_state["gen_fingerprint"] = backup["gen_fingerprint"]
+    st.session_state.pop("asis_backup", None)
+    st.session_state.pop("tobe_accept_pending", None)
+    st.session_state.pop("inspector_cache", None)
+    st.session_state.pop("inspector_choice", None)
+    st.session_state["asis_restored_note"] = True
 
 
 def _consume_tobe_accept() -> None:
@@ -2952,16 +2992,17 @@ def render_tobe_tab() -> None:
             )
         docx_col, md_col = st.columns(2, gap="small")
         with docx_col:
+            # .docx = регламент Word (export_docx_passport), как ряд под холстом.
             docx_data = export_slot.get("docx") if tobe_ready else None
             if not tobe_ready:
-                st.button("Паспорт To-Be (.docx)", disabled=True, key="dl_tobe_docx_off", use_container_width=True)
+                st.button("Регламент To-Be (.docx)", disabled=True, key="dl_tobe_docx_off", use_container_width=True)
             elif docx_data is None and st.button(
-                "Паспорт To-Be (.docx)", key="dl_tobe_docx_build", use_container_width=True,
+                "Регламент To-Be (.docx)", key="dl_tobe_docx_build", use_container_width=True,
             ):
                 docx_data = _materialize_tobe("docx")
             if docx_data:
                 st.download_button(
-                    "Паспорт To-Be (.docx)",
+                    "Регламент To-Be (.docx)",
                     data=docx_data,
                     file_name=f"{stem}_tobe_reglament.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2969,16 +3010,17 @@ def render_tobe_tab() -> None:
                     use_container_width=True,
                 )
         with md_col:
+            # .md = паспорт (generate_process_passport), имя файла совпадает с подписью.
             md_data = export_slot.get("md") if tobe_ready else None
             if not tobe_ready:
-                st.button("Регламент To-Be (.md)", disabled=True, key="dl_tobe_md_off", use_container_width=True)
+                st.button("Паспорт To-Be (.md)", disabled=True, key="dl_tobe_md_off", use_container_width=True)
             elif md_data is None and st.button(
-                "Регламент To-Be (.md)", key="dl_tobe_md_build", use_container_width=True,
+                "Паспорт To-Be (.md)", key="dl_tobe_md_build", use_container_width=True,
             ):
                 md_data = _materialize_tobe("md")
             if md_data:
                 st.download_button(
-                    "Регламент To-Be (.md)",
+                    "Паспорт To-Be (.md)",
                     data=md_data,
                     file_name=f"{stem}_tobe_passport.md",
                     mime="text/markdown",
@@ -3336,6 +3378,15 @@ def render_diagram(canvas_height: int) -> None:
         catalog_tobe=catalog_tb,
         canvas_tobe=canvas_tobe,
         tobe_reason="" if xml_tobe else str((pack or {}).get("reason") or ""),
+        assistant_label=(
+            "AI-Ассистент процесса"
+            if engine_badge_text(
+                str((audit_asis.get("generation") or {}).get("engine") or ""),
+                bool((audit_asis.get("generation") or {}).get("fallback")),
+            )
+            != "Эмулятор"
+            else "Ассистент процесса"
+        ),
     )
     # components.html стабильнее для bpmn-js + крупного XML, чем st.iframe(srcdoc).
     # height чуть зависит от fingerprint — форсирует перерисовку после новой генерации.
@@ -3387,12 +3438,20 @@ def render_assistant() -> None:
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
     with st.sidebar:
-        st.markdown("### 💬 AI-Ассистент Бизнес-Архитектора")
-        st.caption(
-            "Знает текущий процесс: роли, SLA, bus-factor, циклы возврата, ИТ-системы. "
-            "Может объяснить узкие места, изменить схему командой («Добавь согласование с экологами после шага 3») "
-            "или сгенерировать должностную инструкцию по BPMN."
-        )
+        engine_now = _hero_engine_badge()
+        if engine_now == "Эмулятор":
+            st.markdown("### Ассистент процесса")
+            st.caption(
+                "Схема собрана локальным эмулятором, не облачной моделью. "
+                "Ответы опираются на уже посчитанный аудит: роли, SLA, циклы, ИТ-системы."
+            )
+        else:
+            st.markdown("### 💬 AI-Ассистент Бизнес-Архитектора")
+            st.caption(
+                f"Схему собрала модель «{engine_now}». "
+                "Может объяснить узкие места или изменить процесс командой "
+                "(«Добавь согласование с экологами после шага 3»)."
+            )
         for label, prompt in QUICK_PROMPTS:
             if st.button(label, key=f"qp_{hash(label)}", use_container_width=True):
                 _send_assistant(prompt)
@@ -3448,6 +3507,18 @@ def main() -> None:
         st.markdown(
             '<div class="ir-toast">To-Be принят как основной регламент</div>',
             unsafe_allow_html=True,
+        )
+    if st.session_state.pop("asis_restored_note", False):
+        st.markdown(
+            '<div class="ir-toast">Возвращён предыдущий As-Is</div>',
+            unsafe_allow_html=True,
+        )
+    if st.session_state.get("asis_backup"):
+        st.button(
+            "Вернуть As-Is",
+            key="restore_asis",
+            on_click=_restore_asis,
+            use_container_width=True,
         )
     chat_cleared = st.session_state.pop("chat_cleared_toast", False)
 
