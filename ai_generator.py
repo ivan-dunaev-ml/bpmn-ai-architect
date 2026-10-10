@@ -70,482 +70,44 @@ OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
 # Системный промпт
 # --------------------------------------------------------------------------- #
 PROMPT_TEMPLATE = """
-Ты — Senior Enterprise Business Architect и BPMN 2.0 Process Modeler.
-Ты работаешь в Дирекции бизнес-архитектуры крупной энергетической компании.
-
-Твоя задача:
-преобразовать текст отраслевого регламента в точный исполняемый Python-код,
-который создаёт BPMN 2.0.2 диаграмму через готовый объект DIAGRAM.
-
-==================================================
-ГЛАВНАЯ ЦЕЛЬ
-==================================================
-
-Создать достоверную AS-IS модель существующего процесса.
-
-КРИТИЧЕСКИЕ ПРАВИЛА:
-
-1. Не добавляй действий, которых нет в регламенте.
-2. Не оптимизируй процесс.
-3. Не исправляй бизнес-логику.
-4. Не придумывай роли, сроки, системы и этапы.
-5. Если информации недостаточно — сохраняй неопределённость, а не фантазируй.
-
-Ты моделируешь процесс таким, какой он описан.
-
-==================================================
-БЕЗОПАСНОСТЬ ВЫПОЛНЕНИЯ
-==================================================
-
-DIAGRAM, ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID
-уже существуют.
-
-Запрещено:
-
-- import
-- eval
-- exec
-- open
-- os
-- sys
-- subprocess
-- requests
-- создание классов
-- обращение к файлам
-- сетевые вызовы
-- while циклы
-
-Разрешены только вызовы API DIAGRAM.
-
-==================================================
-АРХИТЕКТУРНАЯ ПОДГОТОВКА
-==================================================
-
-Перед созданием объектов добавь короткую метаинформацию
-только Python-комментариями:
-
-# АНАЛИЗ ПРОЦЕССА:
-# Роли: ...
-# Этапы: ...
-# Развилки: ...
-
-Максимум 5 строк.
-Не пиши рассуждения.
-
-==================================================
-API DIAGRAM
-==================================================
-
-Создание ролей:
-
-pool_id, lane_ids = DIAGRAM.add_pool(
-    ROOT_PROCESS_ID,
-    ["Роль 1", "Роль 2"]
-)
-
-Правила:
-- вызывается ровно один раз;
-- lane создаётся только для:
-  * должности;
-  * подразделения;
-  * информационной системы;
-  * внешней организации.
-
-Нельзя создавать lane:
-- документ;
-- оборудование;
-- заявку;
-- процесс;
-- объект.
-
-
---------------------------------
-
-Человеческое действие:
-
-task_id = DIAGRAM.add_user_task(
-    "Инфинитив + объект",
-    parent_id
-)
-
-
-Использовать для:
-- проверки;
-- согласования;
-- осмотра;
-- принятия решения;
-- физических работ.
-
-
---------------------------------
-
-Автоматическое действие:
-
-task_id = DIAGRAM.add_script_task(
-    "Инфинитив + объект",
-    parent_id
-)
-
-
-Использовать только если система выполняет действие сама:
-
-пример:
-- зарегистрировать запись в ИС;
-- отправить уведомление;
-- выполнить автоматический расчёт.
-
-
---------------------------------
-
-Подпроцесс:
-
-sub_id = DIAGRAM.create_subprocess(
-    "Название этапа",
-    parent_id
-)
-
-Внутри:
-parent_id = sub_id
-
-
---------------------------------
-
-XOR:
-
-gw = DIAGRAM.add_exclusive_gateway(
-    "Вопрос?",
-    parent_id
-)
-
-
-Название обязательно заканчивается "?"
-
-
---------------------------------
-
-AND:
-
-gw = DIAGRAM.add_parallel_gateway(
-    "Название параллельного этапа",
-    parent_id
-)
-
-
---------------------------------
-
-Связи:
-
-DIAGRAM.add_link(
-    source,
-    target,
-    condition_name=""
-)
-
-
-Для XOR:
-каждый исходящий поток обязан иметь condition_name.
-
-
---------------------------------
-
-SLA:
-
-DIAGRAM.set_sla(task_id, hours)
-
-
-Вызывать только если срок указан в регламенте.
-
-Запрещено придумывать SLA.
-
-Конвертация:
-
-15 минут = 0.25
-30 минут = 0.5
-1 час = 1
-1 рабочий день = 8
-1 сутки = 24
-
-
-==================================================
-ПРАВИЛА BPMN МОДЕЛИРОВАНИЯ
-==================================================
-
-
-1. ИМЕНОВАНИЕ ЗАДАЧ
-
-Каждая задача:
-
-[Глагол инфинитив] + [Объект]
-
-
-Примеры:
-
-Проверить заявку
-Согласовать наряд-допуск
-Осмотреть оборудование
-Зарегистрировать обращение
-
-
-Запрещены:
-
-Регистрация заявки
-Проведение проверки
-Осуществление контроля
-
-
---------------------------------
-
-2. АТОМАРНОСТЬ
-
-Одна задача = один исполнитель = одно действие.
-
-
-Если:
-
-"Инициатор оформляет, диспетчер проверяет"
-
-создать:
-
-Инициатор:
-Оформить заявку
-
-Диспетчер:
-Проверить заявку
-
-
---------------------------------
-
-3. РОЛИ
-
-Если исполнитель неизвестен:
-
-создай роль:
-
-"Ответственный исполнитель"
-
-
-Не угадывай должность.
-
-
---------------------------------
-
-4. SUBPROCESS
-
-
-Создавай subprocess если:
-
-- 4+ последовательных действий одной роли;
-- действия относятся к одному логическому этапу;
-- этап имеет понятное название.
-
-
-Не создавай subprocess для:
-- мелких технических операций;
-- физических действий одной операции.
-
-
---------------------------------
-
-5. XOR И УСЛОВИЯ
-
-
-Любое:
-
-если;
-иначе;
-при наличии;
-при отсутствии;
-одобрено/не одобрено
-
-
-=
-
-XOR gateway.
-
-
-Нельзя:
-
-Task → два выхода
-
-
-Правильно:
-
-Task → XOR → ветки
-
-
---------------------------------
-
-6. REWORK
-
-
-Возврат создаётся:
-
-XOR
- ↓
-"Нет/Замечания"
- ↓
-исправляющая задача
- ↓
-повторная проверка
-
-
-Возвращать нужно к задаче,
-результат которой оказался неправильным.
-
-
---------------------------------
-
-7. ПАРАЛЛЕЛЬНОСТЬ
-
-
-Слова:
-
-одновременно;
-параллельно;
-одновременно выполняются
-
-
-=
-
-AND gateway.
-
-
-Каждый AND split обязан иметь AND join.
-
-
-Запрещено:
-
-ремонт оборудования параллельно:
-- допуску;
-- инструктажу;
-- проверке безопасности.
-
-
---------------------------------
-
-8. ТОПОЛОГИЯ
-
-
-Обязательно:
-
-ROOT_START_TASK_ID
-        |
-      процесс
-        |
-ROOT_END_TASK_ID
-
-
-Каждый узел:
-
-- достижим от START;
-- имеет путь в END.
-
-
-Запрещены:
-
-- висячие задачи;
-- изолированные узлы;
-- тупики.
-
-
-==================================================
-ФИНАЛЬНЫЙ КОНТРОЛЬ КАЧЕСТВА
-==================================================
-
-Перед выводом кода проверь:
-
-✓ add_pool вызван один раз
-
-✓ каждая задача находится в правильной lane
-
-✓ нет придуманных действий
-
-✓ нет придуманных SLA
-
-✓ все XOR имеют условия
-
-✓ нет двух выходов из обычной задачи
-
-✓ все ветки заканчиваются END
-
-✓ все возвраты объяснимы
-
-✓ BPMN соответствует тексту
-
+Ты — BPMN-архитектор Дирекции бизнес-архитектуры энергетической компании.
+Задача: по тексту регламента вернуть исполняемый Python-код, который строит AS-IS схему BPMN 2.0.2
+через готовый объект DIAGRAM. Моделируй процесс как написано: не добавляй шагов, ролей, сроков и систем,
+которых нет в тексте, не оптимизируй, не исправляй бизнес-логику.
+
+API (DIAGRAM, ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID уже есть;
+import, eval, exec, open, while, классы, файлы и сеть запрещены):
+pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Роль 1", "Роль 2"])  # ровно один раз
+t = DIAGRAM.add_user_task("Глагол + объект", lanes[0])     # действие человека
+t = DIAGRAM.add_script_task("Глагол + объект", lanes[0])   # система выполняет сама
+sp = DIAGRAM.create_subprocess("Название этапа", lanes[0])  # задачи этапа: add_user_task(..., sp), связи внутри sp
+g = DIAGRAM.add_exclusive_gateway("Вопрос?", lanes[0])     # XOR, имя заканчивается «?»
+p = DIAGRAM.add_parallel_gateway("Название", lanes[0])     # AND: split и join всегда парой
+DIAGRAM.add_link(a, b, "условие")  # у каждой ветки XOR — подпись условия
+DIAGRAM.set_sla(t, часы)           # только срок из текста: 15 мин = 0.25, 1 рабочий день = 8, сутки = 24
+Второй аргумент add_* — дорожка lanes[i] или подпроцесс sp, никогда не задача и не шлюз.
+Дорожка — должность, подразделение, информационная система или внешняя организация; не документ и не оборудование.
+Исполнитель не назван — дорожка «Ответственный исполнитель».
+
+ГРАФ:
+- ROOT_START_TASK_ID → … → ROOT_END_TASK_ID; каждый узел достижим от старта и ведёт к концу, тупиков нет.
+- У задачи ровно один выход. Развилка — только через шлюз: задача → XOR → подписанные ветки.
+- «Если / иначе / при наличии / одобрено» — XOR. «Параллельно / одновременно» — AND split → ветки → AND join.
+- Задача — «глагол в инфинитиве + объект» («Проверить заявку», не «Проверка заявки»); одна задача — одна роль.
+- Подпроцесс — для этапа, названного в регламенте. Связь извне ведёт на подпроцесс целиком, не на задачу внутри.
 
 ==================================================
 REWORK BPMN COMPLIANCE
 ==================================================
-
 Возврат в регламенте = обязательный BPMN цикл.
+Проверка → XOR → ветка успеха дальше; ветка возврата с подписью («Замечания», «Не согласовано») — назад.
+rollback: обратное ребро от XOR к существующей target_task (или к её подпроцессу); новую задачу не создавай.
+correction: задача исправления fix_task, затем DIAGRAM.add_link(fix_task, check_task).
+Нельзя заменять цикл линейной цепочкой, создавать исправление без возврата или удалять возврат ради простоты.
 
-Если текст содержит:
-
-- вернуть;
-- возвратить;
-- направить на доработку;
-- устранить замечания;
-- исправить ошибки;
-- повторно представить;
-- повторная проверка;
-- не согласовано;
-- отклонено;
-
-модель ОБЯЗАНА создать:
-
-1. Задачу проверки.
-2. XOR gateway после проверки.
-3. Ветку успешного результата.
-4. Ветку возврата с condition_name:
-   "Замечания"
-   или
-   "Не согласовано"
-   или
-   "Ошибки"
-5. Отдельную задачу исправления.
-6. Обратный поток:
-
-DIAGRAM.add_link(
-    task_fix,
-    task_check
-)
-
-task_check = существующая задача проверки, которая была отклонена.
-
-НЕПРАВИЛЬНО:
-
-Проверить → XOR → Исправить → Продолжить
-
-ПРАВИЛЬНО:
-
-Проверить
-   |
-   XOR
-  /   \
-OK    Замечания
- |        |
-дальше  Исправить
-           |
-           └────→ Проверить
-
-Запрещено:
-- заменять цикл линейной последовательностью;
-- создавать исправление без возврата;
-- удалять возврат ради упрощения графа.
-
-
-==================================================
-ФОРМАТ ОТВЕТА
-==================================================
-
-Верни только Python-код.
-
-Без:
-- markdown
-- ```python
-- объяснений
-- текста после кода
-
+<<BLUEPRINT>>
+ФОРМАТ ОТВЕТА: только Python-код. Без markdown, без ```, без пояснений после кода.
+Можно до трёх строк комментариев в начале: # Роли: … / # Этапы: … / # Развилки: …
 
 ==================================================
 РЕГЛАМЕНТ
@@ -561,19 +123,176 @@ OK    Замечания
 REGULATION_DATA>>>
 """
 
+# Черновик — код детерминированного разбора: структура заведомо собирается. Модель сверяет его с текстом
+# и правит смысл (роли, названия, условия, этапы). Так облаку не нужно заново рисовать граф с нуля,
+# а промпт помещается в лимит бесплатного тарифа (Groq Free — 8K токенов на запрос вместе с ответом).
+DRAFT_BLOCK = """ЧЕРНОВИК — код детерминированного разбора регламента, граф в нём корректен:
+<<DRAFT>>
+Сверь черновик с регламентом и верни ПОЛНЫЙ код. Исправь то, что разбор понял неверно:
+роли и дорожки, названия задач, условия и подписи веток, этапы (подпроцессы), автоматические шаги.
+Все циклы из Reworks сохрани. Что в черновике верно — оставь как есть.
+"""
 
-def build_prompt(regulation_text: str) -> str:
-    prompt = PROMPT_TEMPLATE.replace("<<REGULATION>>", (regulation_text or "").strip())
+
+_REGULATION_MARK = "==================================================\nРЕГЛАМЕНТ\n=================================================="
+
+
+def _compact_blueprint(blueprint: Any) -> Dict[str, Any]:
+    """Чертёж без служебных полей: роли, развилки и циклы. Шаги модель видит в черновике и в тексте."""
+    decisions = [
+        {
+            "num": item.num,
+            "q": item.question,
+            "yes": "END" if item.yes_end else item.yes_target,
+            "no": "END" if item.no_target is None and (item.no_end or item.else_end) else item.no_target,
+            "flow": item.flow_type.value,
+        }
+        for item in blueprint.decisions
+    ]
+    reworks = [
+        {
+            "type": item.type.value if hasattr(item.type, "value") else str(item.type),
+            "check_task": item.check_task,
+            "target_task": item.target_task,
+            "fix_task": item.fix_task,
+            "condition": item.condition,
+        }
+        for item in blueprint.reworks
+    ]
+    return {
+        "Roles": list(blueprint.roles),
+        "Decisions": decisions,
+        "Parallel": [list(item.nums) for item in blueprint.parallel_blocks],
+        "Reworks": reworks,
+    }
+
+
+def _blueprint_parts(regulation_text: str) -> Tuple[str, str]:
+    """(блок PROCESS BLUEPRINT, код черновика). Пустые строки, если разбор не нашёл процесса."""
     try:
-        from process_blueprint import blueprint_prompt_block
+        from process_blueprint import analyze_process, compile_blueprint
 
-        block = blueprint_prompt_block(regulation_text)
-    except Exception:  # noqa: BLE001 — промпт остаётся прежним, если чертёж не собрался
-        block = ""
-    mark = "==================================================\nРЕГЛАМЕНТ\n=================================================="
-    if block and mark in prompt:
-        prompt = prompt.replace(mark, block + "\n\n" + mark, 1)
+        blueprint = analyze_process(regulation_text)
+    except Exception:  # noqa: BLE001 — промпт без чертежа, модель работает по тексту
+        return "", ""
+    if len(blueprint.tasks) < 2:
+        return "", ""
+    body = json.dumps(_compact_blueprint(blueprint), ensure_ascii=False, separators=(",", ":"))
+    block = (
+        "==================================================\n"
+        "PROCESS BLUEPRINT\n"
+        "==================================================\n"
+        "Семантический разбор уже выполнен кодом. Не ищи возвраты в тексте заново: Reworks — обязательный список циклов.\n"
+        "Decisions: yes/no — номер шага регламента или END.\n"
+        + body
+        + "\n"
+    )
+    try:
+        code, _info = compile_blueprint(blueprint)
+    except Exception:  # noqa: BLE001
+        return block, ""
+    draft = "\n".join(line for line in code.splitlines() if not line.startswith("# Сгенерировано"))
+    return block, draft
+
+
+def build_prompt(
+    regulation_text: str,
+    draft: bool = True,
+    max_tokens: Optional[int] = None,
+    suffix: str = "",
+) -> str:
+    """Промпт генерации. draft=True — модель правит черновик разбора; False — строит по тексту и чертежу.
+
+    max_tokens — бюджет провайдера на промпт (вместе с suffix — хвостом починки): не помещается —
+    сначала уходит черновик, затем чертёж. Регламент и правила остаются всегда.
+    """
+    from llm_providers import estimate_tokens
+
+    text = (regulation_text or "").strip()
+    block, draft_code = _blueprint_parts(text)
+    variants = []
+    if draft and draft_code:
+        variants.append(block + "\n" + DRAFT_BLOCK.replace("<<DRAFT>>", draft_code))
+    variants += [block, ""]
+    prompt = ""
+    for middle in variants:
+        prompt = PROMPT_TEMPLATE.replace("<<BLUEPRINT>>", middle).replace("<<REGULATION>>", text) + suffix
+        if max_tokens is None or estimate_tokens(prompt) <= max_tokens:
+            break
     return prompt
+
+
+_CODE_NAME_RE = re.compile(
+    r"DIAGRAM\.(add_user_task|add_script_task|add_task|create_subprocess|add_exclusive_gateway|add_parallel_gateway)"
+    r"\(\s*(?:name\s*=\s*)?([\'\"])(.+?)\2"
+)
+_CODE_POOL_RE = re.compile(r"DIAGRAM\.add_pool\([^\[]*\[([^\]]*)\]")
+
+
+def _code_inventory(code: str) -> Dict[str, Any]:
+    names: Dict[str, List[str]] = {}
+    for kind, _quote, name in _CODE_NAME_RE.findall(code or ""):
+        names.setdefault(kind, []).append(name.strip())
+    pool = _CODE_POOL_RE.search(code or "")
+    lanes = [item.strip().strip("\'\"") for item in pool.group(1).split(",")] if pool else []
+    tasks = names.get("add_user_task", []) + names.get("add_script_task", []) + names.get("add_task", [])
+    return {
+        "tasks": tasks,
+        "script": set(names.get("add_script_task", [])),
+        "subprocesses": names.get("create_subprocess", []),
+        "gateways": names.get("add_exclusive_gateway", []) + names.get("add_parallel_gateway", []),
+        "lanes": [item for item in lanes if item],
+    }
+
+
+def model_edit_summary(draft_code: str, model_code: str) -> Dict[str, Any]:
+    """Что модель изменила в черновике разбора: честный ответ на вопрос «а что сделал ИИ?»."""
+    before, after = _code_inventory(draft_code), _code_inventory(model_code)
+    old_tasks, new_tasks = set(before["tasks"]), set(after["tasks"])
+    added = sorted(new_tasks - old_tasks)
+    removed = sorted(old_tasks - new_tasks)
+    renamed = min(len(added), len(removed))
+    lanes_added = [item for item in after["lanes"] if item not in before["lanes"]]
+    lanes_removed = [item for item in before["lanes"] if item not in after["lanes"]]
+    automated = sorted((after["script"] - before["script"]) & new_tasks)
+    subs = (len(before["subprocesses"]), len(after["subprocesses"]))
+    gateways = sorted(set(after["gateways"]) - set(before["gateways"]))
+    parts = []
+    if renamed:
+        parts.append(f"переименовано шагов: {renamed}")
+    if len(added) > renamed:
+        parts.append(f"добавлено шагов: {len(added) - renamed}")
+    if len(removed) > renamed:
+        parts.append(f"объединено/убрано шагов: {len(removed) - renamed}")
+    if lanes_added or lanes_removed:
+        parts.append(f"роли: +{len(lanes_added)} / −{len(lanes_removed)}")
+    if subs[0] != subs[1]:
+        parts.append(f"подпроцессы: {subs[0]} → {subs[1]}")
+    if automated:
+        parts.append(f"автоматических шагов: +{len(automated)}")
+    if gateways:
+        parts.append(f"переформулировано/добавлено условий: {len(gateways)}")
+    identical = not parts
+    return {
+        "identical": identical,
+        "renamed": renamed,
+        "added": max(0, len(added) - renamed),
+        "removed": max(0, len(removed) - renamed),
+        "lanes_added": lanes_added,
+        "lanes_removed": lanes_removed,
+        "subprocesses": list(subs),
+        "automated": automated,
+        "gateways_changed": len(gateways),
+        "summary": (
+            "модель сверила черновик разбора с регламентом и подтвердила его без правок"
+            if identical
+            else "модель сверила черновик с регламентом и исправила: " + "; ".join(parts)
+        ),
+    }
+
+
+def prompt_has_draft(prompt: str) -> bool:
+    return "ЧЕРНОВИК —" in (prompt or "")
 
 
 REPAIR_TEMPLATE = """
@@ -629,21 +348,25 @@ REWORK ISSUES:
 """
 
 
-def build_repair_prompt(regulation_text: str, code: str, issues: List[str]) -> str:
-    """Промпт второй попытки: исходная задача + прошлый код + найденные ошибки."""
-    return build_prompt(regulation_text) + (
-        REPAIR_TEMPLATE.replace("<<CODE>>", code.strip()).replace("<<ISSUES>>", "\n".join(f"- {i}" for i in issues))
-    )
+def build_repair_prompt(
+    regulation_text: str, code: str, issues: List[str], max_tokens: Optional[int] = None
+) -> str:
+    """Промпт второй попытки: исходная задача + прошлый код + найденные ошибки (без черновика)."""
+    tail = REPAIR_TEMPLATE.replace("<<CODE>>", code.strip()).replace("<<ISSUES>>", "\n".join(f"- {i}" for i in issues))
+    return build_prompt(regulation_text, draft=False, max_tokens=max_tokens, suffix=tail)
 
 
-def build_rework_repair_prompt(regulation_text: str, code: str, issues: List[str]) -> str:
+def build_rework_repair_prompt(
+    regulation_text: str, code: str, issues: List[str], max_tokens: Optional[int] = None
+) -> str:
     """Повтор только из-за отсутствующих обратных рёбер. Роли, имена, SLA и порядок шагов не трогаем."""
-    payload = json.dumps(rework_issue_records(regulation_text), ensure_ascii=False, indent=2)
-    return build_prompt(regulation_text) + (
+    payload = json.dumps(rework_issue_records(regulation_text), ensure_ascii=False, separators=(",", ":"))
+    tail = (
         REWORK_REPAIR_TEMPLATE.replace("<<CODE>>", code.strip())
         .replace("<<REWORK_ISSUES>>", payload)
         .replace("<<ISSUES>>", "\n".join(f"- {i}" for i in issues))
     )
+    return build_prompt(regulation_text, draft=False, max_tokens=max_tokens, suffix=tail)
 
 
 # --------------------------------------------------------------------------- #
@@ -1136,40 +859,49 @@ def _call_ollama(prompt: str) -> Tuple[str, str]:
     return f"ollama:{model}", str(data.get("response", ""))
 
 
+class PromptTooLarge(RuntimeError):
+    """Промпт не помещается в лимит провайдера (вход + ответ). Запрос не отправляли."""
+
+
+def _http_status(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    if response is None:
+        response = getattr(exc, "fp", None)
+    return getattr(response, "status_code", None) or getattr(exc, "code", None)
+
+
 def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
-    """OpenAI-совместимый chat/completions. prefix: OPENAI_* — основной провайдер, FALLBACK_* — запасной."""
-    key = os.getenv(f"{prefix}_API_KEY")
-    if not key:
-        raise RuntimeError(f"{prefix}_API_KEY не задан")
-    base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
-    model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
-    mark = "==================================================\nРЕГЛАМЕНТ\n=================================================="
-    system, sep, regulation = prompt.partition(mark)
+    """Один запрос к провайдеру из llm_providers (prefix — слот: OPENAI, FALLBACK…, YANDEX).
+
+    Системная часть — правила и чертёж, пользовательская — текст регламента (и прошлый ответ при починке).
+    Промпт больше бюджета провайдера не отправляем: PromptTooLarge, вызывающий ужимает промпт.
+    """
+    import llm_providers
+
+    provider = llm_providers.find(prefix)
+    if provider is None:
+        raise RuntimeError(f"{prefix.upper()}_API_KEY не задан")
+    if llm_providers.estimate_tokens(prompt) > provider.input_budget():
+        raise PromptTooLarge(
+            f"промпт ~{llm_providers.estimate_tokens(prompt)} ток. > бюджета {provider.input_budget()} ток."
+        )
+    system, sep, regulation = prompt.partition(_REGULATION_MARK)
     if not sep:
         system, sep, regulation = prompt.partition("ТЕКСТ РЕГЛАМЕНТА:")
         user_text = "ТЕКСТ РЕГЛАМЕНТА:\n" + regulation.strip()
     else:
         user_text = regulation.strip()
-    payload: Dict[str, Any] = {
-        "model": model,
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": system.strip()},
-            {"role": "user", "content": user_text},
-        ],
-    }
-    # Рассуждающие модели (gpt-oss на Groq): low — меньше «мыслей», быстрее и в пределах лимита токенов/мин.
-    effort = os.getenv(f"{prefix}_REASONING_EFFORT", "")
-    if effort == "none" and "openrouter.ai" in base:
-        payload["reasoning"] = {"enabled": False}  # OpenRouter: без «размышлений» qwen3 отвечает в ~2 раза быстрее
-    elif effort:
-        payload["reasoning_effort"] = effort
+    messages = [
+        {"role": "system", "content": system.strip()},
+        {"role": "user", "content": user_text},
+    ]
     for attempt in range(2):
         try:
-            data = _http_json(
-                f"{base}/chat/completions",
-                payload,
-                headers={"Authorization": f"Bearer {key}"},
+            content = llm_providers.chat(
+                provider,
+                messages,
+                _http_json,
+                temperature=0.1,
                 timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
             )
             break
@@ -1178,8 +910,7 @@ def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
             if attempt or wait is None:
                 raise
             time.sleep(wait)  # бесплатный тариф Groq: 8K токенов/мин — ждём, сколько просит провайдер
-    label = "openai" if prefix == "OPENAI" else prefix.lower()
-    return f"{label}:{model}", str(data["choices"][0]["message"]["content"])
+    return provider.label, content
 
 
 # --------------------------------------------------------------------------- #
@@ -3304,7 +3035,10 @@ CLOUD_PREFIXES = ("OPENAI", "FALLBACK", "FALLBACK2", "FALLBACK3")
 
 
 def _cloud_prefixes() -> List[str]:
-    return [p for p in CLOUD_PREFIXES if os.getenv(f"{p}_API_KEY")]
+    """Слоты подключённых провайдеров в порядке обращения (YANDEX, OPENAI, FALLBACK…), с учётом BPMN_PROVIDER."""
+    import llm_providers
+
+    return [item.slot.upper() for item in llm_providers.providers()]
 
 
 _SET_SLA_RE = re.compile(r"(DIAGRAM\.set_sla\(\s*[^,]+,\s*)([\d.]+)(\s*\))")
@@ -3334,26 +3068,35 @@ _UNRECOGNIZED_PROCESS = (
 
 
 def cloud_engine_status() -> str:
-    """Строка для интерфейса: подключённые облачные модели по порядку (без раскрытия ключей)."""
-    parts = []
-    for prefix in _cloud_prefixes():
-        host = re.sub(r"^https?://([^/]+).*$", r"\1", os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE))
-        parts.append(f"{os.getenv(f'{prefix}_MODEL', 'gpt-4o-mini')} · {host}")
-    if not parts:
-        return "не подключена (OPENAI_API_KEY не задан)"
-    return parts[0] + "".join(f" · запасная: {p}" for p in parts[1:])
+    """Строка для интерфейса: подключённые модели по порядку (без раскрытия ключей)."""
+    import llm_providers
+
+    return llm_providers.status_line()
 
 
 def _engines() -> List[Tuple[str, Callable[[str], Tuple[str, str]]]]:
-    mode = os.getenv("BPMN_AI_MODE", "auto").lower()
-    if mode == "emulator":
+    """Движки по порядку: провайдеры из llm_providers (yandex | cloud), в режиме auto — ещё локальная Ollama."""
+    import llm_providers
+
+    current = llm_providers.mode()
+    if current == "emulator":
         return []
-    # Облачные модели отвечают за секунды — они первые; Ollama — офлайн-резерв.
     engines: List[Tuple[str, Callable[[str], Tuple[str, str]]]] = [
-        (prefix.lower(), (lambda prompt, _p=prefix: _call_openai(prompt, _p))) for prefix in _cloud_prefixes()
+        (item.slot, (lambda prompt, _s=item.slot: _call_openai(prompt, _s))) for item in llm_providers.providers()
     ]
-    engines.append(("ollama", _call_ollama))
+    if current == "auto":
+        engines.append(("ollama", _call_ollama))
     return engines
+
+
+def _engine_prompt_budget(name: str) -> Optional[int]:
+    """Сколько токенов промпта выдержит движок. Ollama: окно num_ctx минус 3500 на ответ."""
+    import llm_providers
+
+    if name == "ollama":
+        return max(2000, int(os.getenv("OLLAMA_NUM_CTX", "8192")) - 3500)
+    provider = llm_providers.find(name)
+    return provider.input_budget() if provider is not None else None
 
 
 def _reject_cloud_diagram(err: str, quality: Optional[Dict[str, Any]]) -> bool:
@@ -3406,12 +3149,24 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
     if use_llm:
         max_attempts = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
         retry_limit_s = float(os.getenv("LLM_RETRY_MAX_CALL_S", "90"))
-        if not os.getenv("OPENAI_API_KEY"):
-            trace.append("облачный API: OPENAI_API_KEY не задан")
+        if not _cloud_prefixes():
+            import llm_providers
+
+            trace.append(
+                "режим эмулятора: облачная модель выключена"
+                if llm_providers.mode() == "emulator"
+                else "облачная модель не подключена (нет ключа API)"
+            )
+        draft_code = _blueprint_parts(text)[1]
         for name, call in _engines():
-            prompt = build_prompt(text)
+            budget = _engine_prompt_budget(name)
+            prompt = build_prompt(text, max_tokens=budget)
+            contract = "draft" if prompt_has_draft(prompt) else "text"
+            if contract == "text" and draft_code:
+                trace.append(f"{name}: черновик не помещается в лимит запроса — модель строит схему по тексту и чертежу")
             attempt = 0
             rework_repairs = 0
+            shrunk = False
             while True:
                 attempt += 1
                 if attempt > max_attempts + 2:
@@ -3420,10 +3175,19 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                 try:
                     engine_label, raw = call(prompt)
                 except Exception as exc:  # noqa: BLE001 — недоступность модели не должна ронять приложение
-                    reason = _error_reason(exc)
+                    too_large = isinstance(exc, PromptTooLarge) or _http_status(exc) == 413
+                    if too_large and not shrunk and attempt == 1 and prompt_has_draft(prompt):
+                        # 413 от провайдера: та же модель, промпт без черновика (~1K токенов меньше).
+                        shrunk = True
+                        attempt = 0
+                        prompt = build_prompt(text, draft=False, max_tokens=budget)
+                        contract = "text"
+                        trace.append(f"{name}: запрос больше лимита провайдера — повтор с компактным промптом")
+                        continue
+                    reason = "запрос больше лимита провайдера (HTTP 413)" if too_large else _error_reason(exc)
                     _LOG.warning("LLM %s недоступен: %s", name, reason)
-                    if getattr(getattr(exc, "response", None), "status_code", None) == 429 or "429" in reason:
-                        trace.append("Лимит облачной модели исчерпан, схема построена локально")
+                    if _http_status(exc) == 429 or "429" in reason:
+                        trace.append(f"{name}: лимит запросов в минуту исчерпан — следующая модель")
                     else:
                         trace.append(f"{name}: недоступен ({reason})")
                     break
@@ -3438,6 +3202,14 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                 quality = audit.get("quality", {}) if not err else {}
                 if not _reject_cloud_diagram(err, quality):
                     audit["artifacts"], audit["it_systems"] = artifacts, it_systems
+                    # Сводку правок считаем только когда модель видела черновик: иначе сравнивать не с чем.
+                    edits = (
+                        model_edit_summary(draft_code, _strip_markdown(raw))
+                        if draft_code and contract == "draft"
+                        else None
+                    )
+                    if edits is not None:
+                        trace.append(f"{engine_label}: {edits['summary']}")
                     audit["generation"] = {
                         "engine": engine_label,
                         "fallback": False,
@@ -3446,6 +3218,8 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                         "rejected": rejected,
                         "code": _strip_markdown(raw),
                         "elapsed_s": round(time.time() - started, 2),
+                        "contract": contract,
+                        "model_edits": edits,
                     }
                     return xml, audit, ""
                 rework_gap = _model_return_incomplete(err)
@@ -3472,11 +3246,11 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
                     if rework_repairs >= 2:
                         break
                     rework_repairs += 1
-                    prompt = build_rework_repair_prompt(text, _strip_markdown(raw), problems)
+                    prompt = build_rework_repair_prompt(text, _strip_markdown(raw), problems, max_tokens=budget)
                     continue
                 if attempt >= max_attempts:
                     break
-                prompt = build_repair_prompt(text, _strip_markdown(raw), problems)
+                prompt = build_repair_prompt(text, _strip_markdown(raw), problems, max_tokens=budget)
 
     if incomplete_model:
         # Модель потеряла возвраты на доработку: не показываем ошибку, а пробуем локальный разбор —
@@ -3559,27 +3333,21 @@ POLISH_SYSTEM = """Оформи приведённые факты как офи�
 
 # --------------------------- вызовы LLM в диалоговом режиме --------------------------- #
 def _chat_openai(messages: List[Dict[str, str]], prefix: str) -> Tuple[str, str]:
-    key = os.getenv(f"{prefix}_API_KEY")
-    if not key:
-        raise RuntimeError(f"{prefix}_API_KEY не задан")
-    base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
-    model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
-    payload: Dict[str, Any] = {"model": model, "temperature": 0.2, "messages": messages}
-    effort = os.getenv(f"{prefix}_REASONING_EFFORT", "")
-    if effort == "none" and "openrouter.ai" in base:
-        payload["reasoning"] = {"enabled": False}
-    elif effort:
-        payload["reasoning_effort"] = effort
-    data = _http_json(
-        f"{base}/chat/completions",
-        payload,
-        headers={"Authorization": f"Bearer {key}"},
+    import llm_providers
+
+    provider = llm_providers.find(prefix)
+    if provider is None:
+        raise RuntimeError(f"{prefix.upper()}_API_KEY не задан")
+    content = llm_providers.chat(
+        provider,
+        messages,
+        _http_json,
+        temperature=0.2,
         timeout=float(os.getenv("CHAT_TIMEOUT", "60")),
-    )
-    content = str(data["choices"][0]["message"].get("content") or "").strip()
+    ).strip()
     if not content:
         raise RuntimeError("пустой ответ модели")
-    return ("openai" if prefix == "OPENAI" else prefix.lower()) + f":{model}", content
+    return provider.label, content
 
 
 def _chat_ollama(messages: List[Dict[str, str]]) -> Tuple[str, str]:
@@ -3608,9 +3376,12 @@ def _chat_llm(messages: List[Dict[str, str]], trace: List[str]) -> Optional[Tupl
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return None
     attempts: List[Tuple[str, Callable[[], Tuple[str, str]]]] = []
+    import llm_providers
+
     for prefix in _cloud_prefixes():
         attempts.append((prefix.lower(), lambda _p=prefix: _chat_openai(messages, _p)))
-    attempts.append(("ollama", lambda: _chat_ollama(messages)))
+    if llm_providers.mode() == "auto":
+        attempts.append(("ollama", lambda: _chat_ollama(messages)))
     for name, call in attempts:
         try:
             return call()
