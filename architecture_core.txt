@@ -1,0 +1,2220 @@
+
+==================================================
+>>> FILE: llm_providers.py
+==================================================
+
+"""Провайдеры LLM: один контракт для Yandex AI Studio, OpenAI-совместимых облаков и эмулятора.
+Режим выбирается переменной BPMN_PROVIDER:
+- auto (по умолчанию) — Yandex AI Studio, если задан ключ, затем облака OPENAI_* → FALLBACK* по порядку;
+- yandex — только Yandex AI Studio (стек партнёра на финале);
+- cloud — только OpenAI-совместимые облака (Groq, OpenRouter и т. п.);
+- emulator — без сети, схему собирает встроенный разбор.
+Пайплайн генерации от выбора не зависит: он получает список Provider и вызывает chat().
+Смена модели — только переменные окружения / Secrets, код не меняется.
+Yandex AI Studio (OpenAI-совместимый Chat Completions):
+    YANDEX_API_KEY      — API-ключ сервисного аккаунта (или YANDEX_IAM_TOKEN)
+    YANDEX_FOLDER_ID    — каталог (folder) сервисного аккаунта
+    YANDEX_MODEL        — «yandexgpt/latest», «yandexgpt-lite/latest» или полный «gpt://…»
+    YANDEX_BASE_URL     — по умолчанию https://llm.api.cloud.yandex.net/v1
+Облака: {PREFIX}_API_KEY, {PREFIX}_BASE_URL, {PREFIX}_MODEL, {PREFIX}_REASONING_EFFORT,
+где PREFIX — OPENAI, FALLBACK, FALLBACK2, FALLBACK3.
+Для любого слота: {SLOT}_INPUT_BUDGET (потолок промпта, токенов), {SLOT}_MAX_TOKENS (потолок ответа).
+"""
+from __future__ import annotations
+import math
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+CLOUD_PREFIXES = ("OPENAI", "FALLBACK", "FALLBACK2", "FALLBACK3")
+OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
+YANDEX_DEFAULT_BASE = "https://llm.api.cloud.yandex.net/v1"
+MODES = ("auto", "yandex", "cloud", "emulator")
+# Потолок промпта, токенов (по оценке estimate_tokens, она завышает на 0–20%).
+# Groq Free, gpt-oss-120b, замер 10.10.2026: вход 5.4K токенов — 200, 6.8K — HTTP 413
+# (лимит 8K токенов в минуту; заказанный max_tokens в проверку не входит). Берём 5000.
+# У остальных лимит — окно контекста за вычетом ответа.
+_HOST_INPUT = (
+    ("api.groq.com", 5000),
+    ("openrouter.ai", 24000),
+    ("llm.api.cloud.yandex.net", 24000),
+)
+_DEFAULT_INPUT = 12000
+_DEFAULT_MAX_OUTPUT = 4096
+@dataclass(frozen=True)
+class Provider:
+    slot: str  # yandex | openai | fallback | fallback2 | fallback3
+    kind: str  # yandex | cloud
+    base_url: str
+    model: str  # как уходит в API
+    display_model: str  # как показываем в интерфейсе
+    headers: Dict[str, str] = field(default_factory=dict, hash=False, compare=False)
+    reasoning_effort: str = ""
+    input_limit: int = _DEFAULT_INPUT
+    max_output: int = _DEFAULT_MAX_OUTPUT
+    @property
+    def label(self) -> str:
+        """Метка движка в audit.generation.engine: «openai:openai/gpt-oss-120b», «yandex:yandexgpt/latest»."""
+        return f"{self.slot}:{self.display_model}"
+    @property
+    def host(self) -> str:
+        return re.sub(r"^https?://([^/]+).*$", r"\1", self.base_url)
+    def input_budget(self) -> int:
+        """Сколько токенов (по estimate_tokens) можно отдать под промпт без HTTP 413."""
+        return self.input_limit
+def mode() -> str:
+    if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
+        return "emulator"
+    value = os.getenv("BPMN_PROVIDER", "auto").strip().lower()
+    return value if value in MODES else "auto"
+def estimate_tokens(text: str) -> int:
+    """Грубая оценка без токенизатора: кириллица ~3 символа на токен (gpt-oss: пример 1 — 16.3K симв. ≈ 4.6K ток.)."""
+    return int(math.ceil(len(text or "") / 3.0)) + 8
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+def _input_limit(slot_env: str, base_url: str) -> int:
+    host_default = next((limit for host, limit in _HOST_INPUT if host in base_url), _DEFAULT_INPUT)
+    return _int_env(f"{slot_env}_INPUT_BUDGET", host_default)
+def _max_output(slot_env: str) -> int:
+    return _int_env(f"{slot_env}_MAX_TOKENS", _DEFAULT_MAX_OUTPUT)
+def yandex_provider() -> Optional[Provider]:
+    key = os.getenv("YANDEX_API_KEY", "").strip()
+    iam = os.getenv("YANDEX_IAM_TOKEN", "").strip()
+    folder = os.getenv("YANDEX_FOLDER_ID", "").strip()
+    if not (key or iam) or not folder:
+        return None
+    base = os.getenv("YANDEX_BASE_URL", YANDEX_DEFAULT_BASE).rstrip("/")
+    name = os.getenv("YANDEX_MODEL", "yandexgpt/latest").strip() or "yandexgpt/latest"
+    model = name if name.startswith("gpt://") else f"gpt://{folder}/{name.lstrip('/')}"
+    display = re.sub(r"^gpt://[^/]+/", "", model)
+    auth = f"Api-Key {key}" if key else f"Bearer {iam}"
+    return Provider(
+        slot="yandex",
+        kind="yandex",
+        base_url=base,
+        model=model,
+        display_model=display,
+        headers={"Authorization": auth, "x-folder-id": folder, "OpenAI-Project": folder},
+        reasoning_effort="",  # AI Studio в режиме OpenAI понимает только temperature / max_tokens / stream / response_format
+        input_limit=_input_limit("YANDEX", base),
+        max_output=_max_output("YANDEX"),
+    )
+def cloud_providers() -> List[Provider]:
+    out: List[Provider] = []
+    for prefix in CLOUD_PREFIXES:
+        key = os.getenv(f"{prefix}_API_KEY", "").strip()
+        if not key:
+            continue
+        base = os.getenv(f"{prefix}_BASE_URL", OPENAI_DEFAULT_BASE).rstrip("/")
+        model = os.getenv(f"{prefix}_MODEL", "gpt-4o-mini")
+        out.append(
+            Provider(
+                slot="openai" if prefix == "OPENAI" else prefix.lower(),
+                kind="cloud",
+                base_url=base,
+                model=model,
+                display_model=model,
+                headers={"Authorization": f"Bearer {key}"},
+                reasoning_effort=os.getenv(f"{prefix}_REASONING_EFFORT", ""),
+                input_limit=_input_limit(prefix, base),
+                max_output=_max_output(prefix),
+            )
+        )
+    return out
+def providers() -> List[Provider]:
+    """Провайдеры в порядке обращения для текущего режима. Пусто — работает эмулятор."""
+    current = mode()
+    if current == "emulator":
+        return []
+    yandex = yandex_provider()
+    if current == "yandex":
+        return [yandex] if yandex else []
+    if current == "cloud":
+        return cloud_providers()
+    return ([yandex] if yandex else []) + cloud_providers()
+def find(slot: str) -> Optional[Provider]:
+    """Провайдер по слоту среди настроенных, без учёта режима (для старых вызовов _call_openai(prompt, prefix))."""
+    slot = (slot or "").lower()
+    yandex = yandex_provider()
+    return next((item for item in ([yandex] if yandex else []) + cloud_providers() if item.slot == slot), None)
+def build_payload(
+    provider: Provider,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_output: Optional[int] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": provider.model,
+        "temperature": temperature,
+        "messages": messages,
+        "max_tokens": int(max_output or provider.max_output),
+    }
+    effort = provider.reasoning_effort
+    if provider.kind == "yandex":
+        return payload
+    if effort == "none" and "openrouter.ai" in provider.base_url:
+        payload["reasoning"] = {"enabled": False}  # OpenRouter: без «размышлений» отвечает вдвое быстрее
+    elif effort:
+        payload["reasoning_effort"] = effort
+    return payload
+def chat(
+    provider: Provider,
+    messages: List[Dict[str, str]],
+    http_json: Callable[..., Dict[str, Any]],
+    *,
+    temperature: float = 0.1,
+    timeout: float = 90.0,
+    max_output: Optional[int] = None,
+) -> str:
+    """Один запрос chat/completions. Сетевые ошибки и HTTP-статусы поднимаются как есть — их разбирает вызывающий."""
+    data = http_json(
+        f"{provider.base_url}/chat/completions",
+        build_payload(provider, messages, temperature, max_output),
+        headers=dict(provider.headers),
+        timeout=timeout,
+    )
+    message = (data.get("choices") or [{}])[0].get("message") or {}
+    return str(message.get("content") or "")
+def status_line() -> str:
+    """Для интерфейса: режим и подключённые модели по порядку (без ключей)."""
+    current = mode()
+    if current == "emulator":
+        return "выключена (режим эмулятора)"
+    items = providers()
+    if not items:
+        if current == "yandex":
+            return "Yandex AI Studio не подключена (нужны YANDEX_API_KEY и YANDEX_FOLDER_ID)"
+        return "не подключена (OPENAI_API_KEY не задан)"
+    parts = [f"{item.display_model} · {item.host}" for item in items]
+    return parts[0] + "".join(f" · запасная: {p}" for p in parts[1:])
+
+==================================================
+>>> FILE: bpmn_quality.py
+==================================================
+
+"""Слой промышленного качества BPMN: визуал, fidelity AS-IS, зрелость, объяснения To-Be.
+Методологический score (check_methodology_compliance) здесь не пересчитывается и не подменяется.
+"""
+from __future__ import annotations
+import math
+import re
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+_NS_BPMN = "http://www.omg.org/spec/BPMN/20100524/MODEL"
+_NS_DI = "http://www.omg.org/spec/BPMN/20100524/DI"
+_NS_DC = "http://www.omg.org/spec/DD/20100524/DC"
+_NS_DI_WP = "http://www.omg.org/spec/DD/20100524/DI"
+_WORK_TAGS = {
+    "task",
+    "userTask",
+    "scriptTask",
+    "manualTask",
+    "serviceTask",
+    "sendTask",
+    "receiveTask",
+    "businessRuleTask",
+}
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+def _clip(value: float) -> int:
+    return max(0, min(100, int(round(value))))
+def _orient(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+def _segments_from_xml(xml: str) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for edge in root.iter(f"{{{_NS_DI}}}BPMNEdge"):
+        points = [
+            (float(point.get("x", 0)), float(point.get("y", 0)))
+            for point in edge.findall(f"{{{_NS_DI_WP}}}waypoint")
+        ]
+        for left, right in zip(points, points[1:]):
+            if abs(left[0] - right[0]) + abs(left[1] - right[1]) > 0.5:
+                edges.append((left, right))
+    return edges
+def count_crossings(xml: str) -> Optional[int]:
+    if not (xml or "").strip():
+        return None
+    try:
+        edges = _segments_from_xml(xml)
+    except Exception:  # noqa: BLE001
+        return None
+    crossings = 0
+    for i, (a, b) in enumerate(edges):
+        for c, d in edges[i + 1 :]:
+            if a in (c, d) or b in (c, d):
+                continue
+            if _orient(a, b, c) * _orient(a, b, d) < 0 and _orient(c, d, a) * _orient(c, d, b) < 0:
+                crossings += 1
+    return crossings
+def _shape_bounds(xml: str) -> List[Tuple[float, float, float, float, str]]:
+    root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    out: List[Tuple[float, float, float, float, str]] = []
+    for shape in root.iter(f"{{{_NS_DI}}}BPMNShape"):
+        box = shape.find(f"{{{_NS_DC}}}Bounds")
+        if box is None:
+            continue
+        x = float(box.get("x", 0))
+        y = float(box.get("y", 0))
+        w = float(box.get("width", 0))
+        h = float(box.get("height", 0))
+        out.append((x, y, x + w, y + h, shape.get("bpmnElement") or ""))
+    return out
+def _label_bounds(xml: str) -> List[Tuple[float, float, float, float]]:
+    root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    out: List[Tuple[float, float, float, float]] = []
+    for label in root.iter(f"{{{_NS_DI}}}BPMNLabel"):
+        box = label.find(f"{{{_NS_DC}}}Bounds")
+        if box is None:
+            continue
+        x = float(box.get("x", 0))
+        y = float(box.get("y", 0))
+        w = float(box.get("width", 0))
+        h = float(box.get("height", 0))
+        if w > 1 and h > 1:
+            out.append((x, y, x + w, y + h))
+    return out
+def _rects_overlap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], pad: float = 0.0) -> bool:
+    return not (a[2] + pad <= b[0] or b[2] + pad <= a[0] or a[3] + pad <= b[1] or b[3] + pad <= a[1])
+def _path_lengths(xml: str) -> Tuple[List[float], List[float]]:
+    """Длины forward и back рёбер по waypoint (манхэттен)."""
+    root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    forward: List[float] = []
+    back: List[float] = []
+    for edge in root.iter(f"{{{_NS_DI}}}BPMNEdge"):
+        points = [
+            (float(point.get("x", 0)), float(point.get("y", 0)))
+            for point in edge.findall(f"{{{_NS_DI_WP}}}waypoint")
+        ]
+        length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(points, points[1:]))
+        color = (edge.get("{http://bpmn.io/schema/bpmn/biocolor/1.0}stroke") or edge.get("bioc:stroke") or "").lower()
+        # возвраты красятся в красный REWORK_EDGE_COLOR
+        is_back = "#c62828" in color or "c62828" in color
+        (back if is_back else forward).append(length)
+    return forward, back
+def compute_visual_score(xml: str, audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Метрики визуального качества. Не трогает methodology.score."""
+    data = audit or {}
+    stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+    meth = data.get("methodology") if isinstance(data.get("methodology"), dict) else {}
+    lanes = int(stats.get("lanes") or 0)
+    crossings = count_crossings(xml)
+    try:
+        shapes = _shape_bounds(xml)
+        labels = _label_bounds(xml)
+        forward, back = _path_lengths(xml)
+    except Exception:  # noqa: BLE001
+        return {
+            "routing_quality": 50,
+            "spacing_quality": 50,
+            "lane_balance": 50,
+            "gateway_clarity": 50,
+            "label_readability": 50,
+            "overall_visual_score": 50,
+            "crossings": crossings,
+            "long_back_edges": 0,
+            "label_overlaps": 0,
+        }
+    work_shapes = [s for s in shapes if s[4]]
+    xs = sorted((s[0] + s[2]) / 2.0 for s in work_shapes)
+    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1) if xs[i + 1] - xs[i] > 8]
+    if gaps:
+        mean = sum(gaps) / len(gaps)
+        variance = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+        spacing = max(0.0, 100.0 - math.sqrt(variance) / max(mean, 1.0) * 35.0)
+    else:
+        spacing = 70.0
+    widths = [s[2] - s[0] for s in work_shapes]
+    heights = [s[3] - s[1] for s in work_shapes]
+    size_spread = 0.0
+    if widths and heights:
+        size_spread = (max(widths) - min(widths)) + (max(heights) - min(heights))
+    spacing = max(0.0, spacing - min(40.0, size_spread / 8.0))
+    routing = 100.0
+    if crossings is not None:
+        routing -= min(60.0, crossings * 10.0)
+    long_back = sum(1 for length in back if length > 1200)
+    routing -= min(20.0, long_back * 6.0)
+    if back:
+        avg_back = sum(back) / len(back)
+        routing -= min(15.0, max(0.0, (avg_back - 600.0) / 50.0))
+    lane_load = list(data.get("lane_load") or [])
+    if lane_load:
+        shares = [float(item.get("share") or 0) for item in lane_load if isinstance(item, dict)]
+        top = max(shares) if shares else 0.0
+        lane_balance = max(0.0, 100.0 - max(0.0, top - 0.35) * 180.0)
+    else:
+        lane_balance = 55.0 if lanes <= 1 else 75.0 + min(20.0, lanes * 2.0)
+    gw_checks = {str(item.get("key")): bool(item.get("passed")) for item in (meth.get("checks") or []) if isinstance(item, dict)}
+    gateway_clarity = 100.0 if gw_checks.get("gateway", True) else 45.0
+    xor = int(stats.get("nodes") or 0)  # fallback; уточним по XML ниже
+    try:
+        root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+        xor_n = len(list(root.iter(f"{{{_NS_BPMN}}}exclusiveGateway")))
+        and_n = len(list(root.iter(f"{{{_NS_BPMN}}}parallelGateway")))
+        if xor_n + and_n == 0:
+            gateway_clarity = max(gateway_clarity, 90.0)
+        else:
+            gateway_clarity = min(100.0, gateway_clarity + min(10.0, (xor_n + and_n)))
+    except Exception:  # noqa: BLE001
+        xor_n = and_n = 0
+    label_overlaps = 0
+    for i, a in enumerate(labels):
+        for b in labels[i + 1 :]:
+            if _rects_overlap(a, b, pad=1.0):
+                label_overlaps += 1
+    label_readability = max(0.0, 100.0 - label_overlaps * 12.0)
+    if lanes >= 2:
+        label_readability = min(100.0, label_readability + 5.0)
+    overall = (
+        0.28 * routing
+        + 0.18 * spacing
+        + 0.18 * lane_balance
+        + 0.18 * gateway_clarity
+        + 0.18 * label_readability
+    )
+    return {
+        "routing_quality": _clip(routing),
+        "spacing_quality": _clip(spacing),
+        "lane_balance": _clip(lane_balance),
+        "gateway_clarity": _clip(gateway_clarity),
+        "label_readability": _clip(label_readability),
+        "overall_visual_score": _clip(overall),
+        "crossings": crossings,
+        "long_back_edges": long_back,
+        "label_overlaps": label_overlaps,
+        "gateways_xor": xor_n,
+        "gateways_and": and_n,
+    }
+def _stems(text: str) -> set:
+    """Основы слов (6 букв) без служебных: «Провести визуальный осмотр» ≈ «Визуальный осмотр провести»."""
+    return {word[:6] for word in re.findall(r"[А-Яа-яЁёA-Za-z]{3,}", (text or "").lower())} - _STOP_STEMS
+_STOP_STEMS = {"для", "при", "или", "что", "это", "его", "так", "все", "без", "над", "под"}
+def _same_meaning(reference: str, candidate: str) -> bool:
+    """Шаг регламента представлен в BPMN: совпадает хотя бы половина основ его названия."""
+    ref, cand = _stems(reference), _stems(candidate)
+    if not ref or not cand:
+        return False
+    if reference.strip().lower() == candidate.strip().lower():
+        return True
+    return len(ref & cand) / len(ref) >= 0.5
+def _xml_inventory(xml: str) -> Dict[str, Any]:
+    names: List[str] = []
+    lanes: List[str] = []
+    xor = 0
+    try:
+        root = ET.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+    except Exception:  # noqa: BLE001
+        return {"names": names, "lanes": lanes, "xor": xor}
+    for node in root.iter():
+        tag = _local(node.tag)
+        name = (node.get("name") or "").strip()
+        if tag in _WORK_TAGS or tag == "subProcess":
+            if name:
+                names.append(name)
+        elif tag == "lane" and name:
+            lanes.append(name)
+        elif tag == "exclusiveGateway":
+            xor += 1
+    return {"names": names, "lanes": lanes, "xor": xor}
+FIDELITY_METHOD = (
+    "Сверка схемы с детерминированным разбором текста регламента: шаги (по смыслу названия), "
+    "роли (дорожки), развилки (XOR) и возвраты (циклы). Процент — доля найденных элементов."
+)
+def regulation_trace(
+    regulation_text: str,
+    blueprint: Any = None,
+    audit: Optional[Dict[str, Any]] = None,
+    xml: str = "",
+) -> Dict[str, Any]:
+    """Трассировка: фраза регламента → BPMN. Потери — предупреждения.
+    Эталон — разбор текста (номера шагов, роли, «если … иначе», «вернуть на п.N»), а не имена задач эмулятора:
+    модель, которая перефразировала шаг, его не теряет. Если схему собрал тот же разбор, сверка —
+    самопроверка (self_check=True), и интерфейс говорит об этом прямо.
+    """
+    from ai_generator import normalize_regulation, parse_regulation
+    warnings: List[str] = []
+    rows: List[Dict[str, Any]] = []
+    text = normalize_regulation(regulation_text or "")
+    empty = {"rows": [], "fidelity": 0, "covered": 0, "total": 0, "dimensions": {}, "method": FIDELITY_METHOD}
+    if len(text) < 20:
+        return {**empty, "warnings": ["Регламент слишком короткий для трассировки."]}
+    try:
+        parsed = parse_regulation(text)
+    except Exception as exc:  # noqa: BLE001
+        return {**empty, "warnings": [f"Парсер не разобрал регламент: {exc}"]}
+    inventory = _xml_inventory(xml) if xml else {"names": [], "lanes": [], "xor": 0}
+    bpmn_names = inventory["names"]
+    bp_tasks = list(getattr(blueprint, "tasks", None) or [])
+    bp_decisions = list(getattr(blueprint, "decisions", None) or [])
+    by_num = {int(task.num): task for task in bp_tasks}
+    dec_by_num = {int(item.num): item for item in bp_decisions}
+    covered = 0
+    for step in parsed.steps:
+        sentence = f"{step.num}. {step.role or ''} {step.title or ''}".strip()
+        if step.decision and getattr(step.decision, "source", None):
+            sentence = str(step.decision.source)
+        elif step.decision and getattr(step.decision, "back_clause", None):
+            sentence = f"{sentence}. {step.decision.back_clause}".strip()
+        semantic = "task"
+        if step.decision:
+            semantic = "decision"
+        if getattr(step, "parallel", False):
+            semantic = "parallel-task"
+        bp_el = by_num.get(step.num) or dec_by_num.get(step.num)
+        bp_id = getattr(bp_el, "id", None) if bp_el is not None else None
+        title = (step.title or "").strip()
+        bpmn_hit = next((name for name in bpmn_names if title and _same_meaning(title, name)), "")
+        status = "ok"
+        if not title and not step.decision:
+            status = "lost"
+            warnings.append(f"Фраза регламента не получила BPMN-представление: «{sentence[:120]}»")
+        elif title and xml and not bpmn_hit:
+            status = "lost"
+            warnings.append(f"Шаг №{step.num} «{title[:80]}» не найден в схеме.")
+        else:
+            covered += 1
+        rows.append(
+            {
+                "num": step.num,
+                "sentence": sentence[:240],
+                "semantic": semantic,
+                "blueprint_id": bp_id or "",
+                "role": step.role or "",
+                "bpmn_element": bpmn_hit,
+                "status": status,
+            }
+        )
+    data = audit or {}
+    roles = [role for role in (parsed.roles or []) if role]
+    roles_hit = sum(1 for role in roles if any(_same_meaning(role, lane) for lane in inventory["lanes"])) if xml else 0
+    for role in roles:
+        if xml and not any(_same_meaning(role, lane) for lane in inventory["lanes"]):
+            warnings.append(f"Роль «{role}» из регламента не получила дорожку.")
+    decisions = sum(1 for step in parsed.steps if step.decision)
+    decisions_hit = min(decisions, int(inventory["xor"]))
+    try:
+        from ai_generator import _explicit_return_count
+        returns = int(_explicit_return_count(regulation_text or ""))
+    except Exception:  # noqa: BLE001
+        returns = 0
+    returns_hit = min(returns, len(data.get("rework_loops") or [])) if data else 0
+    if returns_hit < returns:
+        warnings.append(f"Возвратов в регламенте {returns}, циклов в схеме {returns_hit}.")
+    dimensions = {
+        "steps": {"found": covered, "total": len(parsed.steps)},
+        "roles": {"found": roles_hit, "total": len(roles)},
+        "decisions": {"found": decisions_hit, "total": decisions},
+        "returns": {"found": returns_hit, "total": returns},
+    }
+    total_items = sum(item["total"] for item in dimensions.values())
+    found_items = sum(item["found"] for item in dimensions.values())
+    fidelity = _clip(100.0 * found_items / total_items) if total_items else 0
+    engine = str(((data.get("generation") or {}).get("engine")) or "")
+    return {
+        "rows": rows,
+        "warnings": warnings[:12],
+        "fidelity": fidelity,
+        "covered": covered,
+        "total": len(parsed.steps),
+        "dimensions": dimensions,
+        "method": FIDELITY_METHOD,
+        # Эталон и схема из одного разбора: 100% подтверждает перенос без потерь, а не понимание текста.
+        "self_check": engine.startswith("semantic"),
+        # Пунктов мало — разбор текста ненадёжен как эталон (сплошной текст без нумерации).
+        "reference_weak": len(parsed.steps) < 3,
+    }
+_ACTION_TYPE_MAP = {
+    "automation": "automation",
+    "parallel": "parallelization",
+    "parallelization": "parallelization",
+    "zero_rework": "zero_rework",
+    "loops": "zero_rework",
+    "control": "control_point_shift",
+    "safety": "control_point_shift",
+    "notation": "role_balance",
+    "role_balance": "role_balance",
+    "control_point_shift": "control_point_shift",
+}
+_ACTION_CATALOG = {
+    "automation": {
+        "title": "Автоматизировать ручную фиксацию",
+        "problem": "Исполнитель вручную дублирует запись, которую система уже может сделать сама.",
+        "decision": "Шаг выполняет информационная система автоматически, срок из регламента сохранён.",
+        "business_reason": "Ручная фиксация заменена системной операцией.",
+        "sla_effect": "Снимается ожидание человека на типовой записи.",
+        "risk_effect": "Снижен риск пропуска записи и человеческой ошибки.",
+        "confidence": 0.9,
+    },
+    "parallelization": {
+        "title": "Параллелизация независимых этапов",
+        "problem": "Разные роли ждут друг друга без зависимости по результату.",
+        "decision": "Независимые этапы разных ролей выполняются одновременно.",
+        "business_reason": "Этапы не зависят друг от друга.",
+        "sla_effect": "Сокращение критического пути.",
+        "risk_effect": "Контрольные точки сохранены.",
+        "confidence": 0.88,
+    },
+    "zero_rework": {
+        "title": "Убрать цикл возврата",
+        "problem": "Недостаток контроля качества приводит к повторному прохождению шагов.",
+        "decision": "Контроль перенесён раньше; цикл снят со счастливого пути.",
+        "business_reason": "Недостаток контроля качества устранён раньше по потоку.",
+        "sla_effect": "Срок с возвратами сокращается.",
+        "risk_effect": "Цикл возврата больше не раздувает SLA.",
+        "confidence": 0.86,
+    },
+    "control_point_shift": {
+        "title": "Сместить контрольную точку",
+        "problem": "Проверка стоит слишком поздно или нарушает обязательный порядок допуска.",
+        "decision": "Контроль стоит там, где предотвращает возврат и сохраняет требования ОТ.",
+        "business_reason": "Контроль перенесён раньше, чтобы не возвращать работу.",
+        "sla_effect": "Укорачивается путь с возвратами без нарушения стоп-листа.",
+        "risk_effect": "Снижен риск повторной проверки и нарушения допуска.",
+        "confidence": 0.84,
+    },
+    "role_balance": {
+        "title": "Свернуть повторяющиеся операции в читаемый блок",
+        "problem": "Длинная цепочка одной роли плохо читается и скрывает смысл этапа.",
+        "decision": "Повторяющиеся операции сгруппированы в контрольный блок нотации.",
+        "business_reason": "Нотация BPMN стала читаемой без смены бизнес-логики.",
+        "sla_effect": "Трудозатраты шагов не меняются.",
+        "risk_effect": "Снижен риск неверной интерпретации схемы жюри и аналитиком.",
+        "confidence": 0.8,
+    },
+}
+def enrich_optimization_action(action: Dict[str, Any], before: Any = None, after: Any = None) -> Dict[str, Any]:
+    """Нормализует ход To-Be до контракта OptimizationAction для демонстрации жюри."""
+    raw = str(action.get("type") or action.get("kind") or "reengine")
+    kind = _ACTION_TYPE_MAP.get(raw, raw if raw in _ACTION_CATALOG else "role_balance")
+    detail = str(action.get("description") or action.get("detail") or "").strip()
+    pack = _ACTION_CATALOG.get(kind, _ACTION_CATALOG["role_balance"])
+    title = str(action.get("title") or pack["title"])
+    problem = str(action.get("problem") or pack["problem"])
+    decision = str(action.get("decision") or detail or pack["decision"])
+    confidence = action.get("confidence", pack["confidence"])
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = float(pack["confidence"])
+    return {
+        "type": kind,
+        "title": title,
+        "problem": problem,
+        "decision": decision,
+        "business_reason": str(action.get("business_reason") or pack["business_reason"]),
+        "sla_effect": str(action.get("sla_effect") or pack["sla_effect"]),
+        "risk_effect": str(action.get("risk_effect") or pack["risk_effect"]),
+        "confidence": round(confidence, 2),
+        "before": action.get("before", before),
+        "after": action.get("after", after),
+        "description": detail or decision,
+        "kind": kind,
+        "detail": detail or decision,
+    }
+_REQUIRED_ACTION_FIELDS = ("title", "problem", "decision", "business_reason", "sla_effect", "risk_effect", "confidence")
+def action_is_complete(action: Dict[str, Any]) -> bool:
+    """Рекомендация без полного бизнес-контракта на экран не попадает."""
+    if not isinstance(action, dict):
+        return False
+    if action.get("kind") == "stable" or "узких мест" in str(action.get("detail") or ""):
+        return False
+    for key in _REQUIRED_ACTION_FIELDS:
+        value = action.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return False
+    return True
+def normalize_optimization_actions(actions: Sequence[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    enriched = [enrich_optimization_action(dict(item)) for item in actions if isinstance(item, dict)]
+    enriched = [item for item in enriched if action_is_complete(item)]
+    return enriched[: max(0, int(limit))]
+def compute_structural_quality(audit: Optional[Dict[str, Any]] = None, xml: str = "") -> int:
+    data = audit or {}
+    meth = data.get("methodology") if isinstance(data.get("methodology"), dict) else {}
+    checks = {str(item.get("key")): bool(item.get("passed")) for item in (meth.get("checks") or []) if isinstance(item, dict)}
+    score = 0
+    score += 25 if data.get("xsd_valid") is True else 0
+    score += 25 if not (data.get("dead_ends") or []) else 5
+    score += 25 if not (data.get("orphans_without_incoming") or []) else 5
+    score += 25 if checks.get("gateway", True) else 10
+    if xml and "bpmn:laneSet" not in xml and "laneSet" not in xml:
+        score = max(0, score - 15)
+    return _clip(score)
+def compute_logical_quality(audit: Optional[Dict[str, Any]] = None) -> int:
+    data = audit or {}
+    meth = data.get("methodology") if isinstance(data.get("methodology"), dict) else {}
+    violations = [str(item) for item in (meth.get("violations") or [])]
+    score = 100
+    if data.get("dead_ends"):
+        score -= 25
+    if data.get("orphans_without_incoming"):
+        score -= 25
+    if any("явных возврата" in text for text in violations):
+        score -= 30
+    if any(text.startswith("Нет стартового") or text.startswith("Нет конечного") for text in violations):
+        score -= 20
+    return _clip(score)
+def compute_business_quality(audit: Optional[Dict[str, Any]] = None, tobe_delta: Optional[dict] = None) -> int:
+    data = audit or {}
+    bus = data.get("bus_factor") if isinstance(data.get("bus_factor"), dict) else {}
+    loops = list(data.get("rework_loops") or [])
+    score = 70
+    share = float(bus.get("max_share") or 0)
+    if share <= 0.35:
+        score += 15
+    elif share <= 0.45:
+        score += 5
+    else:
+        score -= 15
+    score -= min(20, len(loops) * 6)
+    if isinstance(tobe_delta, dict):
+        if int(tobe_delta.get("rework_removed") or 0) > 0:
+            score += 10
+        if float(tobe_delta.get("sla_saved_hours") or 0) > 0:
+            score += 10
+    return _clip(score)
+def process_health_issues(audit: Optional[Dict[str, Any]] = None) -> List[str]:
+    """До 3 проблем в формате: проблема → цена → последствие."""
+    data = audit or {}
+    issues: List[str] = []
+    sla = data.get("sla") if isinstance(data.get("sla"), dict) else {}
+    loops = list(data.get("rework_loops") or [])
+    if loops:
+        worst = max(loops, key=lambda item: float((item or {}).get("cycle_hours") or 0))
+        hours = float((worst or {}).get("cycle_hours") or sla.get("rework_hours") or 0)
+        label = str((worst or {}).get("label") or "возврат на доработку")
+        if hours > 0:
+            issues.append(f"Возврат «{label}» → +{hours:g} ч → срыв сроков")
+        else:
+            issues.append(f"Возврат «{label}» → повтор работы → потеря времени")
+    bus = data.get("bus_factor") if isinstance(data.get("bus_factor"), dict) else {}
+    share = float(bus.get("max_share") or 0)
+    role = str(bus.get("top_role") or "")
+    if share >= 0.4 and role:
+        issues.append(f"«{role}» держит {share:.0%} шагов → узкое место → риск SLA")
+    target = sla.get("target_hours")
+    with_rw = float(sla.get("with_rework_hours") or sla.get("critical_path_hours") or 0)
+    if target not in (None, "") and with_rw > float(target):
+        over = with_rw - float(target)
+        issues.append(f"Срок выше цели → +{over:g} ч сверх SLA → обязательство не выполняется")
+    elif float(sla.get("rework_share") or 0) > 0.25:
+        pct = float(sla.get("rework_share") or 0) * 100
+        issues.append(f"Возвраты съедают {pct:.0f}% пути → лишняя длительность → риск срыва")
+    return issues[:3]
+def ai_confidence(
+    audit: Optional[Dict[str, Any]] = None,
+    fidelity: int = 0,
+    tobe_delta: Optional[dict] = None,
+    trace: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Обоснованность схемы и рекомендаций — взвешенная сумма проверяемых факторов, не вероятность модели.
+    40% полнота переноса регламента (fidelity) · 25% логика графа (тупики, возвраты) ·
+    20% структура (XSD, старт/конец, шлюзы) · 15% ясность регламента (у шагов есть роль и срок).
+    Самопроверка эмулятора и слабый эталон не меняют число, но дают оговорку caveat: их 100% не доказывают понимание текста.
+    """
+    data = audit or {}
+    structural = compute_structural_quality(data)
+    logical = compute_logical_quality(data)
+    rows = list((trace or {}).get("rows") or [])
+    clarity = 100.0 * sum(1 for row in rows if row.get("role")) / len(rows) if rows else 50.0
+    hours_share = data.get("sla_from_regulation"), data.get("sla_work_nodes")
+    if hours_share[0] is not None and hours_share[1]:
+        clarity = 0.5 * clarity + 50.0 * float(hours_share[0]) / float(hours_share[1])
+    score = _clip(0.40 * float(fidelity) + 0.25 * logical + 0.20 * structural + 0.15 * clarity)
+    basis = [
+        {"factor": "Полнота переноса регламента", "value": int(fidelity), "weight": 40},
+        {"factor": "Логика графа", "value": int(logical), "weight": 25},
+        {"factor": "Структура и XSD", "value": int(structural), "weight": 20},
+        {"factor": "Ясность регламента (роли и сроки)", "value": _clip(clarity), "weight": 15},
+    ]
+    level = "Высокая" if score >= 85 else ("Средняя" if score >= 70 else "Ограниченная")
+    caveat = ""
+    if (trace or {}).get("reference_weak"):
+        caveat = "Регламент без явных пунктов — эталон для сверки слабый, нужна ручная проверка."
+    elif (trace or {}).get("self_check"):
+        caveat = "Схему собрал детерминированный разбор: сверка подтверждает перенос без потерь, не понимание текста."
+    actions = normalize_optimization_actions(list((tobe_delta or {}).get("actions") or [])) if tobe_delta else []
+    if level == "Высокая":
+        label = (
+            "Рекомендации опираются на измеренные узкие места процесса"
+            if actions
+            else "Процесс перенесён из регламента полностью, граф и XSD корректны"
+        )
+    elif level == "Средняя":
+        label = "Ключевые элементы перенесены; часть формулировок регламента неоднозначна"
+    else:
+        label = "Регламент разобран частично — схеме и рекомендациям нужна ручная проверка"
+    if caveat:
+        label = f"{label}. {caveat}"
+    return {
+        "score": score,
+        "level": level,
+        "label": label,
+        "caveat": caveat,
+        "basis": basis,
+        "method": "0.40·полнота + 0.25·логика + 0.20·структура + 0.15·ясность регламента",
+    }
+def process_improvement_score(
+    audit: Optional[Dict[str, Any]] = None,
+    tobe_delta: Optional[dict] = None,
+    visual_score: int = 0,
+) -> Dict[str, Any]:
+    """40% SLA + 20% rework + 20% role balance + 20% BPMN quality."""
+    data = audit or {}
+    delta = tobe_delta if isinstance(tobe_delta, dict) else {}
+    before = float(delta.get("with_rework_before") or delta.get("sla_before_hours") or 0)
+    after = float(delta.get("with_rework_after") or delta.get("sla_after_hours") or before)
+    if before > 0 and after <= before:
+        sla_part = min(100.0, 100.0 * (before - after) / before)
+    else:
+        sla_part = 0.0
+    loops_b = int(delta.get("rework_before") or len(data.get("rework_loops") or []))
+    loops_a = int(delta.get("rework_after") if delta else loops_b)
+    if loops_b > 0:
+        rework_part = 100.0 * max(0, loops_b - loops_a) / loops_b
+    else:
+        rework_part = 100.0 if delta else 50.0
+    bus = data.get("bus_factor") if isinstance(data.get("bus_factor"), dict) else {}
+    share = float(bus.get("max_share") or 0)
+    # После To-Be роль может улучшиться — если в delta нет role share, берём AS-IS и штрафуем мягко.
+    role_part = max(0.0, 100.0 - max(0.0, share - 0.35) * 200.0)
+    bpmn_part = float(visual_score or 0)
+    if not delta:
+        total = _clip(0.2 * rework_part + 0.3 * role_part + 0.5 * bpmn_part)
+        return {"score": total, "parts": {"sla": 0, "rework": _clip(rework_part), "role": _clip(role_part), "bpmn": _clip(bpmn_part)}}
+    total = _clip(0.4 * sla_part + 0.2 * rework_part + 0.2 * role_part + 0.2 * bpmn_part)
+    return {
+        "score": total,
+        "parts": {
+            "sla": _clip(sla_part),
+            "rework": _clip(rework_part),
+            "role": _clip(role_part),
+            "bpmn": _clip(bpmn_part),
+        },
+    }
+def bpmn_maturity_level(
+    audit: Optional[Dict[str, Any]] = None,
+    xml: str = "",
+    tobe_delta: Optional[dict] = None,
+    fidelity: Optional[int] = None,
+) -> Dict[str, Any]:
+    """L1…L5 зрелости с объяснением для жюри."""
+    structural = compute_structural_quality(audit, xml)
+    logical = compute_logical_quality(audit)
+    business = compute_business_quality(audit, tobe_delta)
+    visual = compute_visual_score(xml, audit)
+    visual_score = int(visual.get("overall_visual_score") or 0)
+    fid = int(fidelity if fidelity is not None else 0)
+    issues = process_health_issues(audit)
+    optimized = False
+    if isinstance(tobe_delta, dict):
+        actions = normalize_optimization_actions(list(tobe_delta.get("actions") or []))
+        optimized = bool(actions) and (
+            int(tobe_delta.get("rework_removed") or 0) > 0
+            or float(tobe_delta.get("sla_saved_hours") or 0) > 0
+            or int(tobe_delta.get("quality_gain") or 0) > 0
+        )
+    level = 1
+    title = "Нарисованный процесс"
+    why = "Схема есть, но доверие к полноте ещё не подтверждено."
+    if structural >= 70 and logical >= 60 and fid >= 70:
+        level = 2
+        title = "Корректная модель процесса"
+        why = "AI восстановил исходный процесс по регламенту без потери шагов."
+    if level >= 2 and issues:
+        level = 3
+        title = "Процесс с анализом проблем"
+        why = "AI нашёл узкие места: возвраты, перегруз ролей или риск срыва срока."
+    if level >= 3 and optimized:
+        level = 4
+        title = "Оптимизированный процесс"
+        why = "AI нашёл узкие места, предложил изменение структуры процесса и подтвердил эффект."
+    if level >= 4 and visual_score >= 80 and business >= 70:
+        level = 5
+        title = "Управляемый процесс"
+        why = "Есть цифровой двойник, объяснимые улучшения и измеримый эффект для управления."
+    return {
+        "level": level,
+        "title": title,
+        "why": why,
+        "structural_quality": structural,
+        "logical_quality": logical,
+        "business_quality": business,
+        "visual_quality": visual_score,
+        "visual": visual,
+        "asis_fidelity": fid,
+        "health_issues": issues,
+    }
+def _fidelity_caption(trace: Dict[str, Any]) -> str:
+    dims = trace.get("dimensions") or {}
+    parts = [
+        f"{label} {dims[key]['found']}/{dims[key]['total']}"
+        for key, label in (("steps", "шаги"), ("roles", "роли"), ("decisions", "развилки"), ("returns", "возвраты"))
+        if key in dims and dims[key]["total"]
+    ]
+    head = " · ".join(parts) or "нет данных для сверки"
+    if trace.get("reference_weak"):
+        return f"{head} — регламент без явных пунктов, сверка приблизительная"
+    if trace.get("self_check"):
+        return f"{head} — самопроверка: схему собрал тот же разбор текста"
+    if int(trace.get("fidelity") or 0) >= 95:
+        return f"{head} — процесс перенесён из регламента без потерь"
+    return f"{head} — часть элементов регламента не найдена в схеме"
+def jury_scorecard(
+    audit: Optional[Dict[str, Any]] = None,
+    xml: str = "",
+    regulation_text: str = "",
+    blueprint: Any = None,
+    tobe_delta: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Сводная карточка для UI: executive view, reasoning, technical audit."""
+    data = audit or {}
+    trace = regulation_trace(regulation_text, blueprint, data, xml)
+    fidelity = int(trace.get("fidelity") or 0)
+    maturity = bpmn_maturity_level(data, xml, tobe_delta, fidelity=fidelity)
+    actions = normalize_optimization_actions(list((tobe_delta or {}).get("actions") or [])) if tobe_delta else []
+    visual = maturity.get("visual") or {}
+    improvement = process_improvement_score(data, tobe_delta, int(visual.get("overall_visual_score") or 0))
+    confidence = ai_confidence(data, fidelity, tobe_delta, trace)
+    health = list(maturity.get("health_issues") or process_health_issues(data))
+    tobe_view = None
+    if isinstance(tobe_delta, dict):
+        before = float(tobe_delta.get("with_rework_before") or tobe_delta.get("sla_before_hours") or 0)
+        after = float(tobe_delta.get("with_rework_after") or tobe_delta.get("sla_after_hours") or before)
+        pct = int(round(100.0 * (before - after) / before)) if before > 0 and after < before else 0
+        stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+        tobe_stats = (tobe_delta.get("tobe_audit") or {}).get("stats") if isinstance(tobe_delta.get("tobe_audit"), dict) else {}
+        tobe_view = {
+            "sla_before": before,
+            "sla_after": after,
+            "sla_saved_pct": pct,
+            "loops_before": int(tobe_delta.get("rework_before") or 0),
+            "loops_after": int(tobe_delta.get("rework_after") or 0),
+            "steps_before": int(stats.get("work_items") or 0) or None,
+            "steps_after": int((tobe_stats or {}).get("work_items") or 0) or None,
+            "quality_before": tobe_delta.get("quality_before"),
+            "quality_after": tobe_delta.get("quality_after"),
+            "actions": actions,
+        }
+    return {
+        "asis_fidelity": fidelity,
+        "fidelity_caption": _fidelity_caption(trace),
+        "process_health": health,
+        "ai_confidence": confidence,
+        "process_improvement": improvement,
+        "trace": trace,
+        "visual": visual,
+        "maturity": maturity,
+        "tobe_improvement": tobe_view,
+        "reasoning": actions,
+        "warnings": list(trace.get("warnings") or []),
+    }
+def attach_quality_pack(
+    audit: Dict[str, Any],
+    xml: str,
+    regulation_text: str = "",
+    blueprint: Any = None,
+) -> Dict[str, Any]:
+    """Дописывает в audit блок bpmn_quality без изменения methodology."""
+    pack = jury_scorecard(audit, xml, regulation_text, blueprint, None)
+    audit["bpmn_quality"] = {
+        "visual": pack["visual"],
+        "structural_quality": pack["maturity"]["structural_quality"],
+        "logical_quality": pack["maturity"]["logical_quality"],
+        "business_quality": pack["maturity"]["business_quality"],
+        "maturity_level": pack["maturity"]["level"],
+        "maturity_title": pack["maturity"]["title"],
+        "maturity_why": pack["maturity"].get("why"),
+        "asis_fidelity": pack["asis_fidelity"],
+        "fidelity_caption": pack.get("fidelity_caption"),
+        "process_health": pack.get("process_health") or [],
+        "ai_confidence": pack.get("ai_confidence") or {},
+        "process_improvement": pack.get("process_improvement") or {},
+        "trace_warnings": pack["warnings"],
+        "trace": pack["trace"],
+    }
+    return audit
+
+==================================================
+>>> FILE: process_blueprint.py
+==================================================
+
+"""Семантический чертёж процесса между текстом регламента и генерацией BPMN.
+Возврат — не один тип. Чертёж различает три потока:
+- rollback: назад на уже существующий шаг, новая задача не создаётся;
+- correction: отдельная задача исправления и ребро на проверку;
+- termination: ветка завершения, цикла нет.
+Модель получает этот чертёж готовым. После генерации нормализатор
+достраивает только недостающую часть своего типа и не меняет
+уже существующие задачи, роли и сроки.
+"""
+from __future__ import annotations
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+class FlowType(str, Enum):
+    """Тип потока. Сравнение со строкой «rollback» остаётся рабочим для уже записанных чертежей."""
+    NORMAL = "normal"
+    ROLLBACK = "rollback"
+    CORRECTION = "correction"
+    TERMINATION = "termination"
+    PARALLEL = "parallel"
+class TaskType(str, Enum):
+    """Вид задачи BPMN. Компилятор не угадывает его заново."""
+    USER = "user"
+    SCRIPT = "script"
+@dataclass
+class BlueprintTask:
+    num: int
+    role: str
+    title: str
+    hours: Optional[float] = None
+    stage: Optional[str] = None
+    system: bool = False
+    back_num: Optional[int] = None
+    id: str = ""
+    task_type: TaskType = TaskType.USER
+@dataclass
+class BlueprintDecision:
+    num: int
+    question: str
+    yes_label: str
+    no_label: str
+    kind: str  # rework | end | branch
+    role: str = ""
+    flow: Optional[FlowType] = None
+    yes_num: Optional[int] = None
+    no_num: Optional[int] = None
+    yes_end: bool = False
+    no_end: bool = False
+    else_end: bool = False
+    id: str = ""
+    gateway_hours: Optional[float] = None
+    @property
+    def yes_target(self) -> Optional[int]:
+        if self.yes_end:
+            return None
+        return self.yes_num
+    @property
+    def no_target(self) -> Optional[int]:
+        if self.no_end or self.else_end or self.flow == FlowType.TERMINATION:
+            return None
+        return self.no_num
+    @property
+    def flow_type(self) -> FlowType:
+        return self.flow or FlowType.NORMAL
+@dataclass
+class BlueprintParallel:
+    nums: List[int]
+    roles: List[str]
+    id: str = ""
+    task_ids: List[str] = field(default_factory=list)
+    split_name: str = "Параллельные работы"
+    join_name: str = "Работы завершены"
+    flow_type: FlowType = FlowType.PARALLEL
+@dataclass
+class BlueprintRework:
+    """Один возврат процесса. Тип — FlowType, не свободная строка."""
+    type: FlowType
+    source_phrase: str
+    check_task: str
+    target_task: str
+    fix_task: str
+    condition: str
+    gateway_name: str
+    check_num: Optional[int] = None
+    target_num: Optional[int] = None
+    success_label: str = "Дальше"
+@dataclass
+class ProcessBlueprint:
+    title: str
+    sla_hours: Optional[float]
+    pool: str = ""
+    month_durations_ignored: bool = False
+    roles: List[str] = field(default_factory=list)
+    tasks: List[BlueprintTask] = field(default_factory=list)
+    decisions: List[BlueprintDecision] = field(default_factory=list)
+    parallel_blocks: List[BlueprintParallel] = field(default_factory=list)
+    reworks: List[BlueprintRework] = field(default_factory=list)
+    def as_dict(self) -> Dict[str, Any]:
+        decisions = []
+        for item in self.decisions:
+            row = asdict(item)
+            row["yes_target"] = item.yes_target
+            row["no_target"] = item.no_target
+            row["flow_type"] = item.flow_type.value
+            decisions.append(row)
+        return {
+            "Process": self.title,
+            "SLA": self.sla_hours,
+            "Pool": self.pool or self.title,
+            "Roles": self.roles,
+            "Tasks": [asdict(item) for item in self.tasks],
+            "Decisions": decisions,
+            "ParallelBlocks": [asdict(item) for item in self.parallel_blocks],
+            "Reworks": [asdict(item) for item in self.reworks],
+        }
+# Словарь намерения. Тип выбирает структура шага: номер существующего пункта
+# важнее глагола исправления, завершение процесса важнее обоих.
+_CORRECTION_MARKS = (
+    "устранить замечан",
+    "исправить ошиб",
+    "направить на доработку",
+    "на доработку",
+    "повторно представить",
+)
+# «Повторно проверить» само по себе — продолжение уже открытого исправления, не второй возврат.
+_CORRECTION_ECHO = (
+    "повторная проверка",
+    "повторно проверить",
+)
+# Повтор той же работы без номера пункта — исправление, не откат на чужой шаг.
+_REPEAT_ACTIVITY = (
+    ("повторн", "диагностик"),
+    ("повторн", "согласован"),
+)
+_ROLLBACK_MARKS = (
+    "вернуть к шаг",
+    "вернуть к этап",
+    "перейти обратно",
+    "повторить предыдущ",
+)
+def _clause_text(step: Any) -> str:
+    """Исходная фраза шага. Нормализованная подпись ветки («На доработку») тип не меняет."""
+    decision = getattr(step, "decision", None)
+    source = (getattr(decision, "source", "") or "").strip()
+    if source:
+        return source
+    parts = (
+        getattr(step, "title", "") or "",
+        getattr(decision, "back_clause", "") or "",
+    )
+    return " ".join(part for part in parts if part)
+def _mentioned_refs(step: Any) -> set:
+    """Номера пунктов, которые написаны в шаге. Выведенный «предыдущий шаг» сюда не входит."""
+    from ai_generator import _REF_RE
+    return {int(match.group(1)) for match in _REF_RE.finditer(_clause_text(step))}
+def _backward_target(step: Any) -> Optional[int]:
+    """Откат только на пункт, который регламент назвал. Ссылка «на предыдущий» — ещё не тип."""
+    decision = getattr(step, "decision", None)
+    num = getattr(step, "num", None)
+    mentioned = _mentioned_refs(step)
+    if decision is not None and decision.no_ref is not None and num is not None and decision.no_ref < num:
+        if decision.no_ref in mentioned:
+            return decision.no_ref
+    if decision is not None and decision.yes_ref is not None and num is not None and decision.yes_ref < num:
+        if decision.yes_ref in mentioned:
+            return decision.yes_ref
+    back_ref = getattr(step, "back_ref", None)
+    if back_ref is not None and num is not None and back_ref < num:
+        return back_ref
+    text = _clause_text(step)
+    low = text.lower()
+    from ai_generator import _EXPLICIT_RETURN_RE
+    if num is not None and (_EXPLICIT_RETURN_RE.search(text) or "перейти обратно" in low):
+        backward = [ref for ref in mentioned if ref < num]
+        if backward:
+            return max(backward)
+    return None
+def clause_intent(text: str) -> Optional[FlowType]:
+    """Намерение фразы. Передача вещи сюда не входит."""
+    from ai_generator import (
+        _END_KW,
+        _EXPLICIT_RETURN_RE,
+        _NAZAD_RETURN_RE,
+        _REF_RE,
+        _REWORK_CLAUSE_RE,
+        _is_physical_handoff,
+    )
+    src = text or ""
+    if _is_physical_handoff(src):
+        return None
+    low = src.lower()
+    # Приоритет: явный пункт, затем «повторить», затем «доработать», затем «завершить».
+    numbered = bool(
+        _REF_RE.search(src)
+        and (_EXPLICIT_RETURN_RE.search(src) or "перейти обратно" in low)
+    )
+    if numbered:
+        return FlowType.ROLLBACK
+    if any(left in low and right in low for left, right in _REPEAT_ACTIVITY):
+        return FlowType.CORRECTION
+    if any(mark in low for mark in _CORRECTION_ECHO) and re.search(r"если|при\s|ошиб|замечан", low):
+        return FlowType.CORRECTION
+    if any(mark in low for mark in _ROLLBACK_MARKS):
+        return FlowType.ROLLBACK
+    if any(mark in low for mark in _CORRECTION_MARKS):
+        return FlowType.CORRECTION
+    if _NAZAD_RETURN_RE.search(src):
+        return FlowType.ROLLBACK
+    if _REWORK_CLAUSE_RE.search(src):
+        if "доработ" in low or "устранить" in low or "исправить" in low:
+            return FlowType.CORRECTION
+        return FlowType.ROLLBACK
+    if _END_KW.search(src) or "аннулир" in low or "отказ заявителя" in low or re.search(r"\bотказать\b", low):
+        return FlowType.TERMINATION
+    return None
+def classify_flow(step: Any) -> Optional[FlowType]:
+    """Тип потока по уже разобранному шагу, а не по новому выражению поверх парсера.
+    Ссылка на существующий пункт — rollback.
+    Глагол исправления без пункта — correction.
+    Ветка завершения без возврата — termination.
+    """
+    from ai_generator import _is_physical_handoff
+    if _is_physical_handoff(_clause_text(step)):
+        return None
+    decision = getattr(step, "decision", None)
+    if _backward_target(step) is not None:
+        return FlowType.ROLLBACK
+    intent = clause_intent(_clause_text(step))
+    if intent in (FlowType.ROLLBACK, FlowType.CORRECTION):
+        return intent
+    if decision is not None and (decision.no_end or decision.yes_end):
+        return FlowType.TERMINATION
+    return intent
+def _step_is_rework(step: Any) -> bool:
+    return classify_flow(step) in (FlowType.ROLLBACK, FlowType.CORRECTION)
+def _decision_kind(step: Any) -> str:
+    kind = classify_flow(step)
+    if kind in (FlowType.ROLLBACK, FlowType.CORRECTION):
+        return "rework"
+    if kind == FlowType.TERMINATION:
+        return "end"
+    decision = step.decision
+    if decision is not None and (decision.yes_end or decision.no_end):
+        return "end"
+    return "branch"
+def correction_fix_name(step: Any) -> str:
+    """Имя задачи исправления. У rollback такой задачи нет."""
+    low = _clause_text(step).lower()
+    if "ошиб" in low:
+        return "Исправить ошибки"
+    return "Устранить замечания"
+def _fix_task_name(condition: str) -> str:
+    """Имя синтетической задачи исправления: инфинитив и объект, без чужого шага."""
+    label = re.sub(r"\s+", " ", (condition or "").strip())
+    low = label.lower()
+    if "не соглас" in low or "отклон" in low:
+        return "Исправить замечания"
+    if "ошиб" in low:
+        return "Исправить ошибки"
+    if not label or low in ("иначе", "нет", "на доработку"):
+        label = "замечания"
+    if low.startswith(("устранить ", "исправить ")):
+        return label[:80]
+    body = label[:1].lower() + label[1:]
+    return f"Устранить {body}"[:80]
+def _condition(step: Any) -> str:
+    decision = getattr(step, "decision", None)
+    label = (getattr(decision, "no_label", "") or "").strip()
+    low = label.lower()
+    if "не соглас" in low or "отклон" in low:
+        return "Не согласовано"
+    if "ошиб" in low:
+        return "Ошибки"
+    if label and label.lower() not in ("иначе", "нет"):
+        return label[:40]
+    return "Замечания"
+def analyze_process(regulation_text: str) -> ProcessBlueprint:
+    """Чертёж As-Is: возвраты уже отделены от завершения процесса и от передачи вещей."""
+    from ai_generator import parse_regulation
+    parsed = parse_regulation(regulation_text or "")
+    steps = list(parsed.steps)
+    by_num = {step.num: step for step in steps}
+    blueprint = ProcessBlueprint(
+        title=parsed.title,
+        sla_hours=parsed.sla_hours,
+        pool=parsed.title,
+        month_durations_ignored=bool(getattr(parsed, "month_durations_ignored", False)),
+        roles=list(parsed.roles),
+        tasks=[
+            BlueprintTask(
+                num=step.num,
+                role=step.role,
+                title=step.title,
+                hours=step.hours,
+                stage=step.stage,
+                system=bool(step.system),
+                back_num=step.back_ref,
+                id=f"T{step.num}",
+                task_type=TaskType.SCRIPT if step.system else TaskType.USER,
+            )
+            for step in steps
+            if step.title
+        ],
+    )
+    blueprint.parallel_blocks = _parallel_blocks(steps)
+    for step in steps:
+        if step.decision is None and not _step_is_rework(step):
+            continue
+        flow = classify_flow(step)
+        if step.decision is not None:
+            question = (step.decision.yes_label or "Условие").rstrip("?") + "?"
+            decision = step.decision
+            blueprint.decisions.append(
+                BlueprintDecision(
+                    num=step.num,
+                    question=question[:80],
+                    yes_label=decision.yes_label,
+                    no_label=decision.no_label,
+                    kind=_decision_kind(step),
+                    role=step.role or "",
+                    flow=flow if flow in (FlowType.ROLLBACK, FlowType.CORRECTION, FlowType.TERMINATION) else FlowType.NORMAL,
+                    yes_num=decision.yes_ref,
+                    no_num=decision.no_ref,
+                    yes_end=bool(decision.yes_end),
+                    no_end=bool(decision.no_end),
+                    else_end=bool(
+                        decision.has_else
+                        and not decision.no_end
+                        and decision.no_ref is None
+                        and not decision.no_back
+                    ),
+                    id=f"D{step.num}",
+                )
+            )
+        elif flow == FlowType.ROLLBACK:
+            blueprint.decisions.append(
+                BlueprintDecision(
+                    num=step.num,
+                    question="Результат принят?",
+                    yes_label="Дальше",
+                    no_label="Возврат",
+                    kind="rework",
+                    role=step.role or "",
+                    flow=FlowType.ROLLBACK,
+                    no_num=_backward_target(step),
+                    id=f"D{step.num}",
+                    gateway_hours=0.0,
+                )
+            )
+        if flow not in (FlowType.ROLLBACK, FlowType.CORRECTION):
+            continue
+        decision = step.decision
+        target_num = _backward_target(step)
+        if flow == FlowType.ROLLBACK and target_num is None:
+            earlier = [item for item in steps if item.num < step.num]
+            if earlier:
+                target_num = earlier[-1].num
+        target = by_num.get(target_num) if target_num is not None else None
+        phrase = (decision.back_clause if decision is not None else "") or step.title
+        condition = _condition(step)
+        question = ""
+        success = "Дальше"
+        if decision is not None:
+            question = ((decision.yes_label or "Условие").rstrip("?") + "?")[:80]
+            success = (decision.yes_label or "Дальше")[:40]
+        check_task = step.title or "Проверить"
+        if flow == FlowType.ROLLBACK:
+            target_task = (target.title if target is not None else "") or ""
+            fix_task = ""
+        else:
+            target_task = check_task
+            fix_task = correction_fix_name(step)
+        blueprint.reworks.append(
+            BlueprintRework(
+                type=flow,
+                source_phrase=re.sub(r"\s+", " ", phrase).strip()[:160],
+                check_num=step.num,
+                check_task=check_task,
+                fix_task=fix_task,
+                target_num=target_num if flow == FlowType.ROLLBACK else step.num,
+                target_task=target_task,
+                condition=condition,
+                gateway_name=question or "Результат принят?",
+                success_label=success,
+            )
+        )
+    return blueprint
+def _parallel_blocks(steps: List[Any]) -> List[BlueprintParallel]:
+    """«Параллельно» присоединяет шаг к предыдущему. Развилка в блок не входит.
+    Правило живёт в чертеже. Генератор потом не собирает AND заново из текста.
+    """
+    blocks: List[tuple] = []
+    for step in steps:
+        if getattr(step, "decision", None) is not None:
+            blocks.append(("decision", [step]))
+        elif step.parallel:
+            if step.fork_parallel or not blocks or blocks[-1][0] not in ("step", "parallel"):
+                blocks.append(("parallel", [step]))
+            elif blocks[-1][0] == "parallel":
+                blocks[-1][1].append(step)
+            else:
+                blocks[-1] = ("parallel", blocks[-1][1] + [step])
+        else:
+            blocks.append(("step", [step]))
+    result: List[BlueprintParallel] = []
+    for kind, group in blocks:
+        if kind != "parallel" or len(group) < 2:
+            continue
+        nums = [item.num for item in group]
+        result.append(
+            BlueprintParallel(
+                nums=nums,
+                roles=list(dict.fromkeys(item.role for item in group if item.role)),
+                id=f"P{len(result) + 1}",
+                task_ids=[f"T{num}" for num in nums],
+                flow_type=FlowType.PARALLEL,
+            )
+        )
+    return result
+@dataclass
+class _EmitUnit:
+    kind: str
+    tasks: List[BlueprintTask]
+    name: str = ""
+    decision_num: Optional[int] = None
+    @property
+    def role(self) -> str:
+        return self.tasks[0].role if self.tasks else ""
+def _layout_units(blueprint: ProcessBlueprint) -> List[_EmitUnit]:
+    """Порядок блоков схемы строго из чертежа: шаг, развилка, AND, подпроцесс этапа."""
+    decisions = {item.num: item for item in blueprint.decisions}
+    block_of = {}
+    for block in blueprint.parallel_blocks:
+        for num in block.nums:
+            block_of[num] = block
+    pinned = set()
+    for decision in blueprint.decisions:
+        if decision.yes_num is not None:
+            pinned.add(decision.yes_num)
+        if decision.no_num is not None and decision.flow == FlowType.ROLLBACK:
+            pinned.add(decision.no_num)
+    for item in blueprint.reworks:
+        if item.type == FlowType.ROLLBACK and item.target_num is not None:
+            pinned.add(item.target_num)
+    for task in blueprint.tasks:
+        if task.back_num is not None:
+            pinned.add(task.back_num)
+    units: List[_EmitUnit] = []
+    consumed = set()
+    task_by = {task.num: task for task in blueprint.tasks}
+    for num in sorted(set(task_by) | set(decisions)):
+        if num in consumed:
+            continue
+        block = block_of.get(num)
+        if block is not None and num == block.nums[0]:
+            members = [item for item in blueprint.tasks if item.num in set(block.nums)]
+            members.sort(key=lambda item: block.nums.index(item.num))
+            units.append(_EmitUnit("parallel", members))
+            consumed.update(item.num for item in members)
+            continue
+        task = task_by.get(num)
+        if num in decisions:
+            units.append(_EmitUnit("decision", [task] if task is not None else [], decision_num=num))
+        elif task is not None:
+            units.append(_EmitUnit("step", [task]))
+        consumed.add(num)
+    stage_marks: Dict[str, int] = {}
+    for task in blueprint.tasks:
+        if task.stage:
+            stage_marks[task.stage] = stage_marks.get(task.stage, 0) + 1
+    staged: List[_EmitUnit] = []
+    index = 0
+    while index < len(units):
+        unit = units[index]
+        stage = unit.tasks[0].stage if unit.kind == "step" and unit.tasks else None
+        if not stage:
+            staged.append(unit)
+            index += 1
+            continue
+        # Этап назван у одного шага («(этап «Диагностика»)») — отсюда он начинается и продолжается
+        # следующими шагами той же роли без своего этапа: до развилки, параллели, смены роли или нового этапа.
+        # Этап, отмеченный у нескольких шагов, перечислен явно — чужие шаги в него не добавляются.
+        carry = stage_marks.get(stage, 0) == 1
+        nxt = index + 1
+        while (
+            nxt < len(units)
+            and units[nxt].kind == "step"
+            and units[nxt].tasks
+            and (units[nxt].tasks[0].stage == stage or (carry and units[nxt].tasks[0].stage is None))
+            and units[nxt].role == unit.role
+            and units[nxt].tasks[0].num not in pinned
+        ):
+            nxt += 1
+        run = units[index:nxt]
+        # Возврат на первый шаг этапа = повтор этапа целиком: ребро ведёт на подпроцесс, шаг остаётся внутри.
+        # Цель возврата в середине этапа в подпроцесс не попадает — внутрь подпроцесса ребро не проходит
+        # (такие шаги уже отрезаны условием цикла выше).
+        if len(run) >= 2:
+            staged.append(_EmitUnit("subprocess", [task for item in run for task in item.tasks], name=stage))
+        else:
+            staged.extend(run)
+        index = nxt
+    return staged
+def _unit_index(units: List[_EmitUnit]) -> Dict[int, int]:
+    mapping: Dict[int, int] = {}
+    for index, unit in enumerate(units):
+        for task in unit.tasks:
+            mapping[task.num] = index
+    return mapping
+def _branch_targets(
+    index: int,
+    decision: BlueprintDecision,
+    rework: Optional[BlueprintRework],
+    n_units: int,
+    num_to_unit: Dict[int, int],
+) -> tuple:
+    """Куда ведут ветки развилки. Откат и исправление не подменяются завершением."""
+    nxt = index + 1 if index + 1 < n_units else "END"
+    def resolve(num: Optional[int]) -> Any:
+        if num is None or num not in num_to_unit:
+            return nxt
+        target = num_to_unit[num]
+        return nxt if target == index else target
+    if decision.yes_end:
+        yes = "END"
+    elif decision.yes_num is not None and decision.yes_num > decision.num:
+        yes = resolve(decision.yes_num)
+    else:
+        yes = nxt
+    flow = decision.flow
+    if flow == FlowType.ROLLBACK and rework is not None:
+        no = resolve(rework.target_num)
+    elif flow == FlowType.CORRECTION:
+        no = "FIX"
+    elif (flow == FlowType.TERMINATION and not decision.yes_end) or decision.no_end:
+        no = "END"
+    elif decision.no_num is not None and not (decision.no_num < decision.num):
+        no = resolve(decision.no_num)
+    elif decision.else_end:
+        no = "END"
+    else:
+        no = nxt
+    return yes, no
+def _flatten_units(blueprint: ProcessBlueprint, units: List[_EmitUnit]) -> List[_EmitUnit]:
+    """Шлюз с одной и той же целью обеих веток остаётся обычным шагом."""
+    decisions = {item.num: item for item in blueprint.decisions}
+    reworks = {item.check_num: item for item in blueprint.reworks}
+    mapping = _unit_index(units)
+    flat: List[_EmitUnit] = []
+    for index, unit in enumerate(units):
+        if unit.kind != "decision":
+            flat.append(unit)
+            continue
+        num = unit.decision_num if unit.decision_num is not None else (unit.tasks[0].num if unit.tasks else None)
+        decision = decisions.get(num) if num is not None else None
+        if decision is None:
+            flat.append(unit)
+            continue
+        yes, no = _branch_targets(index, decision, reworks.get(decision.num), len(units), mapping)
+        if yes == no:
+            if unit.tasks:
+                flat.append(_EmitUnit("step", unit.tasks))
+            continue
+        flat.append(unit)
+    return flat
+def compile_blueprint(blueprint: ProcessBlueprint) -> tuple:
+    """Код DIAGRAM только из полей чертежа. Исходный регламент сюда не передаётся."""
+    units = _flatten_units(blueprint, _layout_units(blueprint))
+    decisions = {item.num: item for item in blueprint.decisions}
+    reworks = {item.check_num: item for item in blueprint.reworks}
+    num_to_unit = _unit_index(units)
+    lane_var = {role: f"lane_{index}" for index, role in enumerate(blueprint.roles)}
+    def lane(role: str) -> str:
+        return lane_var.get(role) or "lane_0"
+    code: List[str] = [
+        f"# Сгенерировано семантическим эмулятором: {blueprint.title}",
+        "pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, "
+        + json.dumps(list(blueprint.roles), ensure_ascii=False)
+        + ")",
+    ]
+    code += [f"lane_{index} = lanes[{index}]" for index in range(len(blueprint.roles))]
+    def emit_task(var: str, task: BlueprintTask, parent: str) -> None:
+        func = "add_script_task" if task.task_type == TaskType.SCRIPT else "add_user_task"
+        code.append(f"{var} = DIAGRAM.{func}({task.title!r}, {parent})")
+        if task.hours is not None:
+            code.append(f"DIAGRAM.set_sla({var}, {round(float(task.hours), 3)})")
+    entry: List[str] = []
+    exits: List[str] = []
+    gateways: Dict[int, str] = {}
+    for index, unit in enumerate(units):
+        if unit.kind == "step":
+            var = f"n{index}"
+            emit_task(var, unit.tasks[0], lane(unit.role))
+            entry.append(var)
+            exits.append(var)
+        elif unit.kind == "decision":
+            num = unit.decision_num if unit.decision_num is not None else unit.tasks[0].num
+            decision = decisions[num]
+            gw = f"g{index}"
+            gate_lane = lane(decision.role or unit.role)
+            if unit.tasks:
+                var = f"n{index}"
+                emit_task(var, unit.tasks[0], lane(unit.role))
+                code.append(f"{gw} = DIAGRAM.add_exclusive_gateway({decision.question!r}, {gate_lane})")
+                if decision.gateway_hours is not None:
+                    code.append(f"DIAGRAM.set_sla({gw}, {decision.gateway_hours})")
+                code.append(f"DIAGRAM.add_link({var}, {gw})")
+                entry.append(var)
+            else:
+                code.append(f"{gw} = DIAGRAM.add_exclusive_gateway({decision.question!r}, {gate_lane})")
+                if decision.gateway_hours is not None:
+                    code.append(f"DIAGRAM.set_sla({gw}, {decision.gateway_hours})")
+                entry.append(gw)
+            exits.append(gw)
+            gateways[index] = gw
+        elif unit.kind == "parallel":
+            split, join = f"ps{index}", f"pj{index}"
+            block = next(
+                (
+                    item for item in blueprint.parallel_blocks
+                    if tuple(item.nums) == tuple(task.num for task in unit.tasks)
+                ),
+                None,
+            )
+            split_name = block.split_name if block is not None else "Параллельные работы"
+            join_name = block.join_name if block is not None else "Работы завершены"
+            code.append(f"{split} = DIAGRAM.add_parallel_gateway({split_name!r}, {lane(unit.role)})")
+            code.append(f"{join} = DIAGRAM.add_parallel_gateway({join_name!r}, {lane(unit.role)})")
+            for offset, task in enumerate(unit.tasks):
+                var = f"n{index}_{offset}"
+                emit_task(var, task, lane(task.role))
+                code.append(f"DIAGRAM.add_link({split}, {var})")
+                code.append(f"DIAGRAM.add_link({var}, {join})")
+            entry.append(split)
+            exits.append(join)
+        else:
+            sub = f"sp{index}"
+            code.append(f"{sub} = DIAGRAM.create_subprocess({unit.name!r}, {lane(unit.role)})")
+            prev = None
+            for offset, task in enumerate(unit.tasks):
+                var = f"n{index}_{offset}"
+                emit_task(var, task, sub)
+                if prev:
+                    code.append(f"DIAGRAM.add_link({prev}, {var})")
+                prev = var
+            entry.append(sub)
+            exits.append(sub)
+    end_expr = "ROOT_END_TASK_ID"
+    if not entry:
+        code.append("DIAGRAM.add_link(ROOT_START_TASK_ID, ROOT_END_TASK_ID)")
+    else:
+        code.append(f"DIAGRAM.add_link(ROOT_START_TASK_ID, {entry[0]})")
+    def as_expr(target: Any) -> str:
+        if target == "END":
+            return end_expr
+        return entry[target]
+    for index, unit in enumerate(units):
+        nxt = entry[index + 1] if index + 1 < len(units) else end_expr
+        if unit.kind != "decision":
+            code.append(f"DIAGRAM.add_link({exits[index]}, {nxt})")
+            continue
+        decision = decisions[unit.decision_num if unit.decision_num is not None else unit.tasks[0].num]
+        rework = reworks.get(decision.num)
+        gw = gateways[index]
+        yes, no = _branch_targets(index, decision, rework, len(units), num_to_unit)
+        if decision.flow == FlowType.CORRECTION and rework is not None:
+            fix = f"fix{index}"
+            code.append(
+                f"{fix} = DIAGRAM.add_user_task({rework.fix_task!r}, {lane(decision.role or unit.role)})"
+            )
+            code.append(f"DIAGRAM.add_link({gw}, {fix}, {decision.no_label!r})")
+            code.append(f"DIAGRAM.add_link({fix}, {entry[index]})")
+            code.append(f"DIAGRAM.add_link({gw}, {as_expr(yes)}, {decision.yes_label!r})")
+            continue
+        code.append(f"DIAGRAM.add_link({gw}, {as_expr(yes)}, {decision.yes_label!r})")
+        if no != yes:
+            code.append(f"DIAGRAM.add_link({gw}, {as_expr(no)}, {decision.no_label!r})")
+    info = {
+        "title": blueprint.title,
+        "steps": len(blueprint.tasks),
+        "roles": list(blueprint.roles),
+        "blocks": len(units),
+        "subprocesses": sum(1 for unit in units if unit.kind == "subprocess"),
+        "decisions": sum(1 for unit in units if unit.kind == "decision"),
+        "parallel_groups": sum(1 for unit in units if unit.kind == "parallel"),
+        "sla_hours": blueprint.sla_hours,
+    }
+    return "\n".join(code) + "\n", info
+def blueprint_prompt_block(regulation_text: str) -> str:
+    """Фрагмент промпта: модель строит циклы из чертежа, а не ищет их в тексте."""
+    blueprint = analyze_process(regulation_text)
+    body = json.dumps(blueprint.as_dict(), ensure_ascii=False, indent=2)
+    return (
+        "==================================================\n"
+        "PROCESS BLUEPRINT\n"
+        "==================================================\n\n"
+        "Семантический разбор уже выполнен кодом. Не ищи возвраты в тексте заново.\n"
+        "Roles, Tasks, Decisions, ParallelBlocks и Reworks ниже — обязательный чертёж.\n"
+        "type=rollback: не создавай задачу. Проверка → XOR → условие → существующая target_task.\n"
+        "type=correction: создай fix_task и DIAGRAM.add_link(fix_task, check_task).\n"
+        "Решение kind=end завершает процесс и циклом не является.\n\n"
+        + body
+    )
+def _work_nodes(diagram: Any) -> List[Any]:
+    kinds = {"task", "userTask", "scriptTask", "manualTask", "serviceTask", "sendTask", "receiveTask", "businessRuleTask"}
+    return [node for node in diagram.nodes.values() if node.kind in kinds]
+def _find_node(diagram: Any, title: str) -> Any:
+    from ai_generator import _sla_title_score
+    wanted = (title or "").strip()
+    exact = [node for node in _work_nodes(diagram) if (node.name or "").strip() == wanted]
+    if len(exact) == 1:
+        return exact[0]
+    best, score = None, 0
+    pool = exact or _work_nodes(diagram)
+    for node in pool:
+        got = _sla_title_score(title or "", node.name or "")
+        if got > score:
+            best, score = node, got
+    return best if score >= 2 else None
+def _reaches(diagram: Any, start: str, goal: str) -> bool:
+    seen = set()
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == goal and current != start:
+            return True
+        for link in diagram.links:
+            if link.source_id == current:
+                stack.append(link.target_id)
+    return False
+def _back_edge_count(diagram: Any) -> int:
+    count = 0
+    for link in diagram.links:
+        if link.source_id != link.target_id and _reaches(diagram, link.target_id, link.source_id):
+            count += 1
+    return count
+def _back_links(diagram: Any) -> List[Any]:
+    from ai_generator import _back_link_list
+    return _back_link_list(diagram)
+def _lands_on_target(diagram: Any, hit_id: str, target: Any, check: Any) -> bool:
+    """Обратное ребро попало в шаг N, в его подпроцесс или в блок, из которого шаг N ещё достижим.
+    Возврат на шлюз «Параллельные работы», из которого открывается п.11, — это возврат на п.11.
+    Возврат на более ранний шаг, из которого до проверки ещё надо пройти чужие пункты, сюда не входит:
+    обход останавливается на самой проверке.
+    """
+    if hit_id == target.id:
+        return True
+    node = diagram.nodes.get(hit_id)
+    if node is not None and node.kind == "subProcess":
+        from ai_generator import _owner_holds
+        if _owner_holds(diagram, target.id, hit_id):
+            return True
+    if check is None:
+        return False
+    seen = set()
+    stack = [hit_id]
+    while stack:
+        current = stack.pop()
+        if current in seen or current == check.id:
+            continue
+        seen.add(current)
+        if current == target.id:
+            return True
+        for link in diagram.links:
+            if link.source_id == current and link.target_id not in seen:
+                stack.append(link.target_id)
+    return False
+def _conditioned_return(diagram: Any, check: Any, source_id: str) -> bool:
+    """От проверки до источника обратного ребра есть XOR с подписанной веткой."""
+    seen = set()
+    stack = [check.id]
+    gates = []
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        node = diagram.nodes.get(current)
+        if node is not None and node.kind == "exclusiveGateway":
+            gates.append(node)
+        for link in diagram.links:
+            if link.source_id == current:
+                stack.append(link.target_id)
+    if source_id not in seen:
+        return False
+    for gate in gates:
+        outs = [link for link in diagram.links if link.source_id == gate.id and (link.condition_name or "").strip()]
+        if gate.id == source_id and outs:
+            return True
+        for link in outs:
+            if link.target_id == source_id or _reaches(diagram, link.target_id, source_id):
+                return True
+    return False
+def rollback_cycle_holds(diagram: Any, item: BlueprintRework) -> bool:
+    """Допустимый цикл rollback: проверка, XOR, ветка условия и путь на существующую target_task.
+    Новая задача исправления в этот цикл не входит. Прямое ребро на проверку его не заменяет.
+    """
+    check = _find_node(diagram, item.check_task)
+    target = _find_node(diagram, item.target_task)
+    if check is None or target is None:
+        return False
+    for link in _back_links(diagram):
+        if not _lands_on_target(diagram, link.target_id, target, check):
+            continue
+        if link.source_id != check.id and not _reaches(diagram, check.id, link.source_id):
+            continue
+        if _conditioned_return(diagram, check, link.source_id):
+            return True
+    return False
+def correction_cycle_holds(diagram: Any, item: BlueprintRework) -> bool:
+    """Допустимый цикл correction: проверка, XOR, задача исправления и возврат на ту же проверку.
+    Откат на другой пункт этот цикл не закрывает.
+    """
+    check = _find_node(diagram, item.check_task)
+    fix = _find_node(diagram, item.fix_task) if item.fix_task else None
+    if check is None or fix is None or fix.id == check.id:
+        return False
+    if not any(link.source_id == fix.id and link.target_id == check.id for link in diagram.links):
+        return False
+    gate = _exclusive_after(diagram, check)
+    if gate is None:
+        return _conditioned_return(diagram, check, fix.id)
+    labeled = [
+        link for link in diagram.links
+        if link.source_id == gate.id and (link.condition_name or "").strip()
+    ]
+    if not labeled:
+        return False
+    return any(link.target_id == fix.id for link in diagram.links if link.source_id == gate.id) or _reaches(
+        diagram, gate.id, fix.id
+    )
+def validate_rollback(diagram: Any, blueprint: ProcessBlueprint) -> List[str]:
+    gaps: List[str] = []
+    for item in blueprint.reworks:
+        if item.type != FlowType.ROLLBACK or rollback_cycle_holds(diagram, item):
+            continue
+        where = item.target_task or f"п.{item.target_num}"
+        gaps.append(f"«{item.source_phrase}»: нет отката на «{where}»")
+    return gaps
+def validate_correction(diagram: Any, blueprint: ProcessBlueprint) -> List[str]:
+    gaps: List[str] = []
+    for item in blueprint.reworks:
+        if item.type != FlowType.CORRECTION or correction_cycle_holds(diagram, item):
+            continue
+        gaps.append(f"«{item.source_phrase}»: нет исправления «{item.fix_task}» с возвратом на проверку")
+    return gaps
+def validate_reworks(diagram: Any, blueprint: ProcessBlueprint) -> List[str]:
+    """Проверка по типу: rollback ищет путь к шагу, correction — ребро исправления на проверку."""
+    return validate_rollback(diagram, blueprint) + validate_correction(diagram, blueprint)
+def _terminal_decisions(blueprint: ProcessBlueprint) -> List[BlueprintDecision]:
+    """Ветки завершения. Откат и исправление эту ветку не занимают."""
+    taken = {
+        item.check_num
+        for item in blueprint.reworks
+        if item.type in (FlowType.ROLLBACK, FlowType.CORRECTION)
+    }
+    found = []
+    for decision in blueprint.decisions:
+        if decision.num in taken:
+            continue
+        if (
+            decision.flow == FlowType.TERMINATION
+            or decision.kind == "end"
+            or decision.no_end
+            or decision.yes_end
+            or decision.else_end
+        ):
+            found.append(decision)
+    return found
+def _success_nums(diagram: Any, blueprint: ProcessBlueprint) -> List[int]:
+    """Номера шагов по положительным веткам. Откат, исправление и завершение сюда не входят."""
+    title_num = {task.title: task.num for task in blueprint.tasks}
+    yes_labels = {(decision.yes_label or "").strip() for decision in blueprint.decisions}
+    start = diagram.root_start_id if diagram.root_start_id in diagram.nodes else None
+    if start is None:
+        return []
+    nums: List[int] = []
+    current = start
+    seen = set()
+    while current and current not in seen:
+        seen.add(current)
+        node = diagram.nodes.get(current)
+        if node is None:
+            break
+        if node.name in title_num:
+            nums.append(title_num[node.name])
+        if node.kind == "subProcess":
+            # Шаги этапа идут внутри подпроцесса: от его старта до конца по единственному выходу.
+            inner = getattr(node, "inner_start_id", None)
+            if not any(link.source_id == inner for link in diagram.links):
+                # До лечения графа старт подпроцесса ещё не связан: первый шаг — без входящих рёбер.
+                targets = {link.target_id for link in diagram.links}
+                heads = sorted(
+                    (item for item in diagram.nodes.values()
+                     if item.owner_id == node.id and item.kind not in ("startEvent", "endEvent") and item.id not in targets),
+                    key=lambda item: item.order,
+                )
+                inner = heads[0].id if heads else None
+            guard = 0
+            while inner and guard < 60:
+                guard += 1
+                inner_node = diagram.nodes.get(inner)
+                if inner_node is None or inner_node.kind == "endEvent":
+                    break
+                if inner_node.name in title_num:
+                    nums.append(title_num[inner_node.name])
+                inner_outs = [link for link in diagram.links if link.source_id == inner]
+                inner = inner_outs[0].target_id if len(inner_outs) == 1 else None
+        outs = [link for link in diagram.links if link.source_id == current]
+        if not outs:
+            break
+        if node.kind == "exclusiveGateway" and len(outs) > 1:
+            continuing = [
+                link for link in outs
+                if diagram.nodes.get(link.target_id) is None
+                or diagram.nodes[link.target_id].kind != "endEvent"
+            ]
+            labeled = [link for link in continuing if (link.condition_name or "").strip() in yes_labels]
+            if labeled:
+                chosen = labeled[0]
+            elif continuing:
+                chosen = continuing[0]
+            else:
+                chosen = outs[0]
+            current = chosen.target_id
+            continue
+        if node.kind == "parallelGateway" and len(outs) > 1:
+            join_id = None
+            for link in outs:
+                branch = link.target_id
+                guard = 0
+                while branch and guard < 30:
+                    guard += 1
+                    branch_node = diagram.nodes.get(branch)
+                    if branch_node is None:
+                        break
+                    if branch_node.kind == "parallelGateway":
+                        join_id = branch
+                        break
+                    if branch_node.name in title_num:
+                        nums.append(title_num[branch_node.name])
+                    branch_outs = [item for item in diagram.links if item.source_id == branch]
+                    if len(branch_outs) != 1:
+                        break
+                    branch = branch_outs[0].target_id
+            if join_id is None:
+                break
+            join_outs = [link for link in diagram.links if link.source_id == join_id]
+            current = join_outs[0].target_id if join_outs else None
+            continue
+        if len(outs) == 1:
+            current = outs[0].target_id
+            continue
+        break
+    return nums
+def execution_gaps(diagram: Any, blueprint: ProcessBlueprint) -> List[str]:
+    """Расхождение BPMN с чертежом. Пустой список — схема исполнила чертёж."""
+    gaps: List[str] = []
+    work = _work_nodes(diagram)
+    corrections = [item for item in blueprint.reworks if item.type == FlowType.CORRECTION]
+    titles = {task.title for task in blueprint.tasks}
+    fix_names = {item.fix_task for item in corrections if item.fix_task}
+    if len(work) != len(blueprint.tasks) + len(corrections):
+        gaps.append(
+            f"задач {len(work)}, в чертеже {len(blueprint.tasks)} и исправлений {len(corrections)}"
+        )
+    for node in work:
+        if node.name not in titles and node.name not in fix_names:
+            gaps.append(f"Лишняя задача «{node.name}»")
+    by_title: Dict[str, List[Any]] = {}
+    for node in work:
+        by_title.setdefault(node.name, []).append(node)
+    for task in blueprint.tasks:
+        nodes = by_title.get(task.title) or []
+        if not nodes:
+            gaps.append(f"Потеряна задача №{task.num}")
+            continue
+        node = nodes[0]
+        lane = diagram.lanes.get(node.lane_id or "")
+        role = lane.name if lane is not None else ""
+        if role != (task.role or ""):
+            gaps.append(f"шаг {task.num}: роль «{role}» вместо «{task.role}»")
+        if task.hours is not None and node.sla_hours is not None:
+            if abs(float(node.sla_hours) - float(task.hours)) > 0.01:
+                gaps.append(f"шаг {task.num}: срок {node.sla_hours} вместо {task.hours}")
+    for item in blueprint.reworks:
+        if item.type == FlowType.ROLLBACK:
+            if item.fix_task:
+                gaps.append(f"rollback на шаге {item.check_num} содержит задачу исправления")
+            if not rollback_cycle_holds(diagram, item):
+                gaps.append(f"rollback на п.{item.target_num} не ведёт на существующий шаг")
+        elif item.type == FlowType.CORRECTION and not correction_cycle_holds(diagram, item):
+            gaps.append(f"correction «{item.fix_task}» не возвращается на проверку")
+    end_ids = {node.id for node in diagram.nodes.values() if node.kind == "endEvent"}
+    back_ids = {link.id for link in _back_links(diagram)}
+    terminal = _terminal_decisions(blueprint)
+    terminal_labels = set()
+    for decision in terminal:
+        if decision.yes_end:
+            terminal_labels.add((decision.yes_label or "").strip())
+        no_ends = decision.no_end or decision.else_end or (
+            decision.flow == FlowType.TERMINATION and not decision.yes_end
+        )
+        if no_ends:
+            terminal_labels.add((decision.no_label or "").strip())
+    xor_to_end = [
+        link for link in diagram.links
+        if link.target_id in end_ids
+        and (link.condition_name or "").strip() in terminal_labels
+        and diagram.nodes.get(link.source_id) is not None
+        and diagram.nodes[link.source_id].kind == "exclusiveGateway"
+    ]
+    if len(xor_to_end) != len(terminal):
+        gaps.append(f"веток завершения {len(xor_to_end)}, в чертеже {len(terminal)}")
+    if any(link.id in back_ids for link in xor_to_end):
+        gaps.append("termination записан циклом")
+    splits = [
+        node for node in diagram.nodes.values()
+        if node.kind == "parallelGateway"
+        and sum(1 for link in diagram.links if link.source_id == node.id) >= 2
+    ]
+    if len(splits) != len(blueprint.parallel_blocks):
+        gaps.append(f"параллельных блоков {len(splits)}, в чертеже {len(blueprint.parallel_blocks)}")
+    by_num = {task.num: task for task in blueprint.tasks}
+    for block in blueprint.parallel_blocks:
+        members = [_find_node(diagram, by_num[num].title) for num in block.nums if num in by_num]
+        if any(node is None for node in members) or not members:
+            gaps.append(f"параллельный блок {block.nums} не собран")
+            continue
+        held = False
+        for split in splits:
+            outs = {link.target_id for link in diagram.links if link.source_id == split.id}
+            if not all(node.id in outs for node in members):
+                continue
+            joins = set()
+            for node in members:
+                for link in diagram.links:
+                    if link.source_id != node.id:
+                        continue
+                    target = diagram.nodes.get(link.target_id)
+                    if target is not None and target.kind == "parallelGateway":
+                        joins.add(target.id)
+            held = len(joins) == 1
+            if held:
+                break
+        if not held:
+            gaps.append(f"параллельный блок {block.nums} не является AND split/join")
+    expected = [task.num for task in blueprint.tasks]
+    actual = _success_nums(diagram, blueprint)
+    if actual != expected:
+        gaps.append(f"порядок шагов {actual} вместо {expected}")
+    return gaps
+def xml_contract_gaps(xml: str, blueprint: ProcessBlueprint) -> List[str]:
+    """Каркас BPMN 2.0, который открывают bpmn.io и Camunda Modeler."""
+    gaps: List[str] = []
+    body = xml or ""
+    if "http://www.omg.org/spec/BPMN/20100524/MODEL" not in body:
+        gaps.append("нет пространства имён BPMN 2.0")
+    if "http://www.omg.org/spec/BPMN/20100524/DI" not in body:
+        gaps.append("нет пространства имён BPMNDI")
+    for token, label in (
+        ("bpmn:collaboration", "Collaboration"),
+        ("bpmn:participant", "Participant"),
+        ("bpmn:laneSet", "LaneSet"),
+        ("bpmn:sequenceFlow", "SequenceFlow"),
+        ("bpmndi:BPMNShape", "BPMNShape"),
+        ("bpmndi:BPMNEdge", "BPMNEdge"),
+    ):
+        if token not in body:
+            gaps.append(f"нет {label}")
+    if "bpmn:userTask" not in body and "bpmn:scriptTask" not in body and "bpmn:task" not in body:
+        gaps.append("нет задач")
+    if blueprint.decisions and "bpmn:exclusiveGateway" not in body:
+        gaps.append("нет ExclusiveGateway")
+    if blueprint.parallel_blocks and "bpmn:parallelGateway" not in body:
+        gaps.append("нет ParallelGateway")
+    return gaps
+def _exclusive_after(diagram: Any, check: Any) -> Any:
+    outs = [link for link in diagram.links if link.source_id == check.id]
+    if len(outs) != 1:
+        return None
+    nxt = diagram.nodes.get(outs[0].target_id)
+    if nxt is not None and nxt.kind == "exclusiveGateway":
+        return nxt
+    return None
+def _split_check(diagram: Any, check: Any, item: BlueprintRework) -> Any:
+    """Вставляет XOR на единственный выход проверки. Саму задачу, роль и срок не меняет."""
+    outs = [link for link in diagram.links if link.source_id == check.id]
+    if len(outs) != 1:
+        return None
+    parent = check.lane_id or check.parent_id or check.owner_id
+    gate_id = diagram.add_exclusive_gateway(item.gateway_name or "Результат принят?", parent)
+    gate = diagram.nodes.get(gate_id)
+    if gate is None:
+        return None
+    gate.sla_hours = 0.0
+    forward = outs[0]
+    saved_source, saved_label = forward.source_id, forward.condition_name
+    forward.source_id = gate_id
+    if not (forward.condition_name or "").strip():
+        forward.condition_name = item.success_label or "Дальше"
+    if not diagram.add_link(check.id, gate_id):
+        forward.source_id, forward.condition_name = saved_source, saved_label
+        diagram.nodes.pop(gate_id, None)
+        return None
+    return gate
+def _reuse_fix(diagram: Any, gate: Any, item: BlueprintRework) -> Any:
+    """Задача, которая уже стоит на ветке ошибки этого шлюза. Новую вместо неё не создаём."""
+    wanted = (item.condition or "").strip().lower()
+    for link in diagram.links:
+        if link.source_id != gate.id:
+            continue
+        label = (link.condition_name or "").strip().lower()
+        if wanted and wanted not in label and label not in wanted:
+            continue
+        node = diagram.nodes.get(link.target_id)
+        if node is None or node.kind in (
+            "exclusiveGateway", "parallelGateway", "inclusiveGateway", "startEvent", "endEvent",
+        ):
+            continue
+        return node
+    return None
+def _place_fix(diagram: Any, item: BlueprintRework, check: Any, target: Any) -> Any:
+    parent = target.lane_id or check.lane_id or target.parent_id
+    owner = diagram.nodes.get(target.owner_id)
+    if owner is not None and owner.kind == "subProcess":
+        parent = owner.id
+    fix_id = diagram.add_user_task(item.fix_task or "Устранить замечания", parent)
+    fix = diagram.nodes.get(fix_id)
+    if fix is not None and fix.sla_hours is None:
+        fix.sla_hours = 0.0
+    return fix
+def _ensure_rollback(diagram: Any, item: BlueprintRework, check: Any, target: Any) -> int:
+    """XOR и ветка на уже существующий шаг. Задачу исправления не создаёт."""
+    gate = _exclusive_after(diagram, check)
+    if gate is None:
+        gate = _split_check(diagram, check, item)
+    if gate is None:
+        return 0
+    if any(link.source_id == gate.id and link.target_id == target.id for link in diagram.links):
+        for link in diagram.links:
+            if link.source_id == gate.id and link.target_id == target.id and not (link.condition_name or "").strip():
+                link.condition_name = item.condition or "Замечания"
+        return 0
+    linked = diagram.add_link(gate.id, target.id, item.condition or "Замечания")
+    return 1 if linked else 0
+def _ensure_correction(diagram: Any, item: BlueprintRework, check: Any) -> int:
+    """Недостающие XOR, задачу исправления и ребро fix → check."""
+    gate = _exclusive_after(diagram, check)
+    if gate is None:
+        gate = _split_check(diagram, check, item)
+    if gate is None:
+        return 0
+    fix = _find_node(diagram, item.fix_task) if item.fix_task else None
+    if fix is None or fix.id in (check.id, gate.id):
+        fix = _reuse_fix(diagram, gate, item)
+    created = False
+    if fix is None or fix.id in (check.id, gate.id):
+        fix = _place_fix(diagram, item, check, check)
+        created = fix is not None
+    if fix is None or fix.id == check.id:
+        return 0
+    branch = [link for link in diagram.links if link.source_id == gate.id and link.target_id == fix.id]
+    if branch:
+        if not (branch[0].condition_name or "").strip():
+            branch[0].condition_name = item.condition or "Замечания"
+    elif not diagram.add_link(gate.id, fix.id, item.condition or "Замечания"):
+        return 0
+    if any(link.source_id == fix.id and link.target_id == check.id for link in diagram.links):
+        return 1 if created else 0
+    linked = diagram.add_link(fix.id, check.id)
+    return 1 if linked else 0
+def _freeze_nodes(diagram: Any) -> Dict[str, tuple]:
+    return {
+        node.id: (node.name, node.lane_id, node.sla_hours, getattr(node, "sla_source", None))
+        for node in diagram.nodes.values()
+    }
+def _restore_nodes(diagram: Any, frozen: Dict[str, tuple]) -> None:
+    for node_id, signature in frozen.items():
+        node = diagram.nodes.get(node_id)
+        if node is None:
+            continue
+        node.name, node.lane_id, node.sla_hours, source = signature
+        if source is not None:
+            node.sla_source = source
+def normalize_rollbacks(diagram: Any, blueprint: ProcessBlueprint) -> int:
+    """Достраивает откат по чертежу. Текст не читает, задачу исправления не создаёт."""
+    items = [item for item in blueprint.reworks if item.type == FlowType.ROLLBACK]
+    if not items:
+        return 0
+    before = set(diagram.nodes)
+    frozen = _freeze_nodes(diagram)
+    added = 0
+    for item in items:
+        if rollback_cycle_holds(diagram, item):
+            continue
+        check = _find_node(diagram, item.check_task)
+        target = _find_node(diagram, item.target_task)
+        if check is None or target is None or check.id == target.id:
+            continue
+        added += _ensure_rollback(diagram, item, check, target)
+    _restore_nodes(diagram, frozen)
+    for node_id in list(diagram.nodes):
+        if node_id in before:
+            continue
+        node = diagram.nodes[node_id]
+        if node.kind not in ("exclusiveGateway", "inclusiveGateway"):
+            diagram.nodes.pop(node_id, None)
+            diagram.links[:] = [
+                link for link in diagram.links
+                if link.source_id != node_id and link.target_id != node_id
+            ]
+    return added
+def normalize_corrections(diagram: Any, blueprint: ProcessBlueprint) -> int:
+    """Достраивает исправление по чертежу. Текст не читает. Чужие задачи, роли и сроки не меняет."""
+    items = [item for item in blueprint.reworks if item.type == FlowType.CORRECTION]
+    if not items:
+        return 0
+    frozen = _freeze_nodes(diagram)
+    added = 0
+    for item in items:
+        if correction_cycle_holds(diagram, item):
+            continue
+        check = _find_node(diagram, item.check_task)
+        if check is None:
+            continue
+        added += _ensure_correction(diagram, item, check)
+    _restore_nodes(diagram, frozen)
+    return added
+def apply_blueprint(diagram: Any, blueprint: ProcessBlueprint) -> int:
+    """Единственный вход нормализатора. На входе уже готовый чертёж, не регламент."""
+    return normalize_rollbacks(diagram, blueprint) + normalize_corrections(diagram, blueprint)
+def normalize_reworks(diagram: Any, regulation_text: str) -> int:
+    """Граница совместимости: текст разбирает analyze_process, нормализатор видит только чертёж."""
+    if not (regulation_text or "").strip():
+        return 0
+    return apply_blueprint(diagram, analyze_process(regulation_text))
+def blueprint_invariants(blueprint: ProcessBlueprint) -> List[str]:
+    """Нарушения модели чертежа. Пустой список — чертёж допустим."""
+    gaps: List[str] = []
+    nums = [task.num for task in blueprint.tasks]
+    if nums != sorted(nums):
+        gaps.append("порядок шагов нарушен")
+    seen = set()
+    for task in blueprint.tasks:
+        if not (task.role or "").strip():
+            gaps.append(f"шаг {task.num} без роли")
+        key = (task.num, task.title)
+        if key in seen:
+            gaps.append(f"дубликат шага {task.num}")
+        seen.add(key)
+    rework_checks = {item.check_num for item in blueprint.reworks}
+    for decision in blueprint.decisions:
+        if decision.kind == "end" and decision.num in rework_checks:
+            gaps.append(f"завершение на шаге {decision.num} записано как цикл")
+    for item in blueprint.reworks:
+        if item.type == FlowType.TERMINATION:
+            gaps.append("termination попал в список возвратов")
+        if item.type == FlowType.ROLLBACK:
+            if item.fix_task:
+                gaps.append(f"rollback на шаге {item.check_num} содержит задачу исправления")
+            if item.target_num is None or item.check_num is None or item.target_num >= item.check_num:
+                gaps.append(f"rollback на шаге {item.check_num} смотрит не на предыдущий шаг")
+            if not item.target_task:
+                gaps.append(f"rollback на шаге {item.check_num} без целевой задачи")
+        if item.type == FlowType.CORRECTION and not item.fix_task:
+            gaps.append(f"correction на шаге {item.check_num} без задачи исправления")
+    return gaps
+def repair_missing_rework_edges(diagram: Any, regulation_text: str) -> int:
+    """Совместимое имя: нормализует цикл, а не только дорисовывает fix → check."""
+    return normalize_reworks(diagram, regulation_text)
