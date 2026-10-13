@@ -150,3 +150,24 @@ def test_prompt_knows_terminate_and_lane_rule():
     prompt = gen.build_prompt(EX2)
     assert "add_terminate_end_event" in prompt
     assert "Документы, договоры" in prompt
+
+
+def test_vanya_223fz_conditional_actions_and_named_return():
+    """Стресс-тест Вани (223-ФЗ): «Если X — сделать Y» и «возврат на повторную переторжку» не теряются."""
+    from process_blueprint import analyze_process
+
+    text = (ROOT / "stress_tests" / "10_vanya_223fz_turbines.txt").read_text(encoding="utf-8")
+    blueprint = analyze_process(text)
+    actions = {d.num: (d.yes_action, d.yes_action_stop) for d in blueprint.decisions if d.yes_action}
+    assert actions[4] == ("Отклонить заявку и опубликовать протокол отказа", True)
+    assert actions[5][1] is False  # требование обеспечения — мера, процесс продолжается
+    assert actions[10] == ("Наложить вето и прекратить торги", True)
+    assert actions[11][1] is True  # «не подписал» — отказная ветка
+    assert [(r.check_num, r.target_num) for r in blueprint.reworks] == [(8, 7)]
+    xml, audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not err
+    assert len(audit["rework_loops"]) == 1
+    assert xml.count("terminateEventDefinition") == 3
+    assert xsd_errors_xml(xml) == [] and _validate_xml(xml) == [] and _diagonals(xml) == 0
+    _opt, delta = gen.optimize_process_to_be(text, audit)
+    assert delta["sla_after_hours"] <= delta["sla_before_hours"]  # параллель не удваивает путь

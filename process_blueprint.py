@@ -17,7 +17,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class FlowType(str, Enum):
@@ -66,6 +66,9 @@ class BlueprintDecision:
     else_end: bool = False
     id: str = ""
     gateway_hours: Optional[float] = None
+    # «Если X — сделать Y» без номера пункта: Y — задача на ветке «Да». stop — ветка заканчивается отказом.
+    yes_action: str = ""
+    yes_action_stop: bool = False
 
     @property
     def yes_target(self) -> Optional[int]:
@@ -213,6 +216,72 @@ def _backward_target(step: Any) -> Optional[int]:
         if backward:
             return max(backward)
     return None
+
+
+def _named_rollback(step: Any, by_num: Dict[int, Any]) -> Optional[int]:
+    """«Если нет — возврат на повторную переторжку»: номера нет, но фраза возврата называет предмет шага N.
+
+    Парсер вывел цель по смыслу (no_ref) — принимаем её как откат, только если слово возврата явное и
+    у фразы с названием шага N есть общая основа (≥6 букв). «Вернуть на доработку» сюда не попадает:
+    это исправление, а не повтор названного шага.
+    """
+    from ai_generator import _EXPLICIT_RETURN_RE
+
+    decision = getattr(step, "decision", None)
+    num = getattr(step, "num", None)
+    if decision is None or num is None or not getattr(decision, "no_back", False):
+        return None
+    target = decision.no_ref
+    clause = decision.back_clause or ""
+    if target is None or target >= num or target not in by_num or not _EXPLICIT_RETURN_RE.search(clause):
+        return None
+    if re.search(r"доработ|исправ|устран|замечан", clause, re.I):
+        return None
+
+    def stems(text: str) -> set:
+        return {w[:6] for w in re.findall(r"[а-яё]{6,}", (text or "").lower())} - {"возвра", "повтор", "вернут"}
+
+    return target if stems(clause) & stems(by_num[target].title) else None
+
+
+_COND_ACTION_RE = re.compile(r"(?:^|[.;]\s*|:\s*)[Ее]сли\s+(?P<cond>[^—–]+?)\s*[—–]\s*(?P<act>[^.;]+)")
+_NOT_AN_ACTION_RE = re.compile(
+    r"^(?:перейти|вернуть|возврат|завершить\s+процесс|процесс\s+завершается|иначе)\b", re.I
+)
+_STOP_ACTION_RE = re.compile(r"отклон|отказ|прекрат|вето|аннулир|останов", re.I)
+
+
+def conditional_action(step: Any) -> Optional[Tuple[str, str, bool]]:
+    """«Если X — сделать Y» без «перейти к п.N»: (условие, действие, ветка-отказ?).
+
+    Раньше действие Y выбрасывалось, а развилка схлопывалась: терялись шаги «отклонить заявку»,
+    «направить сведения в ФАС». Отрицательное условие («не соответствует», «не подписал») или
+    действие-отказ («отклонить», «прекратить», «вето») заканчивают ветку событием останова.
+    """
+    decision = getattr(step, "decision", None)
+    if decision is None or decision.yes_ref is not None:
+        return None
+    match = _COND_ACTION_RE.search(getattr(decision, "source", "") or "")
+    if not match:
+        return None
+    cond = re.sub(r"\s+", " ", match.group("cond")).strip(" ,")
+    act = re.sub(r"\([^)]*\)", " ", match.group("act"))
+    act = re.sub(r"\s+", " ", act).strip(" ,")
+    if len(act) < 6 or _NOT_AN_ACTION_RE.search(act) or re.search(r"заверш", act, re.I):
+        return None  # «отказать и завершить процесс» — обычная ветка завершения, без отдельной задачи
+    words = act.split()
+    title = act[:1].upper() + act[1:]
+    if len(title) > 80:
+        title = " ".join(words[:12])[:80].rstrip(" ,") + "…"
+    stop = bool(decision.yes_end or _STOP_ACTION_RE.search(act) or re.search(r"\bне\s+\w+", cond, re.I))
+    return cond, title, stop
+
+
+def _question(cond: str) -> str:
+    text = cond[:1].upper() + cond[1:]
+    if len(text) > 70:
+        text = text[:70].rsplit(" ", 1)[0]
+    return text.rstrip(" ,?") + "?"
 
 
 def clause_intent(text: str) -> Optional[FlowType]:
@@ -366,6 +435,7 @@ def analyze_process(regulation_text: str) -> ProcessBlueprint:
         if step.decision is None and not _step_is_rework(step):
             continue
         flow = classify_flow(step)
+        named_back = _named_rollback(step, by_num) if flow is None or flow == FlowType.NORMAL else None
         if step.decision is not None:
             question = (step.decision.yes_label or "Условие").rstrip("?") + "?"
             decision = step.decision
@@ -377,7 +447,11 @@ def analyze_process(regulation_text: str) -> ProcessBlueprint:
                     no_label=decision.no_label,
                     kind=_decision_kind(step),
                     role=step.role or "",
-                    flow=flow if flow in (FlowType.ROLLBACK, FlowType.CORRECTION, FlowType.TERMINATION) else FlowType.NORMAL,
+                    flow=(
+                        FlowType.ROLLBACK
+                        if named_back is not None
+                        else (flow if flow in (FlowType.ROLLBACK, FlowType.CORRECTION, FlowType.TERMINATION) else FlowType.NORMAL)
+                    ),
                     yes_num=decision.yes_ref,
                     no_num=decision.no_ref,
                     yes_end=bool(decision.yes_end),
@@ -391,6 +465,12 @@ def analyze_process(regulation_text: str) -> ProcessBlueprint:
                     id=f"D{step.num}",
                 )
             )
+            action = conditional_action(step) if blueprint.decisions[-1].flow in (FlowType.NORMAL, FlowType.TERMINATION) else None
+            if action is not None:
+                cond, title, stop = action
+                made = blueprint.decisions[-1]
+                made.yes_action, made.yes_action_stop = title, stop
+                made.question, made.yes_label, made.no_label = _question(cond), "Да", "Нет"
         elif flow == FlowType.ROLLBACK:
             blueprint.decisions.append(
                 BlueprintDecision(
@@ -406,10 +486,12 @@ def analyze_process(regulation_text: str) -> ProcessBlueprint:
                     gateway_hours=0.0,
                 )
             )
+        if named_back is not None:
+            flow = FlowType.ROLLBACK
         if flow not in (FlowType.ROLLBACK, FlowType.CORRECTION):
             continue
         decision = step.decision
-        target_num = _backward_target(step)
+        target_num = named_back if named_back is not None else _backward_target(step)
         if flow == FlowType.ROLLBACK and target_num is None:
             earlier = [item for item in steps if item.num < step.num]
             if earlier:
@@ -635,7 +717,7 @@ def _flatten_units(blueprint: ProcessBlueprint, units: List[_EmitUnit]) -> List[
             flat.append(unit)
             continue
         yes, no = _branch_targets(index, decision, reworks.get(decision.num), len(units), mapping)
-        if yes == no:
+        if yes == no and not decision.yes_action:
             if unit.tasks:
                 flat.append(_EmitUnit("step", unit.tasks))
             continue
@@ -752,6 +834,22 @@ def compile_blueprint(blueprint: ProcessBlueprint) -> tuple:
         rework = reworks.get(decision.num)
         gw = gateways[index]
         yes, no = _branch_targets(index, decision, rework, len(units), num_to_unit)
+        if decision.yes_action:
+            # «Если X — сделать Y»: Y — задача на ветке «Да», затем останов (отказ) или основной поток.
+            act = f"ya{index}"
+            role_lane = lane(decision.role or unit.role)
+            code.append(f"{act} = DIAGRAM.add_user_task({decision.yes_action!r}, {role_lane})")
+            code.append(f"DIAGRAM.add_link({gw}, {act}, {decision.yes_label!r})")
+            if decision.yes_action_stop:
+                stop = f"te{index}"
+                code.append(f"{stop} = DIAGRAM.add_terminate_end_event('Процесс прекращён', {role_lane})")
+                code.append(f"DIAGRAM.add_link({act}, {stop})")
+                if no == "END" and index + 1 < len(units):
+                    no = index + 1
+            else:
+                code.append(f"DIAGRAM.add_link({act}, {as_expr(index + 1 if index + 1 < len(units) else 'END')})")
+            code.append(f"DIAGRAM.add_link({gw}, {as_expr(no)}, {decision.no_label!r})")
+            continue
         if index + 1 < len(units) and (yes == "END") != (no == "END"):
             # «Если подрядчик неблагонадёжен — завершить процесс» посреди регламента — это отказ,
             # а не успешный финал: событие останова в дорожке проверяющего. Успех — в ROOT_END.
