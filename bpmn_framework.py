@@ -41,7 +41,7 @@ TASK_H_MAX = 150.0             # длинное название — блок в
 GATEWAY_S = 50.0
 EVENT_S = 36.0
 SUBPROCESS_MIN_W, SUBPROCESS_MIN_H = 560.0, 240.0
-COLUMN_GAP_X = 84.0            # зазор между колонками слоёв на верхнем уровне
+COLUMN_GAP_X = 72.0            # зазор между колонками: плотнее, без «пустых зон»
 SUB_PAD_X = 56.0               # горизонтальный padding внутри подпроцесса
 SUB_PAD_TOP = 64.0             # место под заголовок подпроцесса
 SUB_PAD_BOTTOM = 44.0
@@ -67,6 +67,7 @@ REWORK_PAD = 20.0              # запас U-петли возврата за �
 POOL_REWORK_PAD = 18.0         # отступ U-петли от нижней границы пула
 
 BUS_FACTOR_THRESHOLD = 0.45
+CHAIN_THRESHOLD = 4  # анти-метро: больше N шагов одной роли подряд
 
 # --------------------------------------------------------------------------- #
 # BPMN in Color
@@ -87,6 +88,8 @@ LANE_COLORS = (("#1565C0", "#F4F8FD"), ("#1565C0", "#FFFFFF"))
 GROUP_COLORS = ("#64748B", "#F8FAFC")
 EDGE_COLOR = "#64748B"
 REWORK_EDGE_COLOR = "#C62828"
+CRITICAL_PATH_EDGE_COLOR = "#E65100"
+IMPROVED_PATH_EDGE_COLOR = "#2E7D32"
 
 GATEWAY_KINDS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway"}
 EVENT_KINDS = {"startEvent", "endEvent"}
@@ -286,9 +289,11 @@ class FlowNode:
     y: float = 0.0
     order: int = 0
     sla_hours: Optional[float] = None
+    sla_source: Optional[str] = None
     inner_start_id: Optional[str] = None
     inner_end_id: Optional[str] = None
     label_rect: Optional[Rect] = None
+    terminate: bool = False  # endEvent с terminateEventDefinition: досрочный останов (отказ, брак, вето)
 
 
 @dataclass
@@ -374,6 +379,8 @@ class BPMNDiagramBuilder:
         self.warnings: List[str] = []
         self.skipped_links: List[Dict[str, str]] = []
         self.healed: List[str] = []
+        self.critical_path_ids: Set[str] = set()
+        self.highlight_improved: bool = False
 
         self._seq: Dict[str, int] = defaultdict(int)
         self._used_ids: Set[str] = set()
@@ -419,6 +426,13 @@ class BPMNDiagramBuilder:
         node = self.nodes.get(pid)
         if node is not None and node.kind == "subProcess":
             return node.id, node.lane_id, node.group_id
+        if node is not None:
+            # LLM передала задачу или шлюз вместо дорожки («add_exclusive_gateway("…?", t5)»):
+            # ставим узел рядом с ним, в ту же роль, а не в первую дорожку пула.
+            self.warnings.append(
+                f"parent_id={pid!r} — узел потока, не дорожка: новый узел размещён в его дорожке (self-healing)."
+            )
+            return node.owner_id, node.lane_id, node.group_id
         if pid in self.pools:
             pool = self.pools[pid]
             return pool.process_id, (pool.lane_ids[0] if pool.lane_ids else None), None
@@ -633,6 +647,15 @@ class BPMNDiagramBuilder:
     def add_end_event(self, name: str, parent_id: str, node_id: Optional[str] = None) -> str:
         return self._register_node(name, "endEvent", parent_id, "Event", node_id=node_id)
 
+    def add_terminate_end_event(self, name: str, parent_id: str) -> str:
+        """Досрочное завершение (отказ СБ, брак, вето) — в дорожке проверяющего.
+
+        Успешный финал по-прежнему сходится в ROOT_END_TASK_ID: контракт песочницы не меняется.
+        """
+        node_id = self._register_node(name or "Процесс прекращён", "endEvent", parent_id, "Event")
+        self.nodes[node_id].terminate = True
+        return node_id
+
     def subprocess_entry(self, subprocess_id: str) -> Optional[str]:
         node = self.nodes.get(subprocess_id)
         return node.inner_start_id if node else None
@@ -648,6 +671,7 @@ class BPMNDiagramBuilder:
             return
         try:
             node.sla_hours = max(0.0, float(hours))
+            node.sla_source = "regulation"
         except (TypeError, ValueError):
             self.warnings.append(f"set_sla: некорректное значение {hours!r}.")
 
@@ -1071,6 +1095,19 @@ class BPMNDiagramBuilder:
                     cx = x1 + (x2 - x1) * f
                     top = y + LABEL_LIFT - 4 + tier
                     below.append((cx - w / 2, top, cx + w / 2, top + h))
+        # Отрезок короче подписи (шлюз вплотную к высокому подпроцессу): центрированная подпись
+        # въезжает в соседний блок — запасной вариант прижать её к концу или началу отрезка.
+        for a, b in horizontal:
+            x1, x2, y = min(a[0], b[0]), max(a[0], b[0]), a[1]
+            if x2 - x1 >= w:
+                continue
+            for tier in (0.0, 18.0, 36.0):
+                lift = y - LABEL_LIFT - 2 - tier
+                above.append((x2 - 4 - w, lift - h, x2 - 4, lift))
+                above.append((x1 + 4, lift - h, x1 + 4 + w, lift))
+                drop = y + LABEL_LIFT - 4 + tier
+                below.append((x2 - 4 - w, drop, x2 - 4, drop + h))
+                below.append((x1 + 4, drop, x1 + 4 + w, drop + h))
         # Стрелка-обход «понизу» (U-маршрут возврата ниже обоих концов): подпись под линией — над ней
         # она упирается в блоки, мимо которых идёт обход, и читается как их подпись.
         goes_under = bool(horizontal) and points and horizontal[0][0][1] > max(points[0][1], points[-1][1]) + 0.01
@@ -1354,6 +1391,12 @@ class BPMNDiagramBuilder:
             overlap = sum(_overlap_len(s, p) > 6.0 for s in segs for p in placed)
             length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in segs)
             cost = (len(path) - 2) * 15.0 + length * 0.02 + overlap * 40.0 + hits * 1000.0
+            if is_back:
+                # Компактный loop-back: длинная красная дуга через весь пул дороже короткой U-петли.
+                cost += length * 0.06
+                bottom = max(p[1] for p in path)
+                local_floor = max(src.y + src.height, tgt.y + tgt.height)
+                cost += max(0.0, bottom - local_floor - REWORK_PAD) * 0.45
             if cost < best_cost:
                 best, best_cost = path, cost
         if best is None:
@@ -1373,6 +1416,8 @@ class BPMNDiagramBuilder:
             value = self._critical_path(node.id, node.inner_start_id, memo)[0]
         else:
             value = DEFAULT_HOURS.get(node.kind, 1.0)
+            if not getattr(node, "sla_source", None):
+                node.sla_source = "default"
         memo[node.id] = value
         return value
 
@@ -1431,6 +1476,187 @@ class BPMNDiagramBuilder:
         path.reverse()
         return -dist[best], path
 
+    def _role_schedule(
+        self, owner_id: str, start_id: Optional[str], back: Set[str], memo: Dict[str, float],
+    ) -> Tuple[float, bool]:
+        """Срок с учётом ролей: список-расписание на том же графе, что голый путь, без обратных рёбер.
+
+        Параллельные ветки идут одновременно только при разных ролях. Exclusive — альтернативы,
+        в итог берётся самый длинный сценарий. Это не замена Беллмана — Форда.
+        """
+        nodes = self._children(owner_id)
+        if not nodes:
+            return 0.0, False
+        ids = [n.id for n in nodes]
+        hours = {n.id: self._node_hours(n, memo) for n in nodes}
+        roles: Dict[str, Optional[str]] = {}
+        for n in nodes:
+            if n.kind not in WORK_KINDS:
+                roles[n.id] = None
+            elif n.lane_id in self.lanes and (self.lanes[n.lane_id].name or "").strip():
+                roles[n.id] = self.lanes[n.lane_id].name.strip()
+            else:
+                roles[n.id] = "без роли"
+        scope = set(ids)
+        forward = [(l.source_id, l.target_id) for l in self._scope_links(scope) if l.id not in back]
+        succ: Dict[str, List[str]] = defaultdict(list)
+        pred: Dict[str, List[str]] = defaultdict(list)
+        for u, v in forward:
+            succ[u].append(v)
+            pred[v].append(u)
+        if start_id in scope:
+            sources = [start_id]
+        else:
+            sources = [n for n in ids if not pred[n]]
+
+        def _reach(edges: Sequence[Tuple[str, str]]) -> Set[str]:
+            out: Dict[str, List[str]] = defaultdict(list)
+            for u, v in edges:
+                out[u].append(v)
+            seen: Set[str] = set()
+            stack = list(sources)
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(out.get(cur, []))
+            return seen
+
+        def _bare(edges: Sequence[Tuple[str, str]], live: Set[str]) -> float:
+            live_edges = [(u, v) for u, v in edges if u in live and v in live]
+            src = {nid: hours[nid] for nid in sources if nid in live}
+            if not src:
+                return 0.0
+            dist, _pred = self._bellman_ford_longest(list(live), live_edges, hours, src)
+            finite = [d for d in dist.values() if d != float("inf")]
+            if not finite:
+                return 0.0
+            return -min(finite)
+
+        def _makespan(edges: Sequence[Tuple[str, str]]) -> Tuple[float, bool]:
+            live = _reach(edges)
+            out: Dict[str, List[str]] = defaultdict(list)
+            inn: Dict[str, List[str]] = defaultdict(list)
+            for u, v in edges:
+                if u in live and v in live:
+                    out[u].append(v)
+                    inn[v].append(u)
+            tails: Dict[str, float] = {}
+
+            def _tail(nid: str, stack: Set[str]) -> float:
+                if nid in tails:
+                    return tails[nid]
+                if nid in stack:
+                    tails[nid] = hours[nid]
+                    return tails[nid]
+                stack.add(nid)
+                best = max((_tail(w, stack) for w in out.get(nid, [])), default=0.0)
+                stack.remove(nid)
+                tails[nid] = hours[nid] + best
+                return tails[nid]
+
+            for nid in live:
+                _tail(nid, set())
+            finish: Dict[str, float] = {}
+            role_free: Dict[str, float] = defaultdict(float)
+            pending = set(live)
+            guard = 0
+            while pending and guard <= len(ids) + 2:
+                guard += 1
+                ready = []
+                for nid in pending:
+                    if any(p not in finish for p in inn.get(nid, [])):
+                        continue
+                    pred_done = max((finish[p] for p in inn.get(nid, [])), default=0.0)
+                    role = roles[nid]
+                    start = pred_done if role is None else max(pred_done, role_free[role])
+                    ready.append((start, -tails.get(nid, 0.0), nid, role))
+                if not ready:
+                    break
+                moment = min(item[0] for item in ready)
+                ready = [item for item in ready if abs(item[0] - moment) < 1e-9]
+                ready.sort(key=lambda item: (item[1], item[2]))
+                start, _, nid, role = ready[0]
+                done = start + hours[nid]
+                finish[nid] = done
+                if role is not None:
+                    role_free[role] = done
+                pending.remove(nid)
+            computed = max(finish.values(), default=0.0)
+            if pending:
+                return max(computed, _bare(edges, live)), True
+            return computed, False
+
+        estimate = False
+        splits: List[Tuple[str, List[str]]] = []
+        for n in nodes:
+            outs = succ.get(n.id, [])
+            if len(outs) < 2:
+                continue
+            if n.kind == "inclusiveGateway":
+                estimate = True
+            elif n.kind == "exclusiveGateway":
+                splits.append((n.id, list(outs)))
+        count = 1
+        for _, outs in splits:
+            count *= len(outs)
+        def _from(origin: str) -> Set[str]:
+            seen: Set[str] = set()
+            stack = [origin]
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(succ.get(cur, []))
+            return seen
+
+        if count > 64:
+            estimate = True
+            chosen: Dict[str, str] = {}
+            for gid, outs in splits:
+                reach = [_from(t) for t in outs]
+                # Узел, доступный из другой ветки того же шлюза, — это слияние, его часы в сумму ветки не входят.
+                scores = []
+                for i, tgt in enumerate(outs):
+                    others: Set[str] = set()
+                    for j, got in enumerate(reach):
+                        if j != i:
+                            others |= got
+                    branch = {tgt} | {x for x in reach[i] if x not in others}
+                    scores.append((
+                        sum(hours[x] for x in branch if roles[x] is not None),
+                        tgt,
+                    ))
+                scores.sort(key=lambda item: (-item[0], item[1]))
+                chosen[gid] = scores[0][1]
+            edges = [
+                (u, v) for u, v in forward
+                if u not in chosen or v == chosen[u]
+            ]
+            span, _incomplete = _makespan(edges)
+            return round(span, 2), True
+
+        if not splits:
+            span, incomplete = _makespan(forward)
+            return round(span, 2), estimate or incomplete
+
+        from itertools import product
+
+        best = 0.0
+        options = [outs for _, outs in splits]
+        for pick in product(*options):
+            chosen = {splits[i][0]: pick[i] for i in range(len(splits))}
+            edges = [
+                (u, v) for u, v in forward
+                if u not in chosen or v == chosen[u]
+            ]
+            span, incomplete = _makespan(edges)
+            estimate = estimate or incomplete
+            best = max(best, span)
+        return round(best, 2), estimate
+
     def _rework_loops(self, memo: Dict[str, float]) -> List[Dict[str, object]]:
         loops: List[Dict[str, object]] = []
         owners = [p.process_id for p in self.pools.values()][:1] or [self.process_id]
@@ -1484,11 +1710,13 @@ class BPMNDiagramBuilder:
         work = [n for n in self.nodes.values() if n.kind in WORK_KINDS]
         named_ok: List[str] = []
         named_bad: List[str] = []
+        named_bad_nodes: List[FlowNode] = []
         for node in work:
             if _name_is_infinitive_object(node.name):
                 named_ok.append(node.name)
             else:
                 named_bad.append(node.name)
+                named_bad_nodes.append(node)
         naming_ratio = (len(named_ok) / len(work)) if work else 1.0
         naming_pass = naming_ratio >= 0.999 or not work
 
@@ -1525,7 +1753,7 @@ class BPMNDiagramBuilder:
         chain_ids: Set[str] = set()
 
         def _flush_chain(active: List[FlowNode]) -> None:
-            if len(active) <= 4:
+            if len(active) <= CHAIN_THRESHOLD:
                 return
             names = " → ".join(c.name for c in active)
             label = f"«{role_of(active[0])}»: {names}"
@@ -1609,6 +1837,46 @@ class BPMNDiagramBuilder:
         total_units = len(work) + unlabeled_flows + missing_bounds
         score = 100 if total_units <= 0 else int(round(100.0 * clean / total_units))
         score = max(0, min(100, score))
+        violation_items: List[Dict[str, object]] = [
+            {
+                "type": "naming",
+                "role": role_of(node),
+                "steps": [node.name],
+                "message": f"Имя шага не в форме «глагол + объект»: «{node.name}»",
+                "quote": "",
+            }
+            for node in named_bad_nodes
+        ]
+        for active_label in chains:
+            # chains entries: «Role»: a → b → c
+            role_m = active_label
+            role_name = ""
+            step_names: List[str] = []
+            if active_label.startswith("«") and "»:" in active_label:
+                role_name = active_label[1:active_label.index("»:")]
+                step_names = [p.strip() for p in active_label.split("»:", 1)[1].split("→")]
+            violation_items.append(
+                {
+                    "type": "chain",
+                    "role": role_name,
+                    "steps": step_names,
+                    "message": active_label,
+                    "quote": "",
+                }
+            )
+        for issue in gw_issues:
+            if "без подписи" not in issue:
+                continue
+            violation_items.append(
+                {
+                    "type": "gateway_label",
+                    "role": "",
+                    "steps": [],
+                    "message": issue,
+                    "quote": "",
+                }
+            )
+
         violations: List[str] = [f"Имя шага не в форме «глагол + объект»: «{name}»" for name in named_bad]
         violations.extend(chains)
         violations.extend(issue for issue in gw_issues if "без подписи" in issue)
@@ -1664,7 +1932,7 @@ class BPMNDiagramBuilder:
                 subway_pass,
                 20,
                 subway_pts,
-                "Нет монотонных цепочек длиннее 4 шагов одной роли без подпроцесса."
+                f"Нет монотонных цепочек длиннее {CHAIN_THRESHOLD} шагов одной роли без подпроцесса."
                 if subway_pass
                 else f"Цепочек без декомпозиции: {len(chains)}.",
                 chains,
@@ -1681,6 +1949,14 @@ class BPMNDiagramBuilder:
                 dead + isolated,
             ),
         ]
+        if not has_start:
+            violation_items.append(
+                {"type": "bounds", "role": "", "steps": [], "message": "Нет стартового события", "quote": ""}
+            )
+        if not has_end:
+            violation_items.append(
+                {"type": "bounds", "role": "", "steps": [], "message": "Нет конечного события", "quote": ""}
+            )
         return {
             "score": score,
             "max_score": 100,
@@ -1692,6 +1968,10 @@ class BPMNDiagramBuilder:
             "dead_ends": len(dead),
             "orphans": len(isolated),
             "violations": violations,
+            "clean": clean,
+            "denominator": total_units,
+            "quality_fraction": f"{clean} / {total_units}",
+            "violation_items": violation_items,
         }
 
     def analyze_bottlenecks(self) -> Dict[str, object]:
@@ -1786,9 +2066,12 @@ class BPMNDiagramBuilder:
             if self.nodes[nid].kind not in EVENT_KINDS
         ]
         target = self.sla_target_hours
+        role_hours, role_estimate = self._role_schedule(root, start_id, back, memo)
         sla = {
             "target_hours": target,
             "critical_path_hours": round(base_hours, 2),
+            "role_hours": role_hours,
+            "role_hours_estimate": role_estimate,
             "with_rework_hours": round(with_rework, 2),
             "rework_hours": rework_hours,
             "rework_total_hours": rework_total,
@@ -1833,7 +2116,7 @@ class BPMNDiagramBuilder:
                     "metric": "critical_path_layers",
                     "severity": "medium",
                     "value": path_layers,
-                    "message": f"Критический путь состоит из {path_layers} последовательных слоёв согласования.",
+                    "message": f"Критический путь состоит из {path_layers} последовательных этапов схемы.",
                 }
             )
         for alert in bus_alerts:
@@ -2066,7 +2349,19 @@ class BPMNDiagramBuilder:
             out.append("      </bpmndi:BPMNShape>")
 
         for link in self.links:
-            color = REWORK_EDGE_COLOR if link.is_back else EDGE_COLOR
+            on_critical = (
+                link.source_id in self.critical_path_ids
+                and link.target_id in self.critical_path_ids
+                and not link.is_back
+            )
+            if link.is_back:
+                color = REWORK_EDGE_COLOR
+            elif on_critical and self.highlight_improved:
+                color = IMPROVED_PATH_EDGE_COLOR
+            elif on_critical:
+                color = CRITICAL_PATH_EDGE_COLOR
+            else:
+                color = EDGE_COLOR
             out.append(
                 f'      <bpmndi:BPMNEdge id="{link.id}_di" bpmnElement="{link.id}"{_color_attrs(color)}>'
             )
@@ -2094,6 +2389,9 @@ class BPMNDiagramBuilder:
             lines.append(f"{inner}<bpmn:incoming>{flow_id}</bpmn:incoming>")
         for flow_id in outgoing.get(node.id, []):
             lines.append(f"{inner}<bpmn:outgoing>{flow_id}</bpmn:outgoing>")
+        if node.kind == "endEvent" and node.terminate:
+            # tEndEvent: incoming → … → eventDefinition (порядок XSD BPMN 2.0).
+            lines.append(f'{inner}<bpmn:terminateEventDefinition id="{node.id}_terminate" />')
         if node.kind == "subProcess":
             children = self._children(node.id)
             child_ids = {c.id for c in children}

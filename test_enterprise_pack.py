@@ -7,13 +7,18 @@ import re
 from pathlib import Path
 
 from ai_generator import (
+    apply_chain_wrap_text,
+    apply_notation_moves_text,
+    apply_notation_to_diagram,
     emulate_generation,
     execute_generated_code,
     export_docx_passport,
     generate_bpmn_from_text,
+    generate_process_passport,
     generate_raci_matrix,
     heuristic_analysis,
     build_process_context,
+    notation_removed_remaining,
     optimize_process_to_be,
     parse_regulation,
     read_docx_regulation,
@@ -21,6 +26,7 @@ from ai_generator import (
     _build_blocks,
     _hours_phrase,
 )
+from bpmn_framework import BPMNDiagramBuilder, WORK_KINDS, _name_is_infinitive_object
 
 
 def main() -> None:
@@ -31,9 +37,12 @@ def main() -> None:
     assert not err, err
     assert audit["sla"]["critical_path_hours"] == 9.7
     assert audit["sla"]["with_rework_hours"] == 12.55
+    assert audit["sla"]["role_hours"] >= audit["sla"]["critical_path_hours"]
     assert len(audit["rework_loops"]) == 2
-    assert audit["methodology"]["long_chains"]
-    assert audit["methodology"]["score"] < 100
+    # Этап «Комплексная диагностика повреждений» назван в регламенте → в As-Is это подпроцесс, не длинная цепочка.
+    assert audit["stats"]["subprocesses"] == 1, audit["stats"]
+    assert not audit["methodology"]["long_chains"], audit["methodology"]
+    assert 'name="Комплексная диагностика повреждений"' in xml
     assert 'name="СИЗ"' not in xml
     assert xml.strip().startswith("<?xml") or "<bpmn" in xml or "<definitions" in xml
     xor_ids = set(re.findall(r'<bpmn:exclusiveGateway\b[^>]*\bid="([^"]+)"', xml))
@@ -96,7 +105,11 @@ def main() -> None:
     assert opened_facts["cp_after"] <= 9.6
     assert opened_facts["rw_after"] <= 9.6
     assert opened_facts["loops_before"] == 2 and opened_facts["loops_after"] == 0
-    assert opened_facts["quality_before"] < 100 and opened_facts["quality_after"] < 100
+    # Нотация As-Is уже чистая (этап — подпроцесс); эффект To-Be — срок и циклы, не исправление нотации.
+    assert opened_facts["quality_before"] == 100
+    assert opened_facts["quality_after"] >= opened_facts["quality_before"]
+    assert opened_facts["quality_after"] == 100
+    assert not (opened["delta"].get("tobe_audit") or {}).get("methodology", {}).get("long_chains")
     headline = bpmn_app.tobe_card_headline(opened_facts)
     assert headline == "Экономия пути с возвратами: 12.6 ч → 9.6 ч (−24%)", headline
     assert "Без ускорения" not in headline
@@ -167,6 +180,7 @@ def main() -> None:
     assert not err_g_full, err_g_full
     assert audit_g_full["sla"]["critical_path_hours"] == 400.3
     assert audit_g_full["sla"]["with_rework_hours"] == 584.4
+    assert audit_g_full["sla"]["role_hours"] >= audit_g_full["sla"]["critical_path_hours"]
     assert audit_g_full["methodology"]["score"] == 100
 
     proc = (Path(__file__).resolve().parent / "examples" / "example_2_equipment_procurement.txt").read_text(
@@ -177,10 +191,11 @@ def main() -> None:
     opt_p, delta_p = optimize_process_to_be(proc, audit_p)
     q_after = int(delta_p.get("quality_after") or 0)
     q_before = int(delta_p.get("quality_before") or 0)
-    assert q_before < 100, q_before
+    assert q_before == 100, q_before  # этапы регламента — подпроцессы уже в As-Is
     assert q_after >= q_before, (q_after, q_before)
     assert audit_p["sla"]["critical_path_hours"] == 528.3
     assert audit_p["sla"]["with_rework_hours"] == 856.5
+    assert audit_p["sla"]["role_hours"] >= audit_p["sla"]["critical_path_hours"]
     assert "автоматически:" not in opt_p.lower()
     assert "проводит предварительный входной контроль" in opt_p or "входной контроль" in opt_p.lower()
     ctx_p = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
@@ -190,7 +205,7 @@ def main() -> None:
     assert "Параллелизац" in why or "параллел" in why.lower()
     assert "scriptTask" in why or "Автоматизац" in why
     qual = heuristic_analysis("Почему упал Quality Score?", ctx_p)
-    assert "100%" in qual
+    assert "100 → 100" in qual and "не изменилась" in qual and "2 → 0" in qual, qual
     assert "метро" not in qual.lower()
     read = heuristic_analysis("Оцени читаемость схемы и анти-метро", ctx_p)
     assert "Quality Score" in read or "читаем" in read.lower()
@@ -515,7 +530,7 @@ pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Диспетчер"])
 DIAGRAM.add_start_event("Старт", lanes[0], node_id=ROOT_START_TASK_ID)
 DIAGRAM.add_end_event("Финал", lanes[0], node_id=ROOT_END_TASK_ID)
 sp = DIAGRAM.create_subprocess("Провести диагностику оборудования", lanes[0])
-prev = DIAGRAM.nodes[sp].inner_start_id
+prev = DIAGRAM.subprocess_entry(sp)
 for title in (
     "Принять заявку диспетчера",
     "Зафиксировать запись в журнале",
@@ -527,7 +542,7 @@ for title in (
     step = DIAGRAM.add_user_task(title, sp)
     DIAGRAM.add_link(prev, step)
     prev = step
-DIAGRAM.add_link(prev, DIAGRAM.nodes[sp].inner_end_id)
+DIAGRAM.add_link(prev, DIAGRAM.subprocess_exit(sp))
 DIAGRAM.add_link(ROOT_START_TASK_ID, sp)
 DIAGRAM.add_link(sp, ROOT_END_TASK_ID)
 """
@@ -632,7 +647,8 @@ DIAGRAM.add_link(sp, ROOT_END_TASK_ID)
     )
     assert named.steps[0].title == "Провести визуальный осмотр ячейки", named.steps[0].title
     assert named.steps[0].stage == "Комплексная диагностика повреждений"
-    assert any("визуальный осмотр" in item["to"] for item in audit["rework_loops"])
+    # Возврат «повторная диагностика → п.6» ведёт на этап целиком: п.6 — его первый шаг.
+    assert any(item["to"] == "Комплексная диагностика повреждений" for item in audit["rework_loops"])
     assert bpmn_app.GENERATION_BUSY_LABEL == "Генерация BPMN 2.0…"
     from ai_generator import build_prompt, _code_for_sandbox
 
@@ -678,6 +694,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     _, audit_gap, err_gap = execute_generated_code(linear, "Дыра возврата", regulation_text=one_return)
     assert audit_gap == {}
     assert "Схема не готова" in err_gap and "явных возврата" in err_gap, err_gap
+    assert "REWORK VALIDATION FAILED" in err_gap
+    assert "Найдено:" in err_gap and "Фраза:" in err_gap and "назад" in err_gap
+    assert "Ожидается:" in err_gap and "нет обратного ребра" in err_gap
+    from ai_generator import build_rework_repair_prompt, rework_issue_records
+
+    repair = build_rework_repair_prompt(one_return, linear, [err_gap])
+    assert "Не переписывай процесс." in repair
+    assert "Не меняй:" in repair and "SLA" in repair
+    assert "REWORK ISSUES:" in repair
+    assert "REWORK BPMN COMPLIANCE" in build_prompt(one_return)
+    assert rework_issue_records(one_return)
 
     from ai_generator import _reject_cloud_diagram, process_facts
 
@@ -755,6 +782,60 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert time.time() - started < 3, time.time() - started
     assert not xml_hang
     assert "таймаут" in err_hang.lower(), err_hang
+
+    import ast
+    import threading
+    from ai_generator import (
+        REGULATION_MAX_CHARS,
+        UnsafeCodeError,
+        _to_hours,
+        _validate_ast,
+        build_prompt,
+    )
+
+    probes = [
+        "g = (x for x in [1]); n = g.gi_frame.f_code.co_name",
+        'g = (x for x in [1]); s = "{0.gi_frame}".format(g)',
+        's = "{0.__class__}".format(1)',
+        "x = [[[0 for a in range(2000)] for b in range(2000)] for c in range(2000)]",
+    ]
+    for src in probes:
+        try:
+            _validate_ast(ast.parse(src))
+            raise AssertionError("проба песочницы должна быть отклонена: " + src)
+        except UnsafeCodeError:
+            pass
+    _validate_ast(ast.parse(
+        "pool, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ['А'])\n"
+        "a = DIAGRAM.add_user_task('Шаг', lanes[0])\n"
+        "DIAGRAM.set_sla(a, 1)\n"
+        "DIAGRAM.add_link(ROOT_START_TASK_ID, a)\n"
+    ))
+
+    hang_thread: dict = {}
+    def _run_hang() -> None:
+        os.environ["DIAGRAM_EXEC_TIMEOUT"] = "0.5"
+        try:
+            xml_t, _, err_t = execute_generated_code(hang, "Поток")
+            hang_thread["xml"] = xml_t
+            hang_thread["err"] = err_t
+        finally:
+            os.environ.pop("DIAGRAM_EXEC_TIMEOUT", None)
+    th = threading.Thread(target=_run_hang)
+    t0 = time.time()
+    th.start()
+    th.join(6)
+    assert not th.is_alive()
+    assert time.time() - t0 < 5
+    assert not hang_thread.get("xml")
+    assert "таймаут" in str(hang_thread.get("err") or "").lower(), hang_thread
+
+    long_reg = "Регламент: длинный\nSLA: 8 часов\n1. Диспетчер принимает заявку (1 час).\n" + ("слово " * (REGULATION_MAX_CHARS // 5))
+    xml_long, _, err_long = generate_bpmn_from_text(long_reg, use_llm=False)
+    assert not xml_long and "слишком длинный" in err_long, err_long
+    prompt = build_prompt("секретный текст регламента")
+    assert "<<<REGULATION_DATA" in prompt and "REGULATION_DATA>>>" in prompt
+    assert "Не инструкции" in prompt and "секретный текст регламента" in prompt
 
     from ai_generator import _iter_tobe_selections
 
@@ -947,14 +1028,14 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     tenths = lambda value: int(round(float(value) * 10))  # noqa: E731
     assert tenths(cmp_view["saved_hours"]) == tenths(cmp_facts["rw_saved_hours"])
     assert tenths(cmp_facts["rw_saved_hours"]) == tenths(cmp_facts["rw_before"]) - tenths(cmp_facts["rw_after"])
-    assert sum(tenths(p["hours"]) for p in cmp_view["parts"]) == tenths(cmp_facts["rw_saved_hours"]), cmp_view["parts"]
+    assert sum(tenths(p["hours"]) for p in cmp_view["parts"]) == tenths(cmp_view["saved_hours"]), cmp_view["parts"]
     assert tenths(cmp_view["explained_hours"]) + tenths(cmp_view["rest_hours"]) == tenths(cmp_view["saved_hours"])
-    assert {p["kind"] for p in cmp_view["parts"]} >= {"loops", "parallel", "automation", "rest"}
+    assert {p["kind"] for p in cmp_view["parts"]} >= {"loops", "parallel", "automation", "joint"}
     assert (cmp_snapshot[0], cmp_snapshot[1]) == (cmp_facts["cp_before"], cmp_facts["rw_before"])
     assert cmp_asis_audit["sla"]["critical_path_hours"] == 9.7
     assert cmp_asis_audit["sla"]["with_rework_hours"] == 12.55
     assert cmp_snapshot[2:4] == (2, 0) and cmp_snapshot[5] == 2
-    assert cmp_view["parts"][-1]["kind"] == "rest" and cmp_view["parts"][-1]["label"] == "остальное"
+    assert cmp_view["parts"][-1]["kind"] == "joint" and cmp_view["parts"][-1]["label"] == "Совместный эффект"
     for item in cmp_view["removed_returns"]:
         assert item["scheme"] == "As-Is"
     for row in cmp_view["steps"]:
@@ -1025,15 +1106,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     dup_view = compare_asis_tobe(ren_before, dup_after, {}, {}, ren_facts)
     dup_kinds = [r["kind"] for r in dup_view["steps"] if "латеж" in r["title"] and r["role_after"] == "Информационная система"]
     assert sorted(dup_kinds) == ["added", "changed"], dup_view["steps"]
-    # Закупка: шаг сменил роль на «Информационная система» и сохранил предмет в названии — одна строка.
+    # Закупка: ход журнала не сменил тип и срок, дорожка «Закупочная служба» остаётся, автоматизация 0.
     proc_ctx = build_process_context(proc, xml_p, audit_p, tobe_delta=delta_p)
     proc_cmp = _ctx_compare(proc_ctx)
-    reg_rows = [r for r in proc_cmp["steps"] if "заявки участников" in r["title"]]
-    assert len(reg_rows) == 1 and reg_rows[0]["kind"] == "changed", proc_cmp["steps"]
-    assert reg_rows[0]["role_after"] == "Информационная система" and "роль" in reg_rows[0]["label"]
+    assert not any(r.get("to_system") for r in proc_cmp["steps"]), proc_cmp["steps"]
     assert proc_cmp["counts"]["removed"] == 0 and proc_cmp["counts"]["added"] == 0
     proc_auto = next(p for p in proc_cmp["parts"] if p["kind"] == "automation")
-    assert reg_rows[0]["hours_after"] < reg_rows[0]["hours_before"] and proc_auto["hours"] > 0
+    assert proc_auto["hours"] == 0.0
+    proc_par = next(p for p in proc_cmp["parts"] if p["kind"] == "parallel")
+    assert "Заключить договор поставки с победителем" in proc_par["detail"]
+    assert "Организовать приёмку трансформатора и входной контроль" in proc_par["detail"]
+    assert "экспертизу проекта договора" not in proc_par["detail"]
     assert sum(tenths(p["hours"]) for p in proc_cmp["parts"]) == tenths(proc_ctx["facts"]["rw_saved_hours"]) == tenths(proc_cmp["saved_hours"])
 
     # 2е. Подсветка на схеме: только изменившиеся шаги, «исчез» и «появился» не размечаются, по клику одна строка.
@@ -1041,13 +1124,8 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
 
     cat_asis = build_diagram_catalog(cmp_pack["xml"], cmp_asis_audit, cmp_text)
     cat_tobe = build_diagram_catalog(cmp_pack["tobe_xml"], cmp_pack["tobe_audit"], cmp_pack["tobe_text"])
-    assert mark_changed_steps(cat_asis, cat_tobe, cmp_view) == 1
-    for catalog_side, role_side in ((cat_asis, "Диспетчер"), (cat_tobe, "Информационная система")):
-        marked_nodes = [e for e in catalog_side.values() if e.get("changed")]
-        assert len(marked_nodes) == 1, [e["name"] for e in marked_nodes]
-        assert "Зафиксировать аварию" in marked_nodes[0]["name"] and marked_nodes[0]["role"] == role_side
-        assert marked_nodes[0]["change"] == "Роль «Диспетчер» сменилась на «Информационная система»; шаг передан системе."
-        assert not any("changed" in e or "change" in e for e in catalog_side.values() if e is not marked_nodes[0])
+    assert mark_changed_steps(cat_asis, cat_tobe, cmp_view) == 0
+    assert not any(e.get("changed") for e in [*cat_asis.values(), *cat_tobe.values()])
     synth = {"ready": True, "steps": [
         {"kind": "removed", "title": "Старый шаг", "role_before": "Мастер", "title_before": "Старый шаг"},
         {"kind": "added", "title": "Новый шаг", "role_after": "Мастер"},
@@ -1091,37 +1169,20 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
                    "что изменилось в этом шаге"):
             side, _t, _x, _a = assistant_chat(hq, [], *proc_args, use_llm=True, tobe_delta=proc_pack["delta"])
             canv = canvas_copilot_reply(hq, *proc_args, proc_pack["delta"])
-            assert side == canv, (hq, side, canv)
-            assert "Зарегистрировать заявки" in side and "Роль «Закупочная служба» сменилась на «Информационная система»" in side, side
-            assert "120 ч" in side and "→ 5 мин" in side and "шаг передан системе" in side, side
-            assert "нет данных" not in side.lower() and "Подсвеченных шагов нет" not in side, side
-        # Та же строка, что в фиолетовой карточке; пакет холста несёт тот же текст.
+            assert side == canv and side == "Подсвеченных шагов нет", (hq, side, canv)
+        assert build_canvas_copilot(*proc_args, proc_pack["delta"])["highlight"] == "Подсвеченных шагов нет"
         proc_cat_tb = build_diagram_catalog(proc_pack["tobe_xml"], proc_pack["tobe_audit"], proc_pack["tobe_text"])
-        proc_cat_as = build_diagram_catalog(proc_pack["xml"], proc_pack["audit"], proc_text)
-        proc_cmp = compare_asis_tobe(
-            str(proc_pack["audit"].get("result_text") or proc_text), proc_pack["tobe_text"],
-            proc_pack["audit"], proc_pack["tobe_audit"], proc_pack["facts"])
-        mark_changed_steps(proc_cat_as, proc_cat_tb, proc_cmp)
-        proc_marked = [(k, v) for k, v in proc_cat_tb.items() if v.get("changed")]
-        assert len(proc_marked) == 1 and proc_marked[0][1]["change"] in side
-        assert build_canvas_copilot(*proc_args, proc_pack["delta"])["highlight"] == side
-        # Выбранный шаг: «что изменилось в этом шаге» → строка карточки; обычный шаг → не подсвечен.
-        sel_id = proc_marked[0][0]
-        one = canvas_copilot_reply("что изменилось в этом шаге", *proc_args, proc_pack["delta"], sel_id, proc_cat_tb)
-        assert one == f"**«{proc_marked[0][1]['name']}»**: {proc_marked[0][1]['change']}", one
-        plain_id = next(k for k, v in proc_cat_tb.items() if not v.get("changed") and v.get("kind") in _agen._TASK_TAGS)
+        plain_id = next(k for k, v in proc_cat_tb.items() if v.get("kind") in _agen._TASK_TAGS)
         assert canvas_copilot_reply("почему подсвечен", *proc_args, proc_pack["delta"], plain_id, proc_cat_tb) == "Этот шаг не подсвечен"
-        # Срок стал короче: карточка не пишет, что задержка на шаге сдвигает весь срок.
-        assert "задержка сдвигает" not in proc_marked[0][1]["comment"], proc_marked[0][1]["comment"]
-        assert "Срок шага сокращён" in proc_marked[0][1]["comment"]
-        # Подсвеченных шагов нет: нет To-Be-дельты → одна фраза.
+        shortened = {"comment": "Узел на критическом пути: задержка сдвигает весь срок."}
+        _agen._drop_delay_claim(shortened, {"hours_changed": True, "hours_before": 120.0, "hours_after": 0.083})
+        assert "задержка" not in shortened["comment"].lower() and "Срок шага сокращён" in shortened["comment"]
         no_hl, *_rest = assistant_chat("какие узлы подсвечены", [], *proc_args, use_llm=True)
         assert no_hl == "Подсвеченных шагов нет", no_hl
         assert canvas_copilot_reply("какие узлы фиолетовые", *proc_args) == "Подсвеченных шагов нет"
-        # Пример 1: роль «Диспетчер» → «Информационная система», срока в строке нет.
         ex1_side, *_r1 = assistant_chat("какие узлы подсвечены", [], cmp_pack["xml"], cmp_pack["audit"], cmp_text,
                                         use_llm=True, tobe_delta=cmp_pack["delta"])
-        assert "Роль «Диспетчер» сменилась на «Информационная система»" in ex1_side and "срок" not in ex1_side, ex1_side
+        assert ex1_side == "Подсвеченных шагов нет", ex1_side
     finally:
         _agen._chat_llm = _saved_chat
     # 2з. Отмена передачи шага системе: шаг остаётся, роль и срок из As-Is, подсветки нет, экономия пересчитана, облака нет.
@@ -1137,32 +1198,27 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
             rargs = (rp["xml"], rp["audit"], proc_text)
             asked = "какие узлы подсвечены фиолетовым"
             before_hl, *_b = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert "заявк" in before_hl and "120 ч (≈ 15 раб. дн.) → 5 мин" in before_hl, before_hl
+            assert before_hl == "Подсвеченных шагов нет", before_hl
             facts_before = _agen.process_facts(rp["audit"], rd)
             rev_reply, rev_text, rev_xml, rev_audit = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert rev_text is None and rev_xml is None and rev_audit is None, rq  # As-Is не менялся
-            assert "Не понял" not in rev_reply and "удал" not in rev_reply.lower(), rev_reply
-            assert "заявк" in rev_reply and "«Закупочная служба»" in rev_reply and "120 ч (≈ 15 раб. дн.)" in rev_reply, rev_reply
-            assert "Подсветка этой смены снята" in rev_reply, rev_reply
-            assert rd["skip_auto"] and rd["tobe_rev"] == 1 and rd["tobe_text"] != proc_tobe_before
-            # Шаг остаётся в To-Be с той же ролью и сроком, что в As-Is; смены роли в сравнении нет.
+            assert rev_text is None and rev_xml is None and rev_audit is None, rq
+            assert "возвращать нечего" in rev_reply and "Не понял" not in rev_reply, rev_reply
+            assert "skip_auto" not in rd and "tobe_rev" not in rd and rd["tobe_text"] == proc_tobe_before
             assert "заявк" in rd["tobe_text"].lower()
             assert "Информационная система автоматически регистрирует заявк" not in rd["tobe_text"]
             hl_after, *_h = assistant_chat(asked, [], *rargs, use_llm=True, tobe_delta=rd)
             assert hl_after == "Подсвеченных шагов нет", hl_after
             assert canvas_copilot_reply(asked, *rargs, rd) == "Подсвеченных шагов нет"
-            # Карточка и раскладка экономии пересчитаны: сумма строк равна новой экономии.
             tuned = bpmn_app.retune_tobe(rp["audit"], rd)
-            assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] != facts_before["rw_after"]
+            assert tuned["tobe_ok"] and tuned["facts"]["rw_after"] == facts_before["rw_after"]
             tuned_cmp = compare_asis_tobe(
                 str(rp["audit"].get("result_text") or proc_text), tuned["tobe_text"], rp["audit"],
                 tuned["tobe_audit"], tuned["facts"])
             assert not [r for r in tuned_cmp["steps"] if r.get("to_system")], tuned_cmp["steps"]
             tn = lambda v: int(round(float(v or 0) * 10))  # noqa: E731
             assert sum(tn(p_["hours"]) for p_ in tuned_cmp["parts"]) == tn(tuned["facts"]["rw_before"]) - tn(tuned["facts"]["rw_after"])
-            # Повтор той же просьбы на той же сборке: шаг назван снова, To-Be не пересобирается.
             again, *_a = assistant_chat(rq, [], *rargs, use_llm=True, tobe_delta=rd)
-            assert "заявк" in again and rd["tobe_rev"] == 1, again
+            assert "возвращать нечего" in again and "tobe_rev" not in rd, again
         # Без нужной сборки To-Be и без передачи шагов — понятный ответ, не удаление.
         nothing, *_n = assistant_chat("нет таких возможностей", [], *proc_args, use_llm=True)
         assert "To-Be ещё не посчитан" in nothing and "Не понял" not in nothing, nothing
@@ -1176,8 +1232,13 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     _aud = {"sla": {"critical_path_hours": 10.0}}
     _acc = {"tobe_ready": True, "cp_before": 10.0, "cp_after": 9.0, "loops_before": 2, "loops_after": 0}
     assert bpmn_app.tobe_unavailable_reason(_aud, {}, _acc, "<xml/>") == ""
-    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, cp_after=12.0), "<xml/>").startswith("Голый путь To-Be длиннее: 10 ч → 12 ч")
-    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_after=2), "<xml/>").startswith("Циклы возврата не уменьшились: 2 → 2")
+    assert bpmn_app.tobe_unavailable_reason(
+        _aud, {}, dict(_acc, cp_after=12.0, loops_after=2, rw_before=10.0, rw_after=10.0), "<xml/>",
+    ).startswith("Голый путь To-Be длиннее: 10 ч → 12 ч")
+    assert bpmn_app.tobe_unavailable_reason(
+        _aud, {}, dict(_acc, cp_after=10.0, loops_after=2, rw_before=10.0, rw_after=10.0), "<xml/>",
+    ).startswith("Циклы возврата не уменьшились: 2 → 2")
+    assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, cp_after=12.0), "<xml/>") == ""
     assert bpmn_app.tobe_unavailable_reason(
         _aud, {"quality_before": 80, "quality_after": 70}, dict(_acc, tobe_ready=False), "").startswith("Качество To-Be ниже: 80 → 70")
     assert bpmn_app.tobe_unavailable_reason(_aud, {}, dict(_acc, loops_before=0, loops_after=0, cp_after=10.0), "").startswith("Ни один ход")
@@ -1225,14 +1286,17 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
         cmp_pack["xml"], cmp_pack["audit"], cmp_text, cmp_pack["delta"]), xml_tobe=cmp_pack["tobe_xml"], catalog_tobe=cat_tobe)
     assert "COPILOT.highlight" in page_hl and "подсвеч" in page_hl
 
-    # 2д. Четыре строки экономии: пересчёт пути без хода, обрезка остатком, сумма равна карточке в десятых.
+    # 2д. Вклады категорий — сумма ходов, без обрезки первой категорией. Совместный эффект добирает карточку.
     part_h = {p["kind"]: p["hours"] for p in cmp_view["parts"]}
-    assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "rest"]
-    assert tenths(part_h["loops"]) == (tenths(cmp_facts["rw_before"]) - tenths(cmp_facts["cp_before"])) - (
-        tenths(cmp_facts["rw_after"]) - tenths(cmp_facts["cp_after"]))
-    assert all(tenths(v) >= 0 for v in part_h.values()), part_h
+    assert [p["kind"] for p in cmp_view["parts"]] == ["loops", "parallel", "automation", "joint"]
+    from ai_generator import _category_contrib as _contrib_hours
+
+    contrib_h = _contrib_hours(cmp_facts.get("move_hours") or [])
+    assert tenths(part_h["loops"]) == tenths(contrib_h["loops"])
+    assert tenths(part_h["parallel"]) == tenths(contrib_h["parallel"])
+    assert tenths(part_h["automation"]) == tenths(contrib_h["automation"])
     assert sum(tenths(v) for v in part_h.values()) == tenths(cmp_facts["rw_saved_hours"])
-    # Ход выключается и пересчитывается: без «Параллельно» путь длиннее на часы шага, автоматизация обрезается остатком.
+    # Ход считается сам по себе: параллель 1 ч, автоматизация 5.9 ч. Перекрытие не обрезает автоматизацию, а уходит в совместный эффект.
     what_facts = dict(same_facts, rw_before=9.0, rw_after=7.0, cp_before=9.0, cp_after=7.0, rw_saved_pct=22)
     what_before = (
         "Регламент: Пересчёт\n1. Диспетчер: Принять заявку (1 ч).\n2. Мастер: Проверить комплект (2 ч).\n"
@@ -1244,19 +1308,20 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     )
     what_view = compare_asis_tobe(what_before, what_after, {}, {}, what_facts)
     what_h = {p["kind"]: p["hours"] for p in what_view["parts"]}
-    assert what_h["parallel"] == 1.0 and what_h["automation"] == 1.0 and what_h["loops"] == 0.0, what_h
+    assert what_h["parallel"] == 1.0 and what_h["automation"] == 5.9 and what_h["loops"] == 0.0, what_h
+    assert what_h["joint"] == -4.9, what_h
     assert sum(tenths(v) for v in what_h.values()) == tenths(what_facts["rw_before"] - what_facts["rw_after"])
     # Нет хода — строка 0, часы остаются в «остальное».
     idle_view = compare_asis_tobe(what_before, what_before, {}, {}, what_facts)
     idle_h = {p["kind"]: p["hours"] for p in idle_view["parts"]}
-    assert idle_h == {"loops": 0.0, "parallel": 0.0, "automation": 0.0, "rest": 2.0}, idle_h
+    assert idle_h == {"loops": 0.0, "parallel": 0.0, "automation": 0.0, "joint": 2.0}, idle_h
     # Прежний срок не длиннее — автоматизация 0.
     short_after = what_after.replace("(5 минут)", "(7 ч)")
     short_view = compare_asis_tobe(what_before, short_after, {}, {}, what_facts)
     assert {p["kind"]: p["hours"] for p in short_view["parts"]}["automation"] == 0.0
 
     # 2г. Один шаг — одна строка: хвосты «иначе …» и «вернуть на п.N» отрезаются, начало названия — та же пара.
-    assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 1}, cmp_view["counts"]
+    assert cmp_view["counts"] == {"added": 0, "removed": 0, "changed": 0}, cmp_view["counts"]
     assert round(float(cmp_view["saved_hours"]), 1) == 3.0
 
     def _pair_view(before_steps: str, after_steps: str) -> dict:
@@ -1331,7 +1396,7 @@ DIAGRAM.add_link(b, ROOT_END_TASK_ID)
     assert "<b>исчез</b>" not in screen and "<b>появился</b>" not in screen
     assert "появилось 1, исчезло 17, изменилось" in screen
     assert screen.count("<b>исчез") == 0
-    assert "Информационная система" in screen and "<b>изменилась роль</b>" in screen
+    assert "Информационная система" not in screen and "<b>изменилась роль</b>" not in screen
     assert f"циклы {cmp_view['loops_before']} → {cmp_view['loops_after']}" in screen
     assert f"Экономия: {bpmn_app.fmt_hours(cmp_view['saved_hours'])}" in screen
     shown_parts = [float(m) for m in re.findall(r"</b>: ([+-]\d+\.\d) ч", screen)]
@@ -1566,6 +1631,92 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     assert second_step.title == "Записать аварию в журнал" and second_step.role == "Диспетчер"
     assert len(parse_regulation(named_text).steps) == len(parse_regulation(text1).steps)
 
+    # Честность сроков: недели, месяцы, подпись N из M, плашка без цели. Числа примера 1 те же.
+    assert abs(_to_hours("2", "рабочих недели") - 80.0) < 1e-6
+    assert abs(_to_hours("1", "календарная неделя") - 168.0) < 1e-6
+    month_text = (
+        "Регламент: учёт месяцев\nSLA: 8 часов\n"
+        "1. Диспетчер принимает заявку (2 месяца).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    parsed_m = parse_regulation(month_text)
+    assert parsed_m.month_durations_ignored and parsed_m.steps[0].hours is None
+    xml_m, audit_m, err_m = generate_bpmn_from_text(month_text, use_llm=False)
+    assert not err_m and xml_m and audit_m.get("sla_month_ignored")
+    note_m = str(audit_m.get("sla_hours_note") or "")
+    assert "Срок указан в регламенте у" in note_m and " из " in note_m and "по умолчанию" in note_m
+    src_text = (
+        "Регламент: источник часов\n"
+        "1. Диспетчер принимает заявку.\n"
+        "2. Мастер закрывает заявку (5 часов).\n"
+    )
+    from bpmn_framework import WORK_KINDS
+    from bpmn_framework import BPMNDiagramBuilder as _Builder
+
+    held_src: list = []
+    orig_analyze = _Builder.analyze_bottlenecks
+
+    def _hold_analyze(self, *args, **kwargs):
+        held_src.append(self)
+        return orig_analyze(self, *args, **kwargs)
+
+    _Builder.analyze_bottlenecks = _hold_analyze
+    try:
+        _xml_src, audit_src, err_src = generate_bpmn_from_text(src_text, use_llm=False)
+    finally:
+        _Builder.analyze_bottlenecks = orig_analyze
+    assert not err_src and held_src
+    work_src = [n for n in held_src[-1].nodes.values() if n.kind in WORK_KINDS]
+    bare_src = next(n for n in work_src if "принять заявку" in (n.name or "").lower())
+    assert bare_src.sla_source == "default", (bare_src.name, bare_src.sla_hours, bare_src.sla_source)
+    held_src[-1].set_sla(bare_src.id, 5)
+    assert bare_src.sla_hours == 5 and bare_src.sla_source == "regulation"
+    note_src = str(audit_src.get("sla_hours_note") or "")
+    n_reg_src = sum(1 for n in work_src if getattr(n, "sla_source", None) == "regulation")
+    assert f"у {n_reg_src - 1} из {len(work_src)}" in note_src, (note_src, n_reg_src, len(work_src))
+    assert opened["audit"]["sla"]["critical_path_hours"] == 9.7
+    assert opened["audit"]["sla"]["with_rework_hours"] == 12.55
+    assert "Срок указан в регламенте у" in str(opened["audit"].get("sla_hours_note") or "")
+    no_tgt = (
+        "Регламент: без цели\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    _, audit_ns, err_ns = generate_bpmn_from_text(no_tgt, use_llm=False)
+    assert not err_ns
+    sla_ns = audit_ns["sla"]
+    tgt = sla_ns.get("target_hours")
+    if sla_ns["breach"]:
+        pill = "Риск срыва SLA"
+    elif float(sla_ns["rework_share"]) > 0.25:
+        pill = "Возвраты съедают запас"
+    elif tgt in (None, ""):
+        pill = "Цель SLA не задана"
+    else:
+        pill = "В пределах SLA"
+    assert pill == "Цель SLA не задана", (pill, tgt)
+    app_src = Path(__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
+    # KPI показывает часы пути, не фразу «N этапов схемы» и не «слои согласования».
+    assert "Критический путь" in app_src and "с возвратами" in app_src
+    assert "слоёв согласования" not in app_src
+
+    calls = {"n": 0}
+    orig_gen = bpmn_app.generate_bpmn_from_text
+
+    def _fake_fallback(text: str, use_llm: bool = True) -> tuple:
+        calls["n"] += 1
+        return "<xml/>", {"generation": {"engine": "semantic-emulator", "fallback": True}, "sla": {}}, ""
+
+    bpmn_app.generate_bpmn_from_text = _fake_fallback
+    try:
+        bpmn_app._cached_llm_generate_bpmn.clear()
+        bpmn_app.cached_generate_bpmn("hash-fallback", "текст", True)
+        bpmn_app.cached_generate_bpmn("hash-fallback", "текст", True)
+        assert calls["n"] == 2, calls
+    finally:
+        bpmn_app.generate_bpmn_from_text = orig_gen
+        bpmn_app._cached_llm_generate_bpmn.clear()
+
     # Явная команда добавления по-прежнему правит регламент и пересобирает схему.
     eco_side, eco_text, eco_xml, _ = _side("Добавь согласование со службой экологии после шага 3")
     assert eco_text and "со службой" in eco_text and eco_xml and eco_xml != xml1
@@ -1573,6 +1724,331 @@ DIAGRAM.add_link(c, ROOT_END_TASK_ID)
     print("COPILOT_TOBE", copilot_tobe.replace("\n", " | "))
     print("SIDEBAR_TOBE", side_tobe.replace("\n", " | "))
     print("NEW_STEP", new_step)
+
+    # To-Be принимается относительно локального baseline, а не облачной схемы.
+    from ai_generator import LOCAL_MODEL_NOTE, _category_contrib, _tobe_feasible
+
+    plain = (
+        "Регламент: Приёмка относительно baseline\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Диспетчер закрывает заявку (1 час).\n"
+    )
+    better_than_base = {"cp": 9.0, "rw": 9.0, "loops": 0.0, "q": 70.0, "n": 2.0}
+    baseline_worse = {"cp": 10.0, "rw": 12.0, "loops": 2.0, "q": 60.0, "n": 4.0}
+    cloud_better = {"cp": 8.0, "rw": 8.0, "loops": 0.0, "q": 90.0, "n": 2.0}
+    assert _tobe_feasible(baseline_worse, better_than_base, plain, plain)
+    assert not _tobe_feasible(cloud_better, better_than_base, plain, plain)
+    worse_than_base = {"cp": 10.0, "rw": 11.0, "loops": 1.0, "q": 80.0, "n": 3.0}
+    baseline_better = {"cp": 9.0, "rw": 9.0, "loops": 0.0, "q": 80.0, "n": 2.0}
+    cloud_worse = {"cp": 12.0, "rw": 16.0, "loops": 2.0, "q": 50.0, "n": 6.0}
+    assert _tobe_feasible(cloud_worse, worse_than_base, plain, plain)
+    assert not _tobe_feasible(baseline_better, worse_than_base, plain, plain)
+    assert bpmn_app._tobe_accepted({
+        "tobe_ready": True, "cp_before": 10.0, "cp_after": 9.0, "loops_before": 2, "loops_after": 0,
+    })
+    assert not bpmn_app._tobe_accepted({
+        "tobe_ready": True, "cp_before": 9.0, "cp_after": 10.0, "loops_before": 0, "loops_after": 0,
+    })
+    assert opened["delta"].get("local_model") and LOCAL_MODEL_NOTE
+
+    moves_fwd = [
+        {"kind": "parallel", "path_hours": 1.5},
+        {"kind": "automation", "path_hours": 2.0},
+        {"kind": "zero_rework", "path_hours": 0.5},
+    ]
+    assert _category_contrib(moves_fwd) == _category_contrib(list(reversed(moves_fwd)))
+    total_path = 3.0
+    summed = sum(_category_contrib(moves_fwd).values())
+    assert round(total_path - summed, 3) == -1.0
+
+    fork_only = (
+        "Регламент: только развилка\n"
+        "1. Диспетчер принимает заявку (1 час).\n"
+        "2. Если заявка полная — «полная» — перейти к п.3, иначе «неполная» — завершить процесс.\n"
+        "3. Диспетчер закрывает заявку (1 час).\n"
+    )
+    xml_fork, audit_fork, err_fork = generate_bpmn_from_text(fork_only, use_llm=False)
+    assert not err_fork and xml_fork, err_fork
+    shown_fork = render_result_regulation(fork_only, xml_fork)
+    assert "Выполнить действие" not in shown_fork, shown_fork
+    assert "Если Заявка полная, иначе «Неполная»" in shown_fork, shown_fork
+    xml_again, _, err_again = generate_bpmn_from_text(shown_fork, use_llm=False)
+    assert not err_again and xml_again and "Выполнить действие" not in xml_again
+    from validate_bpmn import xsd_errors_xml
+
+    assert xsd_errors_xml(xml_fork) == [] or xsd_errors_xml(xml_fork) is None or not xsd_errors_xml(xml_fork)
+
+    from bpmn_framework import BPMNDiagramBuilder
+
+    def _role_case(lanes, kind, same_lane):
+        diagram = BPMNDiagramBuilder()
+        _, lane_ids = diagram.add_pool("p", lanes)
+        start = diagram.add_start_event("Старт", lane_ids[0])
+        first = diagram.add_user_task("Первый", lane_ids[0])
+        second = diagram.add_user_task("Второй", lane_ids[0] if same_lane else lane_ids[1])
+        end = diagram.add_end_event("Конец", lane_ids[0])
+        diagram.set_sla(first, 3)
+        diagram.set_sla(second, 5)
+        if kind == "chain":
+            diagram.add_link(start, first)
+            diagram.add_link(first, second)
+            diagram.add_link(second, end)
+        elif kind == "par":
+            split = diagram.add_parallel_gateway("Разделить", lane_ids[0])
+            join = diagram.add_parallel_gateway("Слить", lane_ids[0])
+            diagram.add_link(start, split)
+            diagram.add_link(split, first)
+            diagram.add_link(split, second)
+            diagram.add_link(first, join)
+            diagram.add_link(second, join)
+            diagram.add_link(join, end)
+        else:
+            split = diagram.add_exclusive_gateway("Выбор", lane_ids[0])
+            join = diagram.add_exclusive_gateway("Снова", lane_ids[0])
+            diagram.set_sla(split, 0)
+            diagram.set_sla(join, 0)
+            diagram.add_link(start, split)
+            diagram.add_link(split, first, "да")
+            diagram.add_link(split, second, "нет")
+            diagram.add_link(first, join)
+            diagram.add_link(second, join)
+            diagram.add_link(join, end)
+        return diagram.analyze_bottlenecks()["sla"]
+
+    par_diff = _role_case(["А", "Б"], "par", False)
+    assert par_diff["critical_path_hours"] == 5 and par_diff["role_hours"] == 5, par_diff
+    par_same = _role_case(["А"], "par", True)
+    assert par_same["critical_path_hours"] == 5 and par_same["role_hours"] == 8, par_same
+    xor_same = _role_case(["А"], "xor", True)
+    assert xor_same["critical_path_hours"] == 5 and xor_same["role_hours"] == 5, xor_same
+    chain_same = _role_case(["А"], "chain", True)
+    assert chain_same["critical_path_hours"] == 8 and chain_same["role_hours"] == 8, chain_same
+    role_once = opened["audit"]["sla"]["role_hours"]
+    role_twice = generate_bpmn_from_text(text1, use_llm=False)[1]["sla"]["role_hours"]
+    assert role_once == role_twice
+    assert opened["audit"]["sla"]["critical_path_hours"] == 9.7
+    role_facts = {
+        "tobe_ready": True, "rw_before": 8.0, "rw_after": 5.0, "cp_before": 8.0, "cp_after": 5.0,
+        "loops_before": 0, "loops_after": 0, "rw_saved_pct": 37,
+    }
+    one_role = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Параллельно*: Мастер: Первый шаг (3 ч).\n2. Параллельно: Мастер: Второй шаг (5 ч).\n",
+        {}, {}, role_facts,
+    )
+    one_par = next(p for p in one_role["parts"] if p["kind"] == "parallel")
+    assert one_par["same_role"] is True and one_par["hours"] != 0, one_par
+    chain = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        {}, {}, role_facts,
+    )
+    assert next(p for p in chain["parts"] if p["kind"] == "parallel")["same_role"] is False
+    skipped = compare_asis_tobe(
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        "Регламент: Роли\n1. Мастер: Первый шаг (3 ч).\n2. Мастер: Второй шаг (5 ч).\n",
+        {}, {}, dict(role_facts, move_hours=[{"kind": "stopped", "path_hours": 0, "premium_hours": 0}]),
+    )
+    assert skipped["saved_hours"] == 3.0
+    assert [p["label"] for p in skipped["parts"]] == ["Раскладка по категориям не считалась: ходов больше 12"]
+
+
+    # --- P0 нотация: подпись шлюза, имя, цепочка, дорожка ИС, примеры 1–3 ---
+    gw_reg = (
+        "Регламент: Шлюз\n"
+        "1. Бухгалтер: Проверить сумму. Если сумма больше 100 — согласовать, иначе отклонить (1 ч).\n"
+        "2. Бухгалтер: Согласовать платёж (1 ч).\n"
+        "3. Бухгалтер: Отклонить заявку (1 ч).\n"
+    )
+    d_gw = BPMNDiagramBuilder(process_name="Шлюз")
+    _pool, lanes_gw = d_gw.add_pool("p", ["Бухгалтер"])
+    lane_gw = lanes_gw[0]
+    st_gw = d_gw.add_start_event("Старт", lane_gw)
+    en_gw = d_gw.add_end_event("Конец", lane_gw)
+    t_sum = d_gw.add_task("Проверить сумму", lane_gw)
+    d_gw.set_sla(t_sum, 1.0)
+    gw = d_gw.add_exclusive_gateway("сумма больше 100?", lane_gw)
+    t_yes = d_gw.add_task("Согласовать платёж", lane_gw)
+    d_gw.set_sla(t_yes, 1.0)
+    t_no = d_gw.add_task("Отклонить заявку", lane_gw)
+    d_gw.set_sla(t_no, 1.0)
+    d_gw.add_link(st_gw, t_sum)
+    d_gw.add_link(t_sum, gw)
+    d_gw.add_link(gw, t_yes, "")
+    d_gw.add_link(gw, t_no, "")
+    d_gw.add_link(t_yes, en_gw)
+    d_gw.add_link(t_no, en_gw)
+    d_gw.heal_graph()
+    meth_gw0 = d_gw.check_methodology_compliance()
+    hours_gw0 = {n.id: n.sla_hours for n in d_gw.nodes.values()}
+    assert any("без подписи" in v for v in meth_gw0["violations"]), meth_gw0
+    apply_notation_to_diagram(d_gw, gw_reg)
+    meth_gw1 = d_gw.check_methodology_compliance()
+    assert not any("без подписи" in v for v in meth_gw1["violations"]), meth_gw1
+    assert int(meth_gw1["score"]) > int(meth_gw0["score"])
+    assert all(n.sla_hours == hours_gw0[n.id] for n in d_gw.nodes.values())
+
+    name_reg = (
+        "Регламент: Имя\n"
+        "1. Бухгалтер: Заявка. Проверить заявку (1 ч).\n"
+        "2. Бухгалтер: Оплатить счёт (1 ч).\n"
+    )
+    xml_n0, aud_n0, err_n0 = generate_bpmn_from_text(name_reg, use_llm=False)
+    assert not err_n0
+    assert aud_n0["methodology"]["score"] < 100
+    name_fixed, name_acts = apply_notation_moves_text(name_reg)
+    assert name_acts, name_acts
+    xml_n1, aud_n1, err_n1 = generate_bpmn_from_text(name_fixed, use_llm=False)
+    assert not err_n1
+    assert aud_n1["methodology"]["score"] > aud_n0["methodology"]["score"]
+    assert aud_n1["sla"]["critical_path_hours"] == aud_n0["sla"]["critical_path_hours"]
+    bare_name = (
+        "Регламент: Имя без глагола\n"
+        "1. Бухгалтер: Заявка (1 ч).\n"
+        "2. Бухгалтер: Оплатить счёт (1 ч).\n"
+    )
+    xml_b0, aud_b0, err_b0 = generate_bpmn_from_text(bare_name, use_llm=False)
+    bare_fixed, bare_acts = apply_notation_moves_text(bare_name)
+    assert not bare_acts
+    xml_b1, aud_b1, err_b1 = generate_bpmn_from_text(bare_fixed or bare_name, use_llm=False)
+    assert aud_b1["methodology"]["score"] == aud_b0["methodology"]["score"]
+
+    chain5 = (
+        "Регламент: Цепочка роли\n"
+        "1. Диспетчер: Принять заявку смены (1 ч).\n"
+        "2. Диспетчер: Проверить комплект документов (1 ч).\n"
+        "3. Диспетчер: Зарегистрировать обращение в журнале (1 ч).\n"
+        "4. Диспетчер: Назначить исполнителя работ (1 ч).\n"
+        "5. Диспетчер: Передать наряд в работу (1 ч).\n"
+        "6. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    xml_c0, aud_c0, err_c0 = generate_bpmn_from_text(chain5, use_llm=False)
+    assert not err_c0
+    assert aud_c0["methodology"]["score"] < 100
+    assert aud_c0["methodology"]["long_chains"]
+    cp_c0 = aud_c0["sla"]["critical_path_hours"]
+    wrapped, wrap_acts = apply_chain_wrap_text(chain5)
+    assert wrap_acts
+    xml_c1, aud_c1, err_c1 = generate_bpmn_from_text(wrapped, use_llm=False)
+    assert not err_c1
+    assert aud_c1["methodology"]["score"] > aud_c0["methodology"]["score"]
+    assert not aud_c1["methodology"]["long_chains"]
+    assert aud_c1["sla"]["critical_path_hours"] == cp_c0
+    assert "Принять заявку смены" in wrapped and "Передать наряд в работу" in wrapped
+    opt_c, delta_c = optimize_process_to_be(chain5, aud_c0)
+    rem_c, left_c = notation_removed_remaining(aud_c0, delta_c.get("tobe_audit") or {})
+    # цепочка снята этапом, а не спрятана из формулы
+    assert any("Диспетчер" in str((x.get("message") if isinstance(x, dict) else x)) for x in (delta_c.get("violations_removed") or rem_c))
+    assert not (delta_c.get("tobe_audit") or {}).get("methodology", {}).get("long_chains")
+
+    # шаг не уезжает на «Информационная система», если этих слов нет в предложении
+    is_reg = (
+        "Регламент: Роль\n"
+        "1. Диспетчер: Зарегистрировать обращение (1 ч).\n"
+        "2. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    d_is = BPMNDiagramBuilder(process_name="ИС")
+    _p, lanes_is = d_is.add_pool("p", ["Диспетчер", "Мастер", "Информационная система"])
+    t_is = d_is.add_task("Зарегистрировать обращение", lanes_is[0])
+    d_is.set_sla(t_is, 1.0)
+    apply_notation_to_diagram(d_is, is_reg)
+    lane_name = d_is.lanes[d_is.nodes[t_is].lane_id].name if d_is.nodes[t_is].lane_id in d_is.lanes else ""
+    assert lane_name != "Информационная система", lane_name
+
+    for ex_path, bare, with_ret in [
+        ("examples/example_1_substation_repair.txt", 9.7, 12.55),
+        ("examples/example_2_equipment_procurement.txt", 528.3, 856.5),
+        ("examples/example_3_grid_connection.txt", 400.3, 584.4),
+    ]:
+        ex_text = (Path(__file__).resolve().parent / ex_path).read_text(encoding="utf-8")
+        _x, ex_aud, ex_err = generate_bpmn_from_text(ex_text, use_llm=False)
+        assert not ex_err, ex_err
+        assert ex_aud["sla"]["critical_path_hours"] == bare, (ex_path, ex_aud["sla"]["critical_path_hours"])
+        assert ex_aud["sla"]["with_rework_hours"] == with_ret, (ex_path, ex_aud["sla"]["with_rework_hours"])
+        _opt, ex_delta = optimize_process_to_be(ex_text, ex_aud)
+        assert float(ex_delta.get("with_rework_after") or 0) < float(ex_delta.get("with_rework_before") or 0), ex_path
+        assert float(ex_delta.get("sla_saved_hours") or 0) > 0, ex_path
+        tobe_score = int(((ex_delta.get("tobe_audit") or {}).get("methodology") or {}).get("score") or 0)
+        assert int(ex_delta.get("quality_after") or 0) == tobe_score, ex_path
+        assert int(ex_delta.get("quality_before") or 0) == int(ex_aud["methodology"]["score"]), ex_path
+        if "example_2" in ex_path:
+            tobe_m = ((ex_delta.get("tobe_audit") or {}).get("methodology") or {})
+            if tobe_m.get("long_chains"):
+                assert int(ex_delta.get("quality_after") or 0) < 100
+            else:
+                # Этап «Проведение конкурентной процедуры» уже подпроцесс в As-Is: нотация чистая до To-Be.
+                assert int(ex_delta.get("quality_after") or 0) >= int(ex_delta.get("quality_before") or 0)
+
+    # Чужой балл холста не становится левым. Свой балл To-Be не подменяется баллом As-Is.
+    chain_item = {
+        "type": "chain",
+        "role": "Закупочная служба",
+        "steps": ["Проверить комплектность заявки"],
+        "message": "«Закупочная служба»: Проверить комплектность заявки",
+        "quote": "",
+    }
+    mixed = {
+        "quality_before": 62,
+        "quality_after": 62,
+        "baseline_violations": [chain_item],
+        "violations_removed": [],
+        "violations_remaining": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        mixed,
+        {"methodology": {"score": 62, "violation_items": [chain_item], "quality_fraction": "8 / 13"}},
+    )
+    assert mixed["quality_before"] == 62 and mixed["quality_after"] == 62, mixed
+    assert mixed["violations_removed"] == []
+    assert mixed["violations_remaining"]
+    raised = {
+        "quality_before": 50,
+        "quality_after": 50,
+        "baseline_violations": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        raised,
+        {"methodology": {"score": 80, "violation_items": []}},
+    )
+    assert raised["quality_before"] == 50 and raised["quality_after"] == 80
+    assert raised["violations_removed"]
+    kept = {
+        "quality_before": 62,
+        "quality_after": 62,
+        "baseline_violations": [chain_item],
+    }
+    bpmn_app._keep_local_tobe_quality(
+        kept,
+        {"methodology": {"score": 75, "violation_items": [chain_item], "quality_fraction": "12 / 16"}},
+    )
+    assert kept["quality_before"] == 62 and kept["quality_after"] == 75, kept
+
+    accepted_text = (
+        "Регламент: Принятый To-Be\n"
+        "1. Диспетчер: Принять заявку (1 ч).\n"
+        "2. Мастер: Закрыть наряд (1 ч).\n"
+    )
+    bpmn_app.st.session_state["tobe_pack"] = {"text": accepted_text}
+    bpmn_app.st.session_state["use_llm"] = False
+    bpmn_app.st.session_state["example_choice"] = "старый пример"
+    bpmn_app.st.session_state["applied_example"] = "старый пример"
+    bpmn_app._accept_tobe_as_main()
+    assert bpmn_app.st.session_state["reg_text"].startswith("Регламент: Принятый To-Be")
+    assert bpmn_app.st.session_state["example_choice"] == bpmn_app.CUSTOM_LABEL
+    assert bpmn_app.st.session_state["applied_example"] == bpmn_app.CUSTOM_LABEL
+    assert bpmn_app.st.session_state.get("tobe_accept_pending")
+    assert "tobe_pack" not in bpmn_app.st.session_state
+    bpmn_app._consume_tobe_accept()
+    accepted_result = bpmn_app.st.session_state.get("result") or {}
+    assert accepted_result.get("xml") and not accepted_result.get("error")
+    assert "Принять заявку" in (bpmn_app.st.session_state.get("reg_text") or "")
+    accepted_md = generate_process_passport(
+        accepted_result["xml"], accepted_result["audit"], bpmn_app.st.session_state["reg_text"],
+    )
+    accepted_docx = export_docx_passport(
+        accepted_result["xml"], accepted_result["audit"], bpmn_app.st.session_state["reg_text"],
+    )
+    assert "Принять заявку" in accepted_md and accepted_docx[:2] == b"PK"
 
     print(
         "ok",

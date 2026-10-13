@@ -104,7 +104,16 @@ def validate(path: str) -> List[str]:
     shapes: Dict[str, Rect] = {}
     for s in root.iter(_q("bpmndi", "BPMNShape")):
         shapes[s.get("bpmnElement", "")] = _rect(s)
-    edges = list(root.iter(_q("bpmndi", "BPMNEdge")))
+    # Связи с артефактами данных (опциональный слой bpmn_artifacts): источник — задача-владелец.
+    data_links: Dict[str, Tuple[str, str]] = {}
+    for parent in root.iter():
+        for child in parent:
+            if child.tag in (_q("bpmn", "dataOutputAssociation"), _q("bpmn", "dataInputAssociation")):
+                target = child.find("bpmn:targetRef", NS)
+                data_links[child.get("id", "")] = (parent.get("id", ""), (target.text or "").strip() if target is not None else "")
+    all_edges = list(root.iter(_q("bpmndi", "BPMNEdge")))
+    edges = [e for e in all_edges if e.get("bpmnElement", "") not in data_links]
+    data_edges = [e for e in all_edges if e.get("bpmnElement", "") in data_links]
     if len(edges) != len(flows):
         problems.append(f"рёбер DI {len(edges)} != sequenceFlow {len(flows)}")
 
@@ -118,6 +127,21 @@ def validate(path: str) -> List[str]:
                 _contains(node_rects[a], node_rects[b]) or _contains(node_rects[b], node_rects[a])
             ):
                 problems.append(f"наезд блоков {a} и {b}")
+
+    for e in data_edges:
+        eid = e.get("bpmnElement", "")
+        src, tgt = data_links[eid]
+        pts = [(float(w.get("x")), float(w.get("y"))) for w in e.findall("di:waypoint", NS)]  # type: ignore[arg-type]
+        if len(pts) < 2:
+            problems.append(f"{eid}: нет waypoint")
+            continue
+        skip = {src, tgt} | {k for k, r in node_rects.items() if src in node_rects and _contains(r, node_rects[src])}
+        for a, b in zip(pts, pts[1:]):
+            if abs(a[0] - b[0]) > 0.2 and abs(a[1] - b[1]) > 0.2:
+                problems.append(f"{eid}: диагональный сегмент {a}->{b}")
+            for k, r in node_rects.items():
+                if k not in skip and _seg_hits(a, b, (r[0] + 1, r[1] + 1, r[2] - 1, r[3] - 1)):
+                    problems.append(f"{eid}: пересекает блок {k}")
 
     label_rects: List[Tuple[str, Rect]] = []
     all_segments: List[Tuple[str, Tuple[float, float], Tuple[float, float]]] = []
