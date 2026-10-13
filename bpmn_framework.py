@@ -293,6 +293,7 @@ class FlowNode:
     inner_start_id: Optional[str] = None
     inner_end_id: Optional[str] = None
     label_rect: Optional[Rect] = None
+    terminate: bool = False  # endEvent с terminateEventDefinition: досрочный останов (отказ, брак, вето)
 
 
 @dataclass
@@ -645,6 +646,15 @@ class BPMNDiagramBuilder:
 
     def add_end_event(self, name: str, parent_id: str, node_id: Optional[str] = None) -> str:
         return self._register_node(name, "endEvent", parent_id, "Event", node_id=node_id)
+
+    def add_terminate_end_event(self, name: str, parent_id: str) -> str:
+        """Досрочное завершение (отказ СБ, брак, вето) — в дорожке проверяющего.
+
+        Успешный финал по-прежнему сходится в ROOT_END_TASK_ID: контракт песочницы не меняется.
+        """
+        node_id = self._register_node(name or "Процесс прекращён", "endEvent", parent_id, "Event")
+        self.nodes[node_id].terminate = True
+        return node_id
 
     def subprocess_entry(self, subprocess_id: str) -> Optional[str]:
         node = self.nodes.get(subprocess_id)
@@ -2379,6 +2389,9 @@ class BPMNDiagramBuilder:
             lines.append(f"{inner}<bpmn:incoming>{flow_id}</bpmn:incoming>")
         for flow_id in outgoing.get(node.id, []):
             lines.append(f"{inner}<bpmn:outgoing>{flow_id}</bpmn:outgoing>")
+        if node.kind == "endEvent" and node.terminate:
+            # tEndEvent: incoming → … → eventDefinition (порядок XSD BPMN 2.0).
+            lines.append(f'{inner}<bpmn:terminateEventDefinition id="{node.id}_terminate" />')
         if node.kind == "subProcess":
             children = self._children(node.id)
             child_ids = {c.id for c in children}

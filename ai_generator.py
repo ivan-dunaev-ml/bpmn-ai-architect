@@ -83,10 +83,13 @@ t = DIAGRAM.add_script_task("Глагол + объект", lanes[0])   # сис�
 sp = DIAGRAM.create_subprocess("Название этапа", lanes[0])  # задачи этапа: add_user_task(..., sp), связи внутри sp
 g = DIAGRAM.add_exclusive_gateway("Вопрос?", lanes[0])     # XOR, имя заканчивается «?»
 p = DIAGRAM.add_parallel_gateway("Название", lanes[0])     # AND: split и join всегда парой
+e = DIAGRAM.add_terminate_end_event("Процесс прекращён", lanes[0])  # отказ/брак/вето посреди процесса
 DIAGRAM.add_link(a, b, "условие")  # у каждой ветки XOR — подпись условия
 DIAGRAM.set_sla(t, часы)           # только срок из текста: 15 мин = 0.25, 1 рабочий день = 8, сутки = 24
 Второй аргумент add_* — дорожка lanes[i] или подпроцесс sp, никогда не задача и не шлюз.
-Дорожка — должность, подразделение, информационная система или внешняя организация; не документ и не оборудование.
+Дорожки — только участники процесса (должности, подразделения, внешние контрагенты) или информационные системы.
+Документы, договоры, заявки, акты и оборудование дорожками быть не могут («Договор вступает в силу» — не роль).
+Успешный финал — ROOT_END_TASK_ID; ветка отказа посреди процесса — add_terminate_end_event в дорожке проверяющего.
 Исполнитель не назван — дорожка «Ответственный исполнитель».
 
 ГРАФ:
@@ -949,6 +952,8 @@ VERB_MAP = {
     "вносит": "внести", "проводит": "провести", "готовит": "подготовить", "производит": "произвести",
     "оформляет": "оформить", "направляет": "направить", "определяет": "определить", "проверяет": "проверить",
     "выполняет": "выполнить", "составляет": "составить", "подписывает": "подписать", "заключает": "заключить",
+    "согласовывает": "согласовать", "согласовывают": "согласовать", "подписывают": "подписать",
+    "утверждает": "утвердить", "утверждают": "утвердить",
     "передаёт": "передать", "передает": "передать", "допускает": "допустить", "выводит": "вывести",
     "восстанавливает": "восстановить", "измеряет": "измерить", "рассчитывает": "рассчитать",
     "регистрирует": "зарегистрировать", "формирует": "сформировать", "фиксирует": "зафиксировать",
@@ -1703,6 +1708,16 @@ def _subject_before_verb(text: str) -> Optional[Tuple[str, int]]:
     return None
 
 
+def _subject_is_artifact(subject: str) -> bool:
+    """«Договор вступает в силу», «Заявка регистрируется» — подлежащее-документ, а не исполнитель.
+
+    Дорожкой может быть только участник процесса или информационная система.
+    """
+    if any(rx.search(subject) for rx, _ in _ROLE_RE):
+        return False
+    return any((m := rx.search(subject)) and m.start() == 0 for rx, _ in _ARTIFACT_RE)
+
+
 def _canonical_role(subject: str) -> str:
     for regex, name in _ROLE_RE:
         if regex.search(subject):
@@ -1791,7 +1806,7 @@ def _find_role(text: str) -> Tuple[Optional[str], int, int]:
         tail_start = vm.end() if vm else 0
         return role, tail_start, len(text.strip())
     subject = _subject_before_verb(text[:120])
-    if subject:
+    if subject and not _subject_is_artifact(subject[0]):
         return _canonical_role(subject[0]), 0, subject[1]
     best: Optional[Tuple[int, int, str]] = None
     for regex, name in _ROLE_RE:
@@ -3155,7 +3170,7 @@ def generate_bpmn_from_text(regulation_text: str, use_llm: bool = True) -> Tuple
             trace.append(
                 "режим эмулятора: облачная модель выключена"
                 if llm_providers.mode() == "emulator"
-                else "облачная модель не подключена (нет ключа API)"
+                else f"облачная модель: {llm_providers.status_line()}"
             )
         draft_code = _blueprint_parts(text)[1]
         for name, call in _engines():
@@ -7530,7 +7545,12 @@ def _tobe_time_win(asis: Dict[str, float], cand: Dict[str, float]) -> bool:
 def _tobe_known_block(base: Dict[str, float], cand: Dict[str, float]) -> str:
     """Причина отказа из уже существующих формулировок. Новых причин нет."""
     if cand["cp"] > base["cp"] + _TOBE_MINUTE:
-        return f"Голый путь To-Be длиннее: {_fh(base['cp'])} → {_fh(cand['cp'])}."
+        before, after = _fh(base["cp"]), _fh(cand["cp"])
+        if before == after:
+            # 380.3 → 380.4 ч при округлении выглядело как «380 ч → 380 ч»: показываем разницу.
+            extra = (cand["cp"] - base["cp"]) * 60.0
+            return f"Голый путь To-Be длиннее на {extra:.0f} мин: {base['cp']:.2f} ч → {cand['cp']:.2f} ч."
+        return f"Голый путь To-Be длиннее: {before} → {after}."
     loops_b, loops_a = int(base["loops"]), int(cand["loops"])
     if loops_a > loops_b:
         return f"Циклы возврата не уменьшились: {loops_b} → {loops_a}."
@@ -8689,6 +8709,49 @@ def _apply_notation_and_wrap(text: str) -> Tuple[str, List[Dict[str, str]]]:
     return cur, actions
 
 
+_EDO_STEP_RE = re.compile(r"согласов|подпис|утвержд|визир|рассматр", re.I)
+
+
+def _edo_fallback_text(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Гарантированный ход To-Be: согласование/подписание от 16 ч переводится в ЭДО.
+
+    Новый срок — 30% регламентного, от 4 до 24 ч (80 ч → 24 ч). Это допущение о нормативе ЭДО,
+    поэтому ход идёт последним, только если перестановки не прошли проверку, и подписан как допущение.
+    Шаги охраны труда (наряд-допуск, инструктаж, допуск) не трогаем.
+    """
+    raw = normalize_regulation(text or "")
+    header, steps = _split_steps(raw)
+    try:
+        parsed = parse_regulation(raw)
+    except Exception:  # noqa: BLE001
+        return text, []
+    n = min(len(parsed.steps), len(steps))
+    bodies = [steps[i]["body"] for i in range(n)]
+    actions: List[Dict[str, str]] = []
+    for i in range(n):
+        step, body = parsed.steps[i], bodies[i]
+        hours = float(step.hours or 0)
+        if hours < 16 or not _EDO_STEP_RE.search(f"{step.title} {body}") or _ot_sensitive(step, body):
+            continue
+        match = _DUR_RE.search(body)
+        if not match:
+            continue
+        new_hours = max(4, min(24, int(round(hours * 0.3))))
+        if new_hours >= hours:
+            continue
+        bodies[i] = body[: match.start()] + f" ({new_hours} часов)" + body[match.end():]
+        actions.append({
+            "kind": "edo_approval",
+            "detail": (
+                f"Шаг {step.num} «{step.title}»: согласование через ЭДО — {_fh(hours)} → {_fh(float(new_hours))}. "
+                "Срок — допущение о нормативе ЭДО, его подтверждает владелец процесса."
+            ),
+        })
+    if not actions:
+        return text, []
+    return _join_steps(header, [{"body": b} for b in bodies]), actions
+
+
 def optimize_process_to_be(
     regulation_text: str, audit_data: dict, skip_auto: Optional[Iterable[int]] = None,
 ) -> Tuple[str, dict]:
@@ -8841,6 +8904,12 @@ def optimize_process_to_be(
                 "control": set(ctrl_idx),
             },
         )
+
+    if best is None:
+        # Перестановки не прошли проверку — запасной ход: согласования через ЭДО (с пометкой «допущение»).
+        edo_text, edo_actions = _edo_fallback_text(text)
+        if edo_actions:
+            _consider(edo_text, edo_actions, "semantic-optimizer", None)
 
     engine = "semantic-optimizer"
 

@@ -22,9 +22,11 @@ Yandex AI Studio (OpenAI-совместимый Chat Completions):
 
 from __future__ import annotations
 
+import contextvars
 import math
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -72,11 +74,42 @@ class Provider:
         return self.input_limit
 
 
+# Выбор движка в интерфейсе — на сессию пользователя, не на весь сервер: переменная окружения общая
+# для всех посетителей, а contextvar живёт в потоке сессии Streamlit.
+_SESSION_MODE: "contextvars.ContextVar[str]" = contextvars.ContextVar("bpmn_provider_mode", default="")
+
+
+def set_session_mode(value: str) -> None:
+    """Режим из переключателя интерфейса: auto | yandex | cloud | emulator; пустая строка — как в окружении."""
+    value = (value or "").strip().lower()
+    _SESSION_MODE.set(value if value in MODES else "")
+
+
+@contextmanager
+def session_mode(value: str):
+    token = _SESSION_MODE.set((value or "").strip().lower() if (value or "").strip().lower() in MODES else "")
+    try:
+        yield
+    finally:
+        _SESSION_MODE.reset(token)
+
+
 def mode() -> str:
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return "emulator"
+    chosen = _SESSION_MODE.get()
+    if chosen:
+        return chosen
     value = os.getenv("BPMN_PROVIDER", "auto").strip().lower()
     return value if value in MODES else "auto"
+
+
+def yandex_configured() -> bool:
+    return yandex_provider() is not None
+
+
+def cloud_configured() -> bool:
+    return bool(cloud_providers())
 
 
 def estimate_tokens(text: str) -> int:

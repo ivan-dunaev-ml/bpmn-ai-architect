@@ -167,7 +167,7 @@
     },
     {
       "id": "Activity_12",
-      "name": "Определить победителя и утверждать протокол",
+      "name": "Определить победителя и утвердить протокол",
       "kind": "userTask",
       "role": "Тендерный комитет",
       "hours": 16.0
@@ -221,8 +221,16 @@
     "Целевой SLA нарушается: сократите длительность шагов критического пути или уберите возвраты."
   ],
   "auto_healed": [],
-  "engine_warnings": [],
-  "skipped_links": [],
+  "engine_warnings": [
+    "add_link пропущен: У завершающего события Event_3 не может быть исходящих потоков"
+  ],
+  "skipped_links": [
+    {
+      "source": "Event_3",
+      "target": "Event_RootEnd",
+      "reason": "У завершающего события Event_3 не может быть исходящих потоков"
+    }
+  ],
   "methodology": {
     "score": 100,
     "max_score": 100,
@@ -277,7 +285,7 @@
     "violation_items": []
   },
   "stats": {
-    "nodes": 23,
+    "nodes": 24,
     "valid_links": 25,
     "lanes": 5,
     "subprocesses": 1,
@@ -286,7 +294,9 @@
     "critical_path_hours": 528.3
   },
   "quality": {
-    "issues": [],
+    "issues": [
+      "Связь пропущена: У завершающего события Event_3 не может быть исходящих потоков"
+    ],
     "critical": [],
     "ok": true
   },
@@ -297,13 +307,13 @@
   "xsd_valid": true,
   "bpmn_quality": {
     "visual": {
-      "routing_quality": 59,
+      "routing_quality": 79,
       "spacing_quality": 50,
       "lane_balance": 80,
       "gateway_clarity": 100,
       "label_readability": 100,
-      "overall_visual_score": 76,
-      "crossings": 2,
+      "overall_visual_score": 81,
+      "crossings": 0,
       "long_back_edges": 1,
       "label_overlaps": 0,
       "gateways_xor": 3,
@@ -352,12 +362,12 @@
       "method": "0.40·полнота + 0.25·логика + 0.20·структура + 0.15·ясность регламента"
     },
     "process_improvement": {
-      "score": 61,
+      "score": 64,
       "parts": {
         "sla": 0,
         "rework": 0,
         "role": 78,
-        "bpmn": 76
+        "bpmn": 81
       }
     },
     "trace_warnings": [],
@@ -459,7 +469,7 @@
           "semantic": "decision",
           "blueprint_id": "T11",
           "role": "Тендерный комитет",
-          "bpmn_element": "Определить победителя и утверждать протокол",
+          "bpmn_element": "Определить победителя и утвердить протокол",
           "status": "ok"
         },
         {
@@ -591,10 +601,10 @@
     "engine": "semantic-emulator",
     "fallback": true,
     "trace": [
-      "облачная модель не подключена (нет ключа API)"
+      "режим эмулятора: облачная модель выключена"
     ],
     "rejected": [],
-    "elapsed_s": 0.04,
+    "elapsed_s": 0.06,
     "parsed": {
       "title": "Закупка силового трансформатора 110/10 кВ с проверкой СБ и тендерным комитетом",
       "steps": 13,

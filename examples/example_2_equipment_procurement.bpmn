@@ -10,6 +10,7 @@
         <bpmn:flowNodeRef>Activity_2</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_14</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Event_RootStart</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_RootEnd</bpmn:flowNodeRef>
       </bpmn:lane>
       <bpmn:lane id="Lane_2" name="Закупочная служба">
         <bpmn:flowNodeRef>Activity_3</bpmn:flowNodeRef>
@@ -20,7 +21,7 @@
       <bpmn:lane id="Lane_3" name="Служба безопасности">
         <bpmn:flowNodeRef>Activity_9</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Gateway_2</bpmn:flowNodeRef>
-        <bpmn:flowNodeRef>Event_RootEnd</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_3</bpmn:flowNodeRef>
       </bpmn:lane>
       <bpmn:lane id="Lane_4" name="Тендерный комитет">
         <bpmn:flowNodeRef>Gateway_3</bpmn:flowNodeRef>
@@ -110,7 +111,7 @@
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:userTask id="Activity_12" name="Определить победителя и утверждать протокол">
+    <bpmn:userTask id="Activity_12" name="Определить победителя и утвердить протокол">
       <bpmn:incoming>Flow_19</bpmn:incoming>
       <bpmn:outgoing>Flow_10</bpmn:outgoing>
     </bpmn:userTask>
@@ -130,8 +131,11 @@
     <bpmn:startEvent id="Event_RootStart" name="Старт процесса">
       <bpmn:outgoing>Flow_11</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:endEvent id="Event_RootEnd" name="Процесс завершён">
+    <bpmn:endEvent id="Event_3" name="Процесс прекращён">
       <bpmn:incoming>Flow_18</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="Event_3_terminate" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="Event_RootEnd" name="Процесс завершён">
       <bpmn:incoming>Flow_23</bpmn:incoming>
     </bpmn:endEvent>
     <bpmn:sequenceFlow id="Flow_1" sourceRef="Activity_3" targetRef="Gateway_1" />
@@ -148,7 +152,7 @@
     <bpmn:sequenceFlow id="Flow_15" name="Замечания" sourceRef="Gateway_1" targetRef="Activity_2" />
     <bpmn:sequenceFlow id="Flow_16" sourceRef="Activity_4" targetRef="Activity_9" />
     <bpmn:sequenceFlow id="Flow_17" name="Проверка пройдена" sourceRef="Gateway_2" targetRef="Gateway_3" />
-    <bpmn:sequenceFlow id="Flow_18" name="Отказ СБ" sourceRef="Gateway_2" targetRef="Event_RootEnd" />
+    <bpmn:sequenceFlow id="Flow_18" name="Отказ СБ" sourceRef="Gateway_2" targetRef="Event_3" />
     <bpmn:sequenceFlow id="Flow_19" sourceRef="Gateway_4" targetRef="Activity_12" />
     <bpmn:sequenceFlow id="Flow_20" name="Победитель определён" sourceRef="Gateway_5" targetRef="Activity_13" />
     <bpmn:sequenceFlow id="Flow_21" name="Повторные торги" sourceRef="Gateway_5" targetRef="Activity_4" />
@@ -246,12 +250,12 @@
         <dc:Bounds x="2992.0" y="1138.5" width="140.0" height="106.0" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_12_di" bpmnElement="Activity_12" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
-        <dc:Bounds x="3326.0" y="924.5" width="140.0" height="106.0" />
+        <dc:Bounds x="3326.0" y="931.8" width="140.0" height="91.5" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Gateway_5_di" bpmnElement="Gateway_5" isMarkerVisible="true" bioc:stroke="#F57F17" bioc:fill="#FFF8E1" color:border-color="#F57F17" color:background-color="#FFF8E1">
         <dc:Bounds x="3538.0" y="952.5" width="50.0" height="50.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="3407.0" y="880.5" width="150.0" height="30.0" />
+          <dc:Bounds x="3407.0" y="900.5" width="150.0" height="30.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="Activity_13_di" bpmnElement="Activity_13" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
@@ -266,10 +270,16 @@
           <dc:Bounds x="219.4" y="223.5" width="105.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
-        <dc:Bounds x="4084.0" y="752.8" width="36.0" height="36.0" />
+      <bpmndi:BPMNShape id="Event_3_di" bpmnElement="Event_3" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
+        <dc:Bounds x="2877.0" y="752.8" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="4042.6" y="792.8" width="118.8" height="15.0" />
+          <dc:Bounds x="2917.0" y="755.8" width="120.0" height="30.0" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
+        <dc:Bounds x="4084.0" y="183.5" width="36.0" height="36.0" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="4042.6" y="223.5" width="118.8" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1" bioc:stroke="#E65100" color:border-color="#E65100">
@@ -356,11 +366,11 @@
           <dc:Bounds x="2781.0" y="807.8" width="125.6" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_18_di" bpmnElement="Flow_18" bioc:stroke="#E65100" color:border-color="#E65100">
+      <bpmndi:BPMNEdge id="Flow_18_di" bpmnElement="Flow_18" bioc:stroke="#64748B" color:border-color="#64748B">
         <di:waypoint x="2798.0" y="770.8" />
-        <di:waypoint x="4084.0" y="770.8" />
+        <di:waypoint x="2877.0" y="770.8" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2806.0" y="741.8" width="64.4" height="15.0" />
+          <dc:Bounds x="2805.3" y="741.8" width="64.4" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_19_di" bpmnElement="Flow_19" bioc:stroke="#E65100" color:border-color="#E65100">
@@ -391,8 +401,7 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_23_di" bpmnElement="Flow_23" bioc:stroke="#E65100" color:border-color="#E65100">
         <di:waypoint x="4012.0" y="201.5" />
-        <di:waypoint x="4102.0" y="201.5" />
-        <di:waypoint x="4102.0" y="752.8" />
+        <di:waypoint x="4084.0" y="201.5" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_24_di" bpmnElement="Flow_24" bioc:stroke="#64748B" color:border-color="#64748B">
         <di:waypoint x="1212.0" y="507.0" />

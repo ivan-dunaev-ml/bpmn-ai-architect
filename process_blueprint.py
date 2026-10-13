@@ -739,6 +739,8 @@ def compile_blueprint(blueprint: ProcessBlueprint) -> tuple:
     def as_expr(target: Any) -> str:
         if target == "END":
             return end_expr
+        if isinstance(target, tuple):
+            return target[1]
         return entry[target]
 
     for index, unit in enumerate(units):
@@ -750,6 +752,17 @@ def compile_blueprint(blueprint: ProcessBlueprint) -> tuple:
         rework = reworks.get(decision.num)
         gw = gateways[index]
         yes, no = _branch_targets(index, decision, rework, len(units), num_to_unit)
+        if index + 1 < len(units) and (yes == "END") != (no == "END"):
+            # «Если подрядчик неблагонадёжен — завершить процесс» посреди регламента — это отказ,
+            # а не успешный финал: событие останова в дорожке проверяющего. Успех — в ROOT_END.
+            stop = f"te{index}"
+            code.append(
+                f"{stop} = DIAGRAM.add_terminate_end_event('Процесс прекращён', {lane(decision.role or unit.role)})"
+            )
+            if yes == "END":
+                yes = ("STOP", stop)
+            else:
+                no = ("STOP", stop)
         if decision.flow == FlowType.CORRECTION and rework is not None:
             fix = f"fix{index}"
             code.append(

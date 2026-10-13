@@ -11,7 +11,7 @@
         <bpmn:flowNodeRef>Gateway_2</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_12</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Event_RootStart</bpmn:flowNodeRef>
-        <bpmn:flowNodeRef>Event_RootEnd</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_3</bpmn:flowNodeRef>
       </bpmn:lane>
       <bpmn:lane id="Lane_2" name="Центр обслуживания клиентов">
         <bpmn:flowNodeRef>Activity_2</bpmn:flowNodeRef>
@@ -19,6 +19,7 @@
         <bpmn:flowNodeRef>Gateway_1</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_9</bpmn:flowNodeRef>
         <bpmn:flowNodeRef>Activity_15</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_RootEnd</bpmn:flowNodeRef>
       </bpmn:lane>
       <bpmn:lane id="Lane_3" name="Отдел технологического присоединения">
         <bpmn:flowNodeRef>Activity_4</bpmn:flowNodeRef>
@@ -133,8 +134,11 @@
     <bpmn:startEvent id="Event_RootStart" name="Старт процесса">
       <bpmn:outgoing>Flow_11</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:endEvent id="Event_RootEnd" name="Процесс завершён">
+    <bpmn:endEvent id="Event_3" name="Процесс прекращён">
       <bpmn:incoming>Flow_19</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="Event_3_terminate" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="Event_RootEnd" name="Процесс завершён">
       <bpmn:incoming>Flow_24</bpmn:incoming>
     </bpmn:endEvent>
     <bpmn:sequenceFlow id="Flow_1" sourceRef="Activity_3" targetRef="Gateway_1" />
@@ -152,7 +156,7 @@
     <bpmn:sequenceFlow id="Flow_16" sourceRef="Activity_4" targetRef="Activity_9" />
     <bpmn:sequenceFlow id="Flow_17" sourceRef="Activity_9" targetRef="Activity_10" />
     <bpmn:sequenceFlow id="Flow_18" name="Договор подписан" sourceRef="Gateway_2" targetRef="Gateway_3" />
-    <bpmn:sequenceFlow id="Flow_19" name="Отказ заявителя" sourceRef="Gateway_2" targetRef="Event_RootEnd" />
+    <bpmn:sequenceFlow id="Flow_19" name="Отказ заявителя" sourceRef="Gateway_2" targetRef="Event_3" />
     <bpmn:sequenceFlow id="Flow_20" sourceRef="Gateway_4" targetRef="Activity_13" />
     <bpmn:sequenceFlow id="Flow_21" name="Замечаний нет" sourceRef="Gateway_5" targetRef="Activity_14" />
     <bpmn:sequenceFlow id="Flow_22" name="Замечания к ТУ" sourceRef="Gateway_5" targetRef="Gateway_3" />
@@ -270,10 +274,16 @@
           <dc:Bounds x="219.4" y="223.5" width="105.2" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
-        <dc:Bounds x="4296.0" y="183.5" width="36.0" height="36.0" />
+      <bpmndi:BPMNShape id="Event_3_di" bpmnElement="Event_3" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
+        <dc:Bounds x="3089.0" y="183.5" width="36.0" height="36.0" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="4173.2" y="194.0" width="118.8" height="15.0" />
+          <dc:Bounds x="2995.0" y="263.5" width="120.0" height="30.0" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
+        <dc:Bounds x="4296.0" y="419.2" width="36.0" height="36.0" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="4254.6" y="459.2" width="118.8" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1" bioc:stroke="#E65100" color:border-color="#E65100">
@@ -306,8 +316,9 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_8_di" bpmnElement="Flow_8" bioc:stroke="#64748B" color:border-color="#64748B">
         <di:waypoint x="3107.0" y="988.8" />
-        <di:waypoint x="3107.0" y="201.5" />
-        <di:waypoint x="3204.0" y="201.5" />
+        <di:waypoint x="3107.0" y="625.2" />
+        <di:waypoint x="3274.0" y="625.2" />
+        <di:waypoint x="3274.0" y="261.8" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_9_di" bpmnElement="Flow_9" bioc:stroke="#64748B" color:border-color="#64748B">
         <di:waypoint x="3344.0" y="201.5" />
@@ -363,16 +374,14 @@
         <di:waypoint x="2985.0" y="1013.8" />
         <di:waypoint x="3082.0" y="1013.8" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2993.0" y="238.5" width="96.0" height="30.0" />
+          <dc:Bounds x="2993.0" y="238.5" width="118.8" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="Flow_19_di" bpmnElement="Flow_19" bioc:stroke="#E65100" color:border-color="#E65100">
-        <di:waypoint x="2985.0" y="176.5" />
-        <di:waypoint x="2985.0" y="114.0" />
-        <di:waypoint x="4314.0" y="114.0" />
-        <di:waypoint x="4314.0" y="183.5" />
+      <bpmndi:BPMNEdge id="Flow_19_di" bpmnElement="Flow_19" bioc:stroke="#64748B" color:border-color="#64748B">
+        <di:waypoint x="3010.0" y="201.5" />
+        <di:waypoint x="3089.0" y="201.5" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2993.0" y="149.5" width="112.0" height="15.0" />
+          <dc:Bounds x="2993.5" y="154.5" width="112.0" height="15.0" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_20_di" bpmnElement="Flow_20" bioc:stroke="#E65100" color:border-color="#E65100">
@@ -402,8 +411,7 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_24_di" bpmnElement="Flow_24" bioc:stroke="#E65100" color:border-color="#E65100">
         <di:waypoint x="4224.0" y="437.2" />
-        <di:waypoint x="4314.0" y="437.2" />
-        <di:waypoint x="4314.0" y="219.5" />
+        <di:waypoint x="4296.0" y="437.2" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="Flow_25_di" bpmnElement="Flow_25" bioc:stroke="#64748B" color:border-color="#64748B">
         <di:waypoint x="1212.0" y="735.5" />
