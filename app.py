@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import streamlit.components.v1 as components
 
+import llm_providers
+from bpmn_artifacts import with_data_artifacts
 from ai_generator import (
     assistant_chat,
     build_diagram_catalog,
@@ -67,6 +69,15 @@ EXAMPLES_DIR = ROOT / "examples"
 ASSETS_DIR = ROOT / "assets"
 CUSTOM_LABEL = "✍️  Свой текст регламента"
 USE_LLM_ON_OPEN = True
+# Переключатель движка: подпись → (режим llm_providers, ходить ли в модель). Выбор действует на сессию.
+ENGINE_CLOUD = "Облако (Groq / OpenRouter)"
+ENGINE_YANDEX = "YandexGPT (AI Studio)"
+ENGINE_OFFLINE = "Офлайн-эмулятор"
+ENGINE_CHOICES: Dict[str, Tuple[str, bool]] = {
+    ENGINE_CLOUD: ("cloud", True),
+    ENGINE_YANDEX: ("yandex", True),
+    ENGINE_OFFLINE: ("emulator", False),
+}
 GENERATION_BUSY_LABEL = "Генерация BPMN 2.0…"
 # После Generate холст жёстко clamp'ится в _diagram_height (240–300).
 DIAGRAM_HEIGHT = 260
@@ -1725,12 +1736,20 @@ def render_methodology(audit: Dict[str, Any], asis_audit: Optional[Dict[str, Any
         f'<div style="opacity:.95;font-size:.9rem;margin-top:6px">{esc(fraction)}</div>'
         if fraction else ""
     )
+    # As-Is повторяет регламент: нарушения линтера — свойства исходного текста, а не точность нейросети.
+    is_tobe_card = bool(asis_audit) and asis_audit is not audit
+    score_title = "КАЧЕСТВО НОТАЦИИ TO-BE" if is_tobe_card else "КАЧЕСТВО ИСХОДНОГО ТЕКСТА РЕГЛАМЕНТА"
+    score_note = (
+        "доля шагов To-Be без нарушений BPMN"
+        if is_tobe_card
+        else "доля шагов регламента без нарушений BPMN · не точность нейросети"
+    )
     badges = [
         f'<div class="meth-score" style="background:linear-gradient(105deg,{color},{BLUE})">'
-        f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">QUALITY SCORE</div>'
+        f'<div class="k" style="opacity:.85;font-size:.75rem;letter-spacing:.5px">{score_title}</div>'
         f'<div class="v">{score}%</div>'
         f'{frac_html}'
-        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">доля регламента без нарушений</div></div>'
+        f'<div style="opacity:.9;font-size:.82rem;margin-top:4px">{score_note}</div></div>'
     ]
     for chk in meth.get("checks") or []:
         passed = bool(chk.get("passed"))
@@ -1848,16 +1867,101 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
     )
 
 
+_TECH_ERROR_HINTS: Tuple[Tuple[str, str], ...] = (
+    (r"takes \d+ (?:positional )?arguments? but \d+ (?:were|was) given|unexpected keyword argument",
+     "модель вызвала API DIAGRAM с неверными аргументами"),
+    (r"SyntaxError|Синтаксическая ошибка|unterminated|invalid syntax", "в коде модели синтаксическая ошибка"),
+    (r"NameError|is not defined", "модель обратилась к несуществующей переменной"),
+    (r"UnsafeCodeError|запрещ", "код модели нарушил правила песочницы"),
+    (r"таймаут|Timeout", "код модели не уложился во время песочницы"),
+)
+
+
+def jury_safe_line(line: Any) -> str:
+    """Строка журнала без отладочных трассировок: «TypeError: add_user_task() takes 3…» → понятная причина.
+
+    Полный текст остаётся в audit.generation (JSON), на экран идёт только смысл.
+    """
+    text = str(line or "").strip()
+    if not re.search(r"Traceback|File \"|\b[A-Z]\w*(?:Error|Exception)\b|takes \d+ |unexpected keyword", text):
+        return text
+    hint = next((label for pattern, label in _TECH_ERROR_HINTS if re.search(pattern, text, re.I)), "")
+    head = re.split(r"\s—\s|Ошибка выполнения кода|Traceback|\b[A-Z]\w*(?:Error|Exception)\b", text)[0].strip(" :—-")
+    reason = hint or "код модели не выполнился в песочнице"
+    return f"{head} — {reason}; ответ отправлен на исправление" if head else f"{reason}; ответ отправлен на исправление"
+
+
+def _unique(items: Any, limit: int = 8) -> List[str]:
+    return list(dict.fromkeys(str(item) for item in (items or []) if str(item).strip()))[:limit]
+
+
+def render_guardrails(audit: Dict[str, Any]) -> None:
+    """🛡️ AI Guardrails: какие проверки прошёл граф и что движок исправил на лету.
+
+    Только данные аудита этой сборки: quality, auto_healed, тупики, сироты, XSD, сверка возвратов,
+    отклонённые ответы модели. Ничего не пересчитывает.
+    """
+    quality = audit.get("quality") if isinstance(audit.get("quality"), dict) else {}
+    critical = _unique(quality.get("critical"))
+    issues = _unique(quality.get("issues"), 12)
+    # Починка на лету: лечение графа (auto_healed) + исправления каркаса при исполнении кода модели
+    # (parent = задача → дорожка задачи, связь через границу подпроцесса → переадресована).
+    healed = _unique(
+        list(audit.get("auto_healed") or [])
+        + [w for w in (audit.get("engine_warnings") or []) if re.search(r"self-healing|переадресована", str(w))],
+        10,
+    )
+    gen = audit.get("generation") or {}
+    rejected = list(gen.get("rejected") or [])
+    dims = (((audit.get("bpmn_quality") or {}).get("trace") or {}).get("dimensions") or {})
+    returns = dims.get("returns") or {}
+    checks = [
+        ("Старт и успешный финал на месте", not any("нет стартового" in c.lower() or "нет конечного" in c.lower() for c in critical)),
+        ("Нет тупиков", not audit.get("dead_ends")),
+        ("Нет узлов без входящего потока", not audit.get("orphans_without_incoming")),
+        ("Ветвление только через шлюз", not any("ветвление без шлюза" in c for c in critical + issues)),
+        ("У веток XOR есть подписи условий", not any("без подписи условия" in c for c in issues)),
+        (
+            f"Возвраты регламента → циклы схемы ({returns.get('found', 0)}/{returns.get('total', 0)})",
+            int(returns.get("found") or 0) >= int(returns.get("total") or 0),
+        ),
+        ("XSD BPMN 2.0 (официальная схема OMG)", audit.get("xsd_valid") is True),
+    ]
+    passed = sum(1 for _, ok in checks if ok)
+    with st.expander("🛡️ AI Guardrails: аудит и исправление дефектов графа", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Проверок пройдено", f"{passed}/{len(checks)}")
+        c2.metric("Исправлено на лету", len(healed))
+        c3.metric("Ответов модели отклонено", len(rejected))
+        st.markdown("\n".join(f"- {'✅' if ok else '⚠️'} {label}" for label, ok in checks))
+        if healed:
+            st.markdown("**Исправлено автоматически (self-healing):**\n" + "\n".join(f"- {esc(t)}" for t in healed))
+        if rejected:
+            lines = []
+            for item in rejected[:4]:
+                problems = _unique((jury_safe_line(p) for p in (item.get("problems") or [])), 2)
+                lines.append(f"- попытка {item.get('attempt')}: " + "; ".join(esc(p) for p in problems))
+            final = gen.get("engine") or "—"
+            st.markdown(
+                "**Ответы модели, которые не прошли проверку графа:**\n" + "\n".join(lines)
+                + f"\n\nИтог: схему собрал `{esc(final)}`"
+                + (" — после исправления" if not gen.get("fallback") else " — резервный движок")
+            )
+        if not healed and not rejected and passed == len(checks):
+            st.caption("Граф прошёл все проверки с первого раза — исправлять было нечего.")
+
+
 def render_details(audit: Dict[str, Any]) -> None:
     """Служебные техдетали — единственный глубокий expander аудита."""
     gen = audit.get("generation", {})
     with st.expander("Служебное", expanded=False):
+        reserve = "использован (облако недоступно)" if gen.get("fallback") else "не понадобился"
         st.markdown(
             f"**Движок:** `{gen.get('engine', '—')}` · время {gen.get('elapsed_s', 0)} с · "
-            f"fail-safe: {'да' if gen.get('fallback') else 'нет'}"
+            f"резервный движок: {reserve}"
         )
         if gen.get("trace"):
-            st.markdown("**Трасса:**\n" + "\n".join(f"- {t}" for t in gen["trace"][:8]))
+            st.markdown("**Трасса:**\n" + "\n".join(f"- {esc(jury_safe_line(t))}" for t in _unique(gen["trace"])))
         if audit.get("auto_healed"):
             st.markdown("**Самовосстановление:**\n" + "\n".join(f"- {t}" for t in audit["auto_healed"][:6]))
         if audit.get("engine_warnings"):
@@ -1868,12 +1972,12 @@ def render_details(audit: Dict[str, Any]) -> None:
         for item in gen.get("rejected", [])[:3]:
             st.markdown(
                 f"**Отклонён {item.get('engine')}, попытка {item.get('attempt')}:** "
-                + "; ".join((item.get("problems") or [])[:5])
+                + "; ".join(esc(p) for p in _unique((jury_safe_line(x) for x in (item.get("problems") or [])), 5))
             )
         result_text = str(audit.get("result_text") or "").strip()
         if result_text:
             st.markdown("**Текст результата**")
-            st.caption("Вставка этого текста собирает схему с тем же баллом Quality Score.")
+            st.caption("Вставка этого текста собирает схему с тем же баллом качества нотации.")
             st.code(result_text, language="text")
         st.markdown("**Как считали**")
         tobe_delta = None
@@ -1969,6 +2073,7 @@ def render_audit(
         recs = '<div class="rec ok">Дополнительных рекомендаций нет</div>'
     st.markdown(recs, unsafe_allow_html=True)
 
+    render_guardrails(asis)
     render_details(asis)
 
 
@@ -2023,16 +2128,30 @@ def tobe_unavailable_reason(
     return "Ни один ход оптимизации не прошёл проверку." + _rejected_move_note(d)
 
 
-def _rejected_move_note(delta: Dict[str, Any]) -> str:
-    """К причинам кнопки добавляются уже записанные отказы ходов, без новых формулировок."""
-    bits: List[str] = []
+def _rejected_move_note(delta: Dict[str, Any], limit: int = 3) -> str:
+    """К причине кнопки — уже записанные отказы ходов, без повторов.
+
+    Одинаковая причина у разных ходов («Голый путь длиннее…» ×6) показывается один раз
+    с числом похожих ходов; всего не больше limit строк.
+    """
+    grouped: Dict[str, List[str]] = {}
     for item in (delta or {}).get("rejected") or []:
         reason = str(item.get("reason") or "").strip()
         if not reason:
             continue
         detail = str(item.get("detail") or "").strip()
-        bits.append(f"{detail}: {reason}" if detail else reason)
-    return (" " + " ".join(bits)) if bits else ""
+        bucket = grouped.setdefault(reason, [])
+        if detail and detail not in bucket:
+            bucket.append(detail)
+    bits: List[str] = []
+    for reason, details in list(grouped.items())[:limit]:
+        head = details[0].split(";")[0].strip().rstrip(".") if details else ""
+        more = f" (ещё похожих ходов: {len(details) - 1})" if len(details) > 1 else ""
+        bits.append(f"{head}: {reason}{more}" if head else reason)
+    hidden = len(grouped) - len(bits)
+    if hidden > 0:
+        bits.append(f"…и ещё причин: {hidden}.")
+    return (" Отклонённые ходы: " + " • ".join(bits)) if bits else ""
 
 
 def tobe_card_headline(facts: Dict[str, Any]) -> str:
@@ -2119,7 +2238,7 @@ def prepare_regulation(
     """
     _ = previous
     xml, audit, error = cached_generate_bpmn(
-        _reg_hash(text or "", bool(use_llm), "edges-v9"),
+        _reg_hash(text or "", bool(use_llm), llm_providers.mode(), "edges-v9"),
         text or "",
         bool(use_llm),
     )
@@ -2142,7 +2261,7 @@ def prepare_regulation(
         pack["tobe_reason"] = tobe_unavailable_reason(audit, {}, pack["facts"], "")
         return pack
     opt_text, delta = cached_optimize_to_be(
-        _reg_hash(text or "", _audit_cache_slice(audit), "edges-v9"),
+        _reg_hash(text or "", _audit_cache_slice(audit), llm_providers.mode(), "edges-v9"),
         text or "",
         audit,
     )
@@ -2898,10 +3017,10 @@ def render_tobe_tab() -> None:
     if isinstance(tobe_audit.get("methodology"), dict):
         asis_score = int(((asis_audit.get("methodology") or {}).get("score") or 0))
         tobe_score = int(((tobe_audit.get("methodology") or {}).get("score") or 0))
-        st.caption(f"Quality Score: As-Is {asis_score}% → To-Be {tobe_score}%")
+        st.caption(f"Качество нотации: регламент As-Is {asis_score}% → To-Be {tobe_score}%")
         render_methodology(tobe_audit, asis_audit=asis_audit)
     elif isinstance((asis_audit.get("methodology") or {}), dict) and not pack.get("tobe_ok"):
-        st.caption("Quality Score To-Be недоступен — показан As-Is для ориентира.")
+        st.caption("Качество нотации To-Be недоступно — показан As-Is для ориентира.")
         render_methodology(asis_audit)
 
     # 3) Что изменили ≤3
@@ -3157,13 +3276,25 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
         )
 
     def _gen_controls() -> None:
-        if "use_llm" not in st.session_state:
-            st.session_state["use_llm"] = USE_LLM_ON_OPEN
-        use_llm = st.checkbox(
-            "Использовать LLM (Ollama / OpenAI), если доступна",
-            key="use_llm",
-            help="При открытии страницы галочка включена. Снимите её — кнопка соберёт схему эмулятором и не пойдёт в облако. "
+        st.radio(
+            "Движок генерации",
+            list(ENGINE_CHOICES),
+            key="engine_choice",
+            on_change=_apply_engine_choice,
+            help="Облако — открытые модели через Groq / OpenRouter. YandexGPT — Yandex AI Studio "
+            "(ключи YANDEX_API_KEY и YANDEX_FOLDER_ID). Офлайн-эмулятор — без сети, детерминированный разбор. "
             "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
+        )
+        _apply_engine_choice()
+        use_llm = bool(st.session_state.get("use_llm"))
+        if st.session_state["engine_choice"] == ENGINE_YANDEX and not llm_providers.yandex_configured():
+            st.caption("Ключи Yandex AI Studio не заданы — схема соберётся офлайн-эмулятором.")
+        st.checkbox(
+            "Отображать артефакты данных",
+            key="show_data_artifacts",
+            value=False,
+            help="Документы (наряд-допуск, ведомость…) и системы (журнал, 1С…) под задачами, не больше 6. "
+            "По умолчанию выключено: основной вид остаётся чистым. Скачиваемый .bpmn — без артефактов.",
         )
         secrets_note = (
             f" · найдены секреты: {', '.join(SECRET_NAMES)}"
@@ -3191,7 +3322,7 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
                 reasons = gen.get("trace") or ["LLM недоступна"]
                 if any("лимит облачной модели" in str(r).lower() for r in reasons):
                     st.info("Лимит облачной модели исчерпан, схема построена локально")
-                safe = [r for r in reasons if "Traceback" not in str(r) and 'File "' not in str(r)]
+                safe = _unique(jury_safe_line(r) for r in reasons)
                 if safe:
                     note = "<br>" + "<br>".join(f"· {esc(r)}" for r in safe[:3])
             elif gen.get("attempts", 1) > 1:
@@ -3369,6 +3500,11 @@ def render_diagram(canvas_height: int) -> None:
         (pack or {}).get("delta"),
     )
     canvas_tobe = st.session_state.get("canvas_variant") == TOBE_LABEL and bool(xml_tobe)
+    if st.session_state.get("show_data_artifacts"):
+        # Опциональный слой: документы и системы под задачами. Каталог и скачивание — на чистой схеме.
+        xml_asis = with_data_artifacts(xml_asis, text_asis, audit_asis)
+        if xml_tobe:
+            xml_tobe = with_data_artifacts(xml_tobe, str((pack or {}).get("text") or text_asis), audit_asis)
     page = viewer_html(
         xml_asis,
         canvas_height,
@@ -3469,6 +3605,15 @@ def render_assistant() -> None:
             st.rerun()
 
 
+def _apply_engine_choice() -> None:
+    """Выбор движка → режим llm_providers на эту сессию и флаг use_llm для генерации, To-Be и ассистента."""
+    if "engine_choice" not in st.session_state:
+        st.session_state["engine_choice"] = ENGINE_CLOUD if USE_LLM_ON_OPEN else ENGINE_OFFLINE
+    mode, use_llm = ENGINE_CHOICES.get(st.session_state["engine_choice"], ("cloud", True))
+    llm_providers.set_session_mode(mode)
+    st.session_state["use_llm"] = use_llm
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Архитектор BPMN — Интер РАО",
@@ -3477,6 +3622,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     st.markdown(CSS, unsafe_allow_html=True)
+    _apply_engine_choice()
     render_assistant()
     for _k in ("reg_text", "example_choice"):
         if _k in st.session_state:
@@ -3576,7 +3722,7 @@ def main() -> None:
         _params_and_canvas()
 
         st.markdown(
-            f'<div class="engine">Quality Score As-Is: <b>{qs}%</b> · циклов: <b>{n_loops}</b>'
+            f'<div class="engine">Качество текста регламента: <b>{qs}%</b> · циклов: <b>{n_loops}</b>'
             f" · вкладки ниже</div>",
             unsafe_allow_html=True,
         )
