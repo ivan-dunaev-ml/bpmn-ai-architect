@@ -78,6 +78,8 @@ KIND_COLORS: Dict[str, Tuple[str, str]] = {
     "task": ("#1565C0", "#E3F2FD"),
     "userTask": ("#1565C0", "#E3F2FD"),
     "scriptTask": ("#1565C0", "#E3F2FD"),
+    "serviceTask": ("#1565C0", "#E3F2FD"),
+    "manualTask": ("#1565C0", "#E3F2FD"),
     "exclusiveGateway": ("#F57F17", "#FFF8E1"),
     "parallelGateway": ("#F57F17", "#FFF8E1"),
     "inclusiveGateway": ("#F57F17", "#FFF8E1"),
@@ -93,7 +95,7 @@ IMPROVED_PATH_EDGE_COLOR = "#2E7D32"
 
 GATEWAY_KINDS = {"exclusiveGateway", "parallelGateway", "inclusiveGateway"}
 EVENT_KINDS = {"startEvent", "endEvent"}
-WORK_KINDS = {"task", "userTask", "scriptTask"}
+WORK_KINDS = {"task", "userTask", "scriptTask", "serviceTask", "manualTask"}
 
 # Ориентировочные трудозатраты шага, часы (переопределяются set_sla()).
 DEFAULT_HOURS: Dict[str, float] = {
@@ -102,6 +104,8 @@ DEFAULT_HOURS: Dict[str, float] = {
     "task": 1.0,
     "userTask": 2.0,
     "scriptTask": 0.25,
+    "serviceTask": 0.25,
+    "manualTask": 2.0,
     "exclusiveGateway": 0.1,
     "parallelGateway": 0.0,
     "inclusiveGateway": 0.1,
@@ -114,6 +118,8 @@ XML_TAGS = {
     "task": "bpmn:task",
     "userTask": "bpmn:userTask",
     "scriptTask": "bpmn:scriptTask",
+    "serviceTask": "bpmn:serviceTask",
+    "manualTask": "bpmn:manualTask",
     "subProcess": "bpmn:subProcess",
     "exclusiveGateway": "bpmn:exclusiveGateway",
     "parallelGateway": "bpmn:parallelGateway",
@@ -507,6 +513,14 @@ class BPMNDiagramBuilder:
 
     def add_user_task(self, name: str, parent_id: str) -> str:
         return self._register_node(name, "userTask", parent_id, "Activity")
+
+    def add_manual_task(self, name: str, parent_id: str) -> str:
+        """Физическая работа на объекте без ИТ-системы: монтаж, осмотр, заземления (иконка руки)."""
+        return self._register_node(name, "manualTask", parent_id, "Activity")
+
+    def add_service_task(self, name: str, parent_id: str) -> str:
+        """Операция информационной системы без участия человека (шестерёнка)."""
+        return self._register_node(name, "serviceTask", parent_id, "Activity")
 
     def add_script_task(self, name: str, parent_id: str) -> str:
         return self._register_node(name, "scriptTask", parent_id, "Activity")
