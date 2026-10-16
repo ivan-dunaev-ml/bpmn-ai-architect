@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:bioc="http://bpmn.io/schema/bpmn/biocolor/1.0" xmlns:color="http://www.omg.org/spec/BPMN/non-normative/color/1.0" id="Definitions_InterRAO" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Inter RAO BPMN Architect" exporterVersion="2.0.0">
+  <bpmn:collaboration id="Collaboration_1">
+    <bpmn:participant id="Participant_1" name="Этап 4. Актуализация маршрута согласования доступа к ИС (ИТ-услуге)" processRef="Process_Root" />
+  </bpmn:collaboration>
+  <bpmn:process id="Process_Root" name="Этап 4. Актуализация маршрута согласования доступа к ИС (ИТ-услуге)" isExecutable="false">
+    <bpmn:laneSet id="LaneSet_Process_Root">
+      <bpmn:lane id="Lane_1" name="Менеджер процесса">
+        <bpmn:flowNodeRef>Activity_1</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_RootStart</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_2" name="Ответственный за определение маршрутов согласования доступа к ИС (ИТ-услуге)">
+        <bpmn:flowNodeRef>Activity_2</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_3" name="Администратор маршрутов согласования доступов к ИС (ИТ-услугам)">
+        <bpmn:flowNodeRef>Activity_3</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_RootEnd</bpmn:flowNodeRef>
+      </bpmn:lane>
+    </bpmn:laneSet>
+    <bpmn:userTask id="Activity_1" name="Установить ответственного за определение маршрута согласования доступа к ИС (ИТ-услуге)">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Activity_2" name="Подготовить и согласовать запрос на изменение маршрута согласования доступа к ИС (ИТ-услуге)">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:outgoing>Flow_3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Activity_3" name="Исполнить запрос на изменение маршрута согласования доступов к ИС (ИТ-услугам)">
+      <bpmn:incoming>Flow_3</bpmn:incoming>
+      <bpmn:outgoing>Flow_4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:startEvent id="Event_RootStart" name="Старт процесса">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="Event_RootEnd" name="Процесс завершён">
+      <bpmn:incoming>Flow_4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Event_RootStart" targetRef="Activity_1" />
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Activity_1" targetRef="Activity_2" />
+    <bpmn:sequenceFlow id="Flow_3" sourceRef="Activity_2" targetRef="Activity_3" />
+    <bpmn:sequenceFlow id="Flow_4" sourceRef="Activity_3" targetRef="Event_RootEnd" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collaboration_1">
+      <bpmndi:BPMNShape id="Participant_1_di" bpmnElement="Participant_1" isHorizontal="true" bioc:stroke="#003366" bioc:fill="#FFFFFF" color:border-color="#003366" color:background-color="#FFFFFF">
+        <dc:Bounds x="160.0" y="80.0" width="938.0" height="647.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_1_di" bpmnElement="Lane_1" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F4F8FD" color:border-color="#1565C0" color:background-color="#F4F8FD">
+        <dc:Bounds x="190.0" y="80.0" width="908.0" height="225.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_2_di" bpmnElement="Lane_2" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#FFFFFF" color:border-color="#1565C0" color:background-color="#FFFFFF">
+        <dc:Bounds x="190.0" y="305.5" width="908.0" height="225.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_3_di" bpmnElement="Lane_3" isHorizontal="true" bioc:stroke="#1565C0" bioc:fill="#F4F8FD" color:border-color="#1565C0" color:background-color="#F4F8FD">
+        <dc:Bounds x="190.0" y="531.0" width="908.0" height="196.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1_di" bpmnElement="Activity_1" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
+        <dc:Bounds x="362.0" y="118.0" width="140.0" height="149.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_2_di" bpmnElement="Activity_2" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
+        <dc:Bounds x="574.0" y="343.5" width="140.0" height="149.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_3_di" bpmnElement="Activity_3" bioc:stroke="#1565C0" bioc:fill="#E3F2FD" color:border-color="#1565C0" color:background-color="#E3F2FD">
+        <dc:Bounds x="786.0" y="569.0" width="140.0" height="120.5" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_RootStart_di" bpmnElement="Event_RootStart" bioc:stroke="#2E7D32" bioc:fill="#E8F5E9" color:border-color="#2E7D32" color:background-color="#E8F5E9">
+        <dc:Bounds x="254.0" y="174.8" width="36.0" height="36.0" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="219.4" y="214.8" width="105.2" height="15.0" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_RootEnd_di" bpmnElement="Event_RootEnd" bioc:stroke="#C62828" bioc:fill="#FFEBEE" color:border-color="#C62828" color:background-color="#FFEBEE">
+        <dc:Bounds x="998.0" y="611.2" width="36.0" height="36.0" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="956.6" y="651.2" width="118.8" height="15.0" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1" bioc:stroke="#2E7D32" color:border-color="#2E7D32">
+        <di:waypoint x="290.0" y="192.8" />
+        <di:waypoint x="362.0" y="192.8" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2" bioc:stroke="#2E7D32" color:border-color="#2E7D32">
+        <di:waypoint x="432.0" y="267.5" />
+        <di:waypoint x="432.0" y="418.2" />
+        <di:waypoint x="574.0" y="418.2" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_3_di" bpmnElement="Flow_3" bioc:stroke="#2E7D32" color:border-color="#2E7D32">
+        <di:waypoint x="644.0" y="493.0" />
+        <di:waypoint x="644.0" y="629.2" />
+        <di:waypoint x="786.0" y="629.2" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_4_di" bpmnElement="Flow_4" bioc:stroke="#2E7D32" color:border-color="#2E7D32">
+        <di:waypoint x="926.0" y="629.2" />
+        <di:waypoint x="998.0" y="629.2" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+    <bpmndi:BPMNLabelStyle id="LabelStyle_SubprocessTitle">
+      <dc:Font name="Arial" size="15" isBold="true" />
+    </bpmndi:BPMNLabelStyle>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -106,18 +106,18 @@
       <bpmn:incoming>Flow_9</bpmn:incoming>
       <bpmn:outgoing>Flow_20</bpmn:outgoing>
     </bpmn:parallelGateway>
-    <bpmn:userTask id="Activity_11" name="Выполнить строительно-монтажные работы до границы участка заявителя">
+    <bpmn:manualTask id="Activity_11" name="Выполнить строительно-монтажные работы до границы участка заявителя">
       <bpmn:incoming>Flow_6</bpmn:incoming>
       <bpmn:outgoing>Flow_7</bpmn:outgoing>
-    </bpmn:userTask>
+    </bpmn:manualTask>
     <bpmn:userTask id="Activity_12" name="Выполнить мероприятия на своём участке по техническим условиям">
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:userTask id="Activity_13" name="Провести осмотр присоединяемых устройств заявителя">
+    <bpmn:manualTask id="Activity_13" name="Провести осмотр присоединяемых устройств заявителя">
       <bpmn:incoming>Flow_20</bpmn:incoming>
       <bpmn:outgoing>Flow_10</bpmn:outgoing>
-    </bpmn:userTask>
+    </bpmn:manualTask>
     <bpmn:exclusiveGateway id="Gateway_5" name="Замечаний нет?">
       <bpmn:incoming>Flow_10</bpmn:incoming>
       <bpmn:outgoing>Flow_21</bpmn:outgoing>

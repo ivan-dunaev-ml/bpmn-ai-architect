@@ -78,8 +78,9 @@ PROMPT_TEMPLATE = """
 API (DIAGRAM, ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID уже есть;
 import, eval, exec, open, while, классы, файлы и сеть запрещены):
 pool_id, lanes = DIAGRAM.add_pool(ROOT_PROCESS_ID, ["Роль 1", "Роль 2"])  # ровно один раз
-t = DIAGRAM.add_user_task("Глагол + объект", lanes[0])     # действие человека
-t = DIAGRAM.add_script_task("Глагол + объект", lanes[0])   # система выполняет сама
+t = DIAGRAM.add_user_task("Глагол + объект", lanes[0])     # человек в ИТ-системе / согласование документа
+t = DIAGRAM.add_script_task("Глагол + объект", lanes[0])   # система выполняет сама, без человека
+t = DIAGRAM.add_manual_task("Глагол + объект", lanes[0])   # физическая работа на объекте: монтаж, осмотр, заземления
 sp = DIAGRAM.create_subprocess("Название этапа", lanes[0])  # задачи этапа: add_user_task(..., sp), связи внутри sp
 g = DIAGRAM.add_exclusive_gateway("Вопрос?", lanes[0])     # XOR, имя заканчивается «?»
 p = DIAGRAM.add_parallel_gateway("Название", lanes[0])     # AND: split и join всегда парой
@@ -974,7 +975,7 @@ _SYSTEM_RE = re.compile(
 )
 _DUR_RE = re.compile(
     r"\(?\s*(?:(?:в течение|не более|до|срок[:\s]*)\s*)?(\d+(?:[.,]\d+)?)\s*"
-    r"(рабоч\w*\s+недел\w*|календарн\w*\s+недел\w*|рабоч\w*\s+(?:дн\w*|день)|"
+    r"(рабоч\w*\s+недел\w*|календарн\w*\s+недел\w*|рабоч\w*\s+(?:дн\w*|день)|рабоч\w*\s+час\w*|"
     r"календарн\w*\s+(?:дн\w*|день)|сут\w*|недел\w*|месяц\w*|мес\b|дн\w*|день|час\w*|ч\b|мин\w*)\s*\)?",
     re.I,
 )
@@ -1306,6 +1307,8 @@ def _atomize_step_body(text: str) -> List[str]:
     Несколько длительностей в одном абзаце остаются на своих предложениях и не суммируются.
     """
     t = re.sub(r"\s+", " ", (text or "").strip())
+    if re.search(r"\b(?:Участвуют|Входы|Выходы)\s*:", t):
+        return [t]  # паспорт шага: одна карточка = одна задача, поля не режем на шаги
     if not t:
         return []
     if len(t) < 12:
@@ -1566,23 +1569,49 @@ def read_docx_regulation(data: bytes) -> Tuple[Optional[str], Optional[str]]:
     except ImportError:
         return None, "Для чтения .docx установите пакет: `pip install python-docx>=1.0.0`"
     try:
+        from docx.table import Table  # type: ignore[import-untyped]
+        from docx.text.paragraph import Paragraph  # type: ignore[import-untyped]
+
         doc = Document(io.BytesIO(data))
         num_to_abs, levels, styles = _docx_numbering_maps(data)
         counters: Dict[Tuple[str, str], int] = {}
         parts: List[str] = []
-        for paragraph in doc.paragraphs:
+
+        def add_paragraph(paragraph: Any) -> None:
             raw = (paragraph.text or "").strip()
             if not raw:
-                continue
+                return
             num = _docx_num_pr(paragraph, styles)
             if num and not re.match(r"^\d+[.)]\s+", raw):
                 raw = _docx_next_label(num[0], num[1], counters, num_to_abs, levels) + raw
             parts.append(raw)
-        for table in doc.tables:
+
+        def add_table(table: Any) -> None:
             for row in table.rows:
-                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                if cells:
-                    parts.append(" | ".join(cells))
+                cells: List[str] = []
+                seen = set()
+                for cell in row.cells:
+                    if id(cell._tc) in seen:  # объединённая ячейка Word отдаётся по разу на каждую колонку
+                        continue
+                    seen.add(id(cell._tc))
+                    text = (cell.text or "").strip()
+                    if text and (not cells or cells[-1] != text):
+                        cells.append(text)
+                if not cells:
+                    continue
+                if len(cells) == 2 and re.fullmatch(r"[^\n:]{2,40}:?", cells[0]):
+                    # «Поле | Значение» → «Поле: значение; значение» — без вертикальной черты в задачах.
+                    value = "; ".join(x.strip(" ;") for x in cells[1].splitlines() if x.strip())
+                    parts.append(f"{cells[0].rstrip(':').strip()}: {value}")
+                else:
+                    parts.extend(cells)
+
+        for child in doc.element.body.iterchildren():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                add_paragraph(Paragraph(child, doc))
+            elif tag == "tbl":
+                add_table(Table(child, doc))
         text = "\n".join(parts).strip()
         if not text:
             return None, "В файле .docx не найден текстовый слой (пустые абзацы и таблицы)."
@@ -1599,6 +1628,13 @@ def normalize_regulation(text: str) -> str:
     - многоуровневую нумерацию «3.2.1.» переводит в сквозную «1.», «2.» … вместе со ссылками «п. 3.2.5».
     """
     text = text.replace("\r\n", "\n").replace("­", "")
+    from passport_regulation import passport_to_canonical, strip_word_markup
+
+    text = strip_word_markup(text)
+    canonical = passport_to_canonical(text)
+    if canonical is not None:
+        # Паспорта «Шаг X.Y» с полями: одна карточка — одна строка, нумерация и атомизация не нужны.
+        return canonical
     text = re.sub(r"(\w)-\n\s*(\w)", r"\1\2", text)
     text = re.sub(r"(\bп(?:\.|ункт\w*)|\bшаг\w*)\s*\n\s*(?=\d)", r"\1 ", text, flags=re.I)
     lines = []
@@ -1634,8 +1670,8 @@ def _to_hours(value: str, unit: str) -> float:
     unit = unit.lower()
     if unit.startswith("мин"):
         return num / 60.0
-    if unit.startswith("час") or unit == "ч":
-        return num
+    if unit.startswith("час") or unit == "ч" or re.search(r"\bчас", unit):
+        return num  # «16 рабочих часов» — часы, а не рабочие дни
     if "недел" in unit:
         return num * (168.0 if "календарн" in unit else 40.0)
     if unit.startswith("сут") or unit.startswith("календарн"):
@@ -1663,6 +1699,11 @@ def _task_title(text: str) -> str:
     words = [_infinitive(w) if re.fullmatch(r"[А-Яа-яЁё]+", w) else w for w in text.split(" ")]
     title = " ".join(words)
     title = title[:1].upper() + title[1:] if title else ""
+    if len(words) > 1 and not _is_verb(words[1]):
+        # «Проверка комплектности документов» → «Проверить комплектность документов» (линтер «Глагол + объект»).
+        from passport_regulation import nominal_to_infinitive
+
+        title = nominal_to_infinitive(title, strict=True)
     if len(title) > TITLE_MAX:
         cut = title[:TITLE_MAX].rsplit(" ", 1)[0]
         title = cut.rstrip(",;:—–- ") + "…"
@@ -1796,8 +1837,12 @@ def _split_joint_role(text: str) -> Optional[Tuple[str, str]]:
 
 def _find_role(text: str) -> Tuple[Optional[str], int, int]:
     """Роль-исполнитель шага: (название, начало, конец вырезаемого префикса)."""
-    m = re.match(r"^([А-ЯЁ][А-Яа-яЁё\- ]{2,45}?)\s*[:—–]\s+", text)
-    if m and len(m.group(1).split()) <= 5 and not re.match(r"(?i)^(если|параллельно|одновременно)", m.group(1)):
+    from passport_regulation import STOP_WORDS
+
+    m = re.match(r"^([А-ЯЁ][А-Яа-яЁё\-() ,]{2,120}?)\s*[:—–]\s+", text)
+    if m and m.group(1).strip().lower() in STOP_WORDS:
+        m = None  # «Входы:», «Длительность:» — поле паспорта, а не дорожка
+    if m and len(m.group(1).split()) <= 12 and not re.match(r"(?i)^(если|параллельно|одновременно)", m.group(1)):
         return _canonical_role(m.group(1).strip()), 0, m.end()
     inverted = _match_inverted_role(text)
     if inverted:
@@ -1891,9 +1936,33 @@ def extract_artifacts(text: str) -> List[str]:
     return _find_named(text, _ARTIFACT_RE)
 
 
+_NUMBERED_SYSTEM_RE = re.compile(r"\b(А?ИС|АС|ГИС|СЭД)\s*[№#-]?\s*(\d+|[ІIЗ])(?![\wА-Яа-я])")
+_REGISTRY_RE = re.compile(r"\bРеестр\w*\s+((?:ИС|ИТ|[А-ЯЁA-Z]{2,6}\b|ответственн\w+|[а-яё]+\w*\s+[а-яё]+\w*))", re.I)
+_OCR_DIGITS = {"І": "1", "I": "1", "З": "3"}
+
+
+def _numbered_systems(text: str) -> List[str]:
+    """Номерные и именованные корпоративные системы: ИС1, ИС3 (ИСІ → ИС1, ИСЗ → ИС3), «Реестр ИТ»."""
+    found: List[str] = []
+    for kind, num in _NUMBERED_SYSTEM_RE.findall(text or ""):
+        name = f"{kind}{_OCR_DIGITS.get(num, num)}"
+        if name not in found:
+            found.append(name)
+    for tail in _REGISTRY_RE.findall(text or ""):
+        name = "Реестр " + tail.strip()
+        if name not in found:
+            found.append(name)
+    return found
+
+
 def extract_it_systems(text: str) -> List[str]:
-    """ИТ-системы: АСУ ТП / SCADA, оперативный журнал, CRM, электронная площадка, биллинг, 1С / SAP…"""
-    return _find_named(text, _SYSTEM_RE_LIST)
+    """ИТ-системы: АСУ ТП / SCADA, оперативный журнал, CRM, электронная площадка, биллинг, 1С / SAP, ИС1…"""
+    named = _numbered_systems(text)
+    found = _find_named(text, _SYSTEM_RE_LIST)
+    if named:
+        # «в ИС3» уже названа точно — общий «Информационная система (ИС / АС)» не дублируем.
+        found = [x for x in found if not x.startswith("Информационная система")]
+    return named + [x for x in found if x not in named]
 
 
 def aggregate_landscape(steps: List["Step"], attr: str) -> List[Dict[str, Any]]:
@@ -1940,6 +2009,10 @@ class Step:
     action: bool = True  # есть ли собственное действие перед шлюзом
     artifacts: List[str] = field(default_factory=list)  # документы шага: наряд-допуск, акт, договор…
     systems: List[str] = field(default_factory=list)  # ИТ-системы шага: АСУ ТП, CRM, 1С…
+    manual: bool = False  # физическая работа на объекте без ИТ-системы → manualTask
+    participants: List[str] = field(default_factory=list)  # «Участвуют:» паспорта — C в RACI
+    inputs: List[str] = field(default_factory=list)  # «Входы:» паспорта
+    outputs: List[str] = field(default_factory=list)  # «Выходы:» паспорта
 
 
 @dataclass
@@ -2704,6 +2777,20 @@ def _resolve_implicit_returns(steps: List[Step]) -> None:
             d.no_ref = found
 
 
+# Физическая работа на объекте (иконка руки), если в шаге нет ИТ-системы. Работа человека в системе — userTask.
+_MANUAL_RE = re.compile(
+    r"монтаж|смонтир|демонтир|осмотр|осмотреть|ремонт|заземлен|переключени|выехать|выезд|тепловизион|"
+    r"измерить|замер|ошиновк|\bСИЗ\b|инструмент|испытани|обход|протяжк|опломбир|вскрыть\s+(?:ячейк|шкаф)",
+    re.I,
+)
+_IT_WORK_RE = re.compile(r"\b(?:в|через)\s+(?:А?ИС\d*|СЭД|ЭТП|1С|SAP|ERP|систем\w*|журнал\w*|реестр\w*|портал\w*)", re.I)
+_PASSPORT_FIELD_LINE_RE = re.compile(
+    r"^(Ответственный|Исполнитель|Участвуют|Длительность|Срок|Норматив|Трудо[её]мкость|Входы|Выходы|Основание)"
+    r"\s*[:：]\s*\|?\s*(.*)$",
+    re.I,
+)
+
+
 def parse_regulation(text: str) -> ParsedRegulation:
     text = _promote_lettered_parallels(text or "")
     text = _segment_unnumbered_prose(text)
@@ -2750,6 +2837,19 @@ def parse_regulation(text: str) -> ParsedRegulation:
                 body = f"{body} (этап «{current_stage}»)"
             raw_steps.append((int(m.group(1)), body))
             continue
+        fm = _PASSPORT_FIELD_LINE_RE.match(s)
+        if fm and raw_steps:
+            # Поле паспорта в обычном тексте («Длительность: 16 часов») — свойство прошлого шага, не шаг.
+            num, prev = raw_steps[-1]
+            key, value = fm.group(1).lower(), fm.group(2).strip(" .;|")
+            if key in ("длительность", "срок", "норматив", "трудоёмкость", "трудоемкость"):
+                prev = f"{prev} ({value})"
+            elif key in ("ответственный", "исполнитель"):
+                prev = prev if re.match(r"^[^:]{2,60}:\s", prev) else f"{value}: {prev}"
+            elif key in ("участвуют", "входы", "выходы"):
+                prev = f"{prev.rstrip(' .')}. {key.capitalize()}: {value}."
+            raw_steps[-1] = (num, prev)
+            continue
         m = re.match(r"^[-•*]\s+(.*)$", s)
         if m:
             raw_steps.append((None, m.group(1)))
@@ -2794,7 +2894,11 @@ def parse_regulation(text: str) -> ParsedRegulation:
     raw_steps = sequenced
     for idx, (num, body) in enumerate(raw_steps):
         step = Step(idx=idx, num=num if num is not None else idx + 1)
-        t = body.strip()
+        from passport_regulation import split_inline_fields
+
+        t, passport = split_inline_fields(body.strip())
+        step.participants = passport["participants"]
+        step.inputs, step.outputs = passport["inputs"], passport["outputs"]
         pm = re.match(r"^(параллельно|одновременно)\s*(\*)?\s*[:,—–-]?\s*", t, re.I)
         if pm:
             step.parallel = True
@@ -2854,7 +2958,14 @@ def parse_regulation(text: str) -> ParsedRegulation:
                 source = source[re_:]
             step.title = _task_title(source) if step.action else ""
         step.system = bool(_SYSTEM_RE.search(source))
-        step.artifacts = extract_artifacts(body)
+        step.manual = bool(
+            not step.system and step.title and _MANUAL_RE.search(step.title) and not _IT_WORK_RE.search(source)
+        )
+        step.artifacts = extract_artifacts(t)
+        for item in step.inputs + step.outputs:
+            name = _passport_artifact_name(item)
+            if name and name not in step.artifacts:
+                step.artifacts.append(name)
         step.systems = extract_it_systems(body)
         parsed.steps.append(step)
         if step.role not in parsed.roles:
@@ -2863,6 +2974,22 @@ def parse_regulation(text: str) -> ParsedRegulation:
     parsed.artifacts = aggregate_landscape(parsed.steps, "artifacts")
     parsed.it_systems = aggregate_landscape(parsed.steps, "systems")
     return parsed
+
+
+def _passport_artifact_name(item: str) -> str:
+    """«Зарегистрированный запрос «Запрос на изменение…» в ИС3, предоставляющей…» → «Запрос на изменение…».
+
+    Документ из «Входы/Выходы» паспорта: имя в кавычках важнее описания, место хранения отрезаем.
+    """
+    text = re.sub(r"\s+", " ", item or "").strip(" .;")
+    quoted = re.search(r"«([^»]{4,})»?", text)
+    if quoted:
+        text = quoted.group(1)
+    text = re.split(r",\s+(?:предоставляющ|содержащ|направленн)\w*", text)[0]
+    text = re.sub(r"\s+в\s+(?:А?ИС|СЭД|ЭТП)\s*[№#-]?\s*\w*$", "", text).strip(" .;«»")
+    if len(text) > 70:
+        text = text[:70].rsplit(" ", 1)[0] + "…"
+    return text
 
 
 def _build_blocks(parsed: ParsedRegulation) -> Tuple[List[Block], Dict[int, int]]:
@@ -6492,6 +6619,8 @@ def generate_process_passport(xml_str: str, audit_data: dict, regulation_text: s
 _KIND_RU = {
     "userTask": "Пользовательская задача",
     "scriptTask": "Скриптовая / сервисная задача",
+    "serviceTask": "Сервисная задача (выполняет система)",
+    "manualTask": "Ручная задача (работа на объекте)",
     "task": "Задача",
     "exclusiveGateway": "Исключающий шлюз (XOR)",
     "parallelGateway": "Параллельный шлюз (AND)",
@@ -7268,6 +7397,7 @@ def _step_as_row(item: Any, idx: int) -> Dict[str, Any]:
             "hours": item.hours,
             "artifacts": list(item.artifacts or []),
             "systems": list(item.systems or []),
+            "participants": list(item.participants or []),
         }
     if isinstance(item, dict):
         title = item.get("title") or item.get("name") or item.get("action") or ""
@@ -7280,6 +7410,7 @@ def _step_as_row(item: Any, idx: int) -> Dict[str, Any]:
             "hours": item.get("hours"),
             "artifacts": list(item.get("artifacts") or []),
             "systems": list(item.get("systems") or []),
+            "participants": list(item.get("participants") or []),
         }
     return {"num": idx, "title": str(item), "role": "", "decision": False, "hours": None, "artifacts": [], "systems": []}
 
@@ -7316,6 +7447,10 @@ def generate_raci_matrix(steps: list, roles: list) -> List[Dict[str, Any]]:
 
         _add(executor, "R")
         _add(accountable, "A")
+        for role in row.get("participants") or []:
+            # «Участвуют:» паспорта шага — Consulted по корпоративной методологии.
+            if role and role not in (executor, accountable):
+                _add(role, "C")
         if decision or bool(re.search(r"проверк|допуск|наряд|экспертиз|правов", title, re.I)):
             for role in consulted:
                 if role not in (executor, accountable):
@@ -7367,8 +7502,15 @@ def _independent_steps(a: Step, b: Step, body_a: str = "", body_b: str = "") -> 
     return not ((stems_a & stems_b) - _RACI_STOP)
 
 
+def _action_text(body: str) -> str:
+    """Текст действия шага без полей паспорта («Входы: … в ИС3» не делает шаг журнальным или системным)."""
+    from passport_regulation import split_inline_fields
+
+    return split_inline_fields(body or "")[0]
+
+
 def _ot_blob(step: Step, body: str = "") -> str:
-    return f"{step.title or ''} {body or ''}"
+    return f"{step.title or ''} {_action_text(body)}"
 
 
 def _is_prepare_ppe_ground(blob: str) -> bool:
@@ -7631,7 +7773,7 @@ def _heuristic_optimize_to_be(
             if skip_auto and i in skip_auto:
                 continue
             body = bodies[i]
-            if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+            if _JOURNAL_RE.search(_action_text(body)) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
                 bodies[i] = _automate_journal_body(body)
                 actions.append(
                     {
@@ -7919,7 +8061,7 @@ def _catalog_tobe_moves(regulation_text: str) -> Tuple[List[int], List[int], Lis
     loops: List[int] = []
     for i in range(n):
         body = bodies[i]
-        if _JOURNAL_RE.search(body) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
+        if _JOURNAL_RE.search(_action_text(body)) and not re.search(r"систем\w+\s+автоматическ", body, re.I):
             autos.append(i)
         d = parsed.steps[i].decision
         if d and (d.no_back or (d.no_ref is not None and d.no_ref < parsed.steps[i].num)):
@@ -8709,7 +8851,13 @@ def _apply_notation_and_wrap(text: str) -> Tuple[str, List[Dict[str, str]]]:
     return cur, actions
 
 
-_EDO_STEP_RE = re.compile(r"согласов|подпис|утвержд|визир|рассматр", re.I)
+# Согласование — действие шага (глагол), а не слово объекта («маршрут согласования доступа» — не согласование).
+_EDO_TITLE_RE = re.compile(
+    r"^(?:\w+\s+и\s+)?(?:согласовать|подписать|утвердить|завизировать|визировать|рассмотреть)\b", re.I
+)
+_EDO_VERB_RE = re.compile(r"\b(?:согласовыва\w*|согласу\w+|подписыва\w*|утвержда\w*|визиру\w*|рассматрива\w*)\b", re.I)
+# ЭДО не трогает безопасность работ. Общий стоп-лист ОТ шире («согласован» — любое согласование), здесь — узкий.
+_EDO_SAFETY_RE = re.compile(r"наряд[\s-]*допуск|\bдопуск\w*|инструктаж|заземлен|напряжен", re.I)
 
 
 def _edo_fallback_text(text: str) -> Tuple[str, List[Dict[str, str]]]:
@@ -8731,7 +8879,9 @@ def _edo_fallback_text(text: str) -> Tuple[str, List[Dict[str, str]]]:
     for i in range(n):
         step, body = parsed.steps[i], bodies[i]
         hours = float(step.hours or 0)
-        if hours < 16 or not _EDO_STEP_RE.search(f"{step.title} {body}") or _ot_sensitive(step, body):
+        action = _action_text(body)
+        approves = bool(_EDO_TITLE_RE.search(step.title or "") or _EDO_VERB_RE.search(action))
+        if hours < 16 or not approves or _EDO_SAFETY_RE.search(_ot_blob(step, body)):
             continue
         match = _DUR_RE.search(body)
         if not match:
@@ -8750,6 +8900,37 @@ def _edo_fallback_text(text: str) -> Tuple[str, List[Dict[str, str]]]:
     if not actions:
         return text, []
     return _join_steps(header, [{"body": b} for b in bodies]), actions
+
+
+def _llm_tobe_violations(asis_text: str, cand_text: str) -> List[str]:
+    """Честность To-Be от модели: роли As-Is на месте, шаги не выброшены, сроки шагов не занижены.
+
+    Локальные ходы (ЭДО, автоматизация, параллель) объясняют сокращение сами; модель — нет.
+    """
+    try:
+        before = parse_regulation(normalize_regulation(asis_text))
+        after = parse_regulation(normalize_regulation(cand_text))
+    except Exception:  # noqa: BLE001
+        return ["Вариант модели не разобран"]
+    lost_roles = [r for r in before.roles if r not in after.roles]
+    if lost_roles:
+        return [f"Модель убрала роль «{lost_roles[0]}» — To-Be должен сохранять исполнителей."]
+    work_before = [s for s in before.steps if s.title]
+    work_after = [s for s in after.steps if s.title]
+    if len(work_after) < len(work_before) - 1:
+        return [f"Модель свернула шаги: {len(work_before)} → {len(work_after)} — работа не может исчезнуть."]
+    for old in work_before:
+        if not old.hours:
+            continue
+        stems = {w[:6] for w in re.findall(r"[а-яё]{5,}", old.title.lower())}
+        twin = max(
+            work_after,
+            key=lambda s: len(stems & {w[:6] for w in re.findall(r"[а-яё]{5,}", (s.title or "").lower())}),
+            default=None,
+        )
+        if twin is not None and twin.hours is not None and twin.hours < old.hours - 1e-6:
+            return [f"Модель занизила срок шага «{old.title[:60]}»: {_fh(old.hours)} → {_fh(twin.hours)} без обоснования."]
+    return []
 
 
 def optimize_process_to_be(
@@ -8852,7 +9033,12 @@ def optimize_process_to_be(
         except Exception:  # noqa: BLE001
             llm_text = None
     if llm_text:
-        _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm", None)
+        problems = _llm_tobe_violations(text, llm_text)
+        if problems:
+            # Модель «сократила» процесс, выкинув роли или шаги или занизив сроки, — это не оптимизация.
+            rejected.append({"detail": "Вариант облачной модели", "reason": problems[0]})
+        else:
+            _consider(llm_text, _collect_tobe_actions(text, llm_text), "llm", None)
 
     autos_all, pairs_all, loops_all = _catalog_tobe_moves(text)
     autos_all = [a for a in autos_all if a not in skip]

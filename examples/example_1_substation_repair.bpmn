@@ -69,22 +69,22 @@
       <bpmn:endEvent id="Event_2" name="Завершено">
         <bpmn:incoming>Flow_26</bpmn:incoming>
       </bpmn:endEvent>
-      <bpmn:userTask id="Activity_7" name="Провести визуальный осмотр ячейки и ошиновки">
+      <bpmn:manualTask id="Activity_7" name="Провести визуальный осмотр ячейки и ошиновки">
         <bpmn:incoming>Flow_25</bpmn:incoming>
         <bpmn:outgoing>Flow_2</bpmn:outgoing>
-      </bpmn:userTask>
-      <bpmn:userTask id="Activity_8" name="Выполнить тепловизионный контроль контактных соединений">
+      </bpmn:manualTask>
+      <bpmn:manualTask id="Activity_8" name="Выполнить тепловизионный контроль контактных соединений">
         <bpmn:incoming>Flow_2</bpmn:incoming>
         <bpmn:outgoing>Flow_3</bpmn:outgoing>
-      </bpmn:userTask>
+      </bpmn:manualTask>
       <bpmn:userTask id="Activity_9" name="Проверить состояние изоляции и цепей вторичной коммутации">
         <bpmn:incoming>Flow_3</bpmn:incoming>
         <bpmn:outgoing>Flow_4</bpmn:outgoing>
       </bpmn:userTask>
-      <bpmn:userTask id="Activity_10" name="Измерить сопротивление изоляции и параметры защит">
+      <bpmn:manualTask id="Activity_10" name="Измерить сопротивление изоляции и параметры защит">
         <bpmn:incoming>Flow_4</bpmn:incoming>
         <bpmn:outgoing>Flow_26</bpmn:outgoing>
-      </bpmn:userTask>
+      </bpmn:manualTask>
       <bpmn:sequenceFlow id="Flow_2" sourceRef="Activity_7" targetRef="Activity_8" />
       <bpmn:sequenceFlow id="Flow_3" sourceRef="Activity_8" targetRef="Activity_9" />
       <bpmn:sequenceFlow id="Flow_4" sourceRef="Activity_9" targetRef="Activity_10" />
@@ -110,22 +110,22 @@
       <bpmn:incoming>Flow_9</bpmn:incoming>
       <bpmn:outgoing>Flow_20</bpmn:outgoing>
     </bpmn:parallelGateway>
-    <bpmn:userTask id="Activity_12" name="Вывести оборудование в ремонт оперативными переключениями">
+    <bpmn:manualTask id="Activity_12" name="Вывести оборудование в ремонт оперативными переключениями">
       <bpmn:incoming>Flow_6</bpmn:incoming>
       <bpmn:outgoing>Flow_7</bpmn:outgoing>
-    </bpmn:userTask>
-    <bpmn:userTask id="Activity_13" name="Подготовить СИЗ, инструмент и переносные заземления">
+    </bpmn:manualTask>
+    <bpmn:manualTask id="Activity_13" name="Подготовить СИЗ, инструмент и переносные заземления">
       <bpmn:incoming>Flow_8</bpmn:incoming>
       <bpmn:outgoing>Flow_9</bpmn:outgoing>
-    </bpmn:userTask>
+    </bpmn:manualTask>
     <bpmn:userTask id="Activity_14" name="Провести целевой инструктаж и допустить бригаду к работам">
       <bpmn:incoming>Flow_20</bpmn:incoming>
       <bpmn:outgoing>Flow_21</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:userTask id="Activity_15" name="Выполнить аварийный ремонт оборудования">
+    <bpmn:manualTask id="Activity_15" name="Выполнить аварийный ремонт оборудования">
       <bpmn:incoming>Flow_21</bpmn:incoming>
       <bpmn:outgoing>Flow_22</bpmn:outgoing>
-    </bpmn:userTask>
+    </bpmn:manualTask>
     <bpmn:userTask id="Activity_16" name="Принять выполненные работы и закрыть наряд-допуск">
       <bpmn:incoming>Flow_22</bpmn:incoming>
       <bpmn:outgoing>Flow_23</bpmn:outgoing>
