@@ -71,7 +71,7 @@ CUSTOM_LABEL = "✍️  Свой текст регламента"
 USE_LLM_ON_OPEN = True
 # Переключатель движка: подпись → (режим llm_providers, ходить ли в модель). Выбор действует на сессию.
 ENGINE_CLOUD = "Облако (Groq / OpenRouter)"
-ENGINE_YANDEX = "YandexGPT (AI Studio)"
+ENGINE_YANDEX = "Yandex AI Studio"
 ENGINE_OFFLINE = "Офлайн-эмулятор"
 ENGINE_CHOICES: Dict[str, Tuple[str, bool]] = {
     ENGINE_CLOUD: ("cloud", True),
@@ -112,7 +112,9 @@ def load_examples() -> Dict[str, Dict[str, str]]:
         m = re.search(r"^Регламент:\s*(.+)$", text, re.M)
         number = re.match(r"example_(\d+)_", path.stem)
         prefix = f"{number.group(1)}. " if number else ""
-        label = prefix + (m.group(1).strip() if m else path.stem)
+        # Паспортный регламент (Business Studio) без строки «Регламент:» — подпись по первой строке.
+        first = next((ln.strip(" .") for ln in text.splitlines() if ln.strip()), path.stem)
+        label = prefix + (m.group(1).strip() if m else re.sub(r"^\w+\s+\d+(?:\.\d+)*\.?\s*", "", first) or path.stem)
         items[label] = {"text": text, "stem": path.stem}
     return items
 
@@ -1829,7 +1831,7 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
         (
             n
             for n in (struct.get("nodes") or {}).values()
-            if n.get("type") in ("task", "userTask", "scriptTask") and (n.get("name") or "").strip()
+            if n.get("type") in ("task", "userTask", "scriptTask", "serviceTask", "manualTask") and (n.get("name") or "").strip()
         ),
         key=lambda n: (float(n.get("x") or 0), float(n.get("y") or 0)),
     )
@@ -1893,6 +1895,19 @@ def jury_safe_line(line: Any) -> str:
 
 def _unique(items: Any, limit: int = 8) -> List[str]:
     return list(dict.fromkeys(str(item) for item in (items or []) if str(item).strip()))[:limit]
+
+
+_PASSPORT_IO_RE = re.compile(r"(?m)^\s*(?:\d+\.\s.*\b)?(?:Входы|Выходы|Входные данные|Выходные данные)\s*:")
+
+
+def regulation_has_io(text: str) -> bool:
+    """В регламенте есть секции «Входы:/Выходы:» (паспорта шагов) — артефакты данных показываем сразу."""
+    return bool(_PASSPORT_IO_RE.search(text or ""))
+
+
+def artifacts_xml(xml: str, text: str, audit: Dict[str, Any]) -> str:
+    """Схема с артефактами: у паспортов шагов все входы/выходы, у обычных регламентов — до 6 объектов."""
+    return with_data_artifacts(xml, text, audit, limit=14 if regulation_has_io(text) else 6)
 
 
 def render_guardrails(audit: Dict[str, Any]) -> None:
@@ -2685,10 +2700,14 @@ def render_downloads(key: str) -> None:
 
     with st.container(key="export_row"):
         slots = st.columns(4, gap="small")
+        bpmn_out = (result["xml"] if ok else "")
+        if ok and st.session_state.get("show_data_artifacts"):
+            # Флажок «Отображать артефакты данных» включён — в файл идёт то, что на холсте.
+            bpmn_out = artifacts_xml(bpmn_out, st.session_state.get("reg_text") or "", result.get("audit") or {})
         with slots[0]:
             st.download_button(
                 "⬇️ BPMN 2.0",
-                data=(result["xml"] if ok else ""),
+                data=bpmn_out,
                 file_name=f"{stem}.bpmn",
                 mime="application/xml",
                 disabled=not ok,
@@ -3281,20 +3300,23 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
             list(ENGINE_CHOICES),
             key="engine_choice",
             on_change=_apply_engine_choice,
-            help="Облако — открытые модели через Groq / OpenRouter. YandexGPT — Yandex AI Studio "
-            "(ключи YANDEX_API_KEY и YANDEX_FOLDER_ID). Офлайн-эмулятор — без сети, детерминированный разбор. "
+            help="Облако — открытые модели через Groq / OpenRouter. Yandex AI Studio — стек партнёра: "
+            "gpt-oss-120b / YandexGPT (ключи YANDEX_API_KEY и YANDEX_FOLDER_ID). Офлайн-эмулятор — без сети, детерминированный разбор. "
             "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
         )
         _apply_engine_choice()
         use_llm = bool(st.session_state.get("use_llm"))
         if st.session_state["engine_choice"] == ENGINE_YANDEX and not llm_providers.yandex_configured():
             st.caption("Ключи Yandex AI Studio не заданы — схема соберётся офлайн-эмулятором.")
+        st.session_state.setdefault("show_data_artifacts", False)
+        if st.session_state.pop("_auto_data_artifacts", False):
+            st.session_state["show_data_artifacts"] = True
         st.checkbox(
             "Отображать артефакты данных",
             key="show_data_artifacts",
-            value=False,
             help="Документы (наряд-допуск, ведомость…) и системы (журнал, 1С…) под задачами, не больше 6. "
-            "По умолчанию выключено: основной вид остаётся чистым. Скачиваемый .bpmn — без артефактов.",
+            "По умолчанию выключено: основной вид остаётся чистым. Включено — артефакты и в скачиваемом .bpmn. "
+            "Для регламентов с «Входы:/Выходы:» включается сам.",
         )
         secrets_note = (
             f" · найдены секреты: {', '.join(SECRET_NAMES)}"
@@ -3309,6 +3331,9 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
                 st.warning("Введите текст регламента.")
             else:
                 run_generation(st.session_state["reg_text"], use_llm, show_progress=True)
+                if regulation_has_io(st.session_state["reg_text"]):
+                    # Паспорта шагов: входы/выходы — часть модели. Флажок уже на экране — включаем на перерисовке.
+                    st.session_state["_auto_data_artifacts"] = True
                 ensure_tobe_pack()
                 st.rerun()
         _sync_generation()
@@ -3501,10 +3526,10 @@ def render_diagram(canvas_height: int) -> None:
     )
     canvas_tobe = st.session_state.get("canvas_variant") == TOBE_LABEL and bool(xml_tobe)
     if st.session_state.get("show_data_artifacts"):
-        # Опциональный слой: документы и системы под задачами. Каталог и скачивание — на чистой схеме.
-        xml_asis = with_data_artifacts(xml_asis, text_asis, audit_asis)
+        # Опциональный слой: документы и системы под задачами. Каталог узлов — по чистой схеме (id те же).
+        xml_asis = artifacts_xml(xml_asis, text_asis, audit_asis)
         if xml_tobe:
-            xml_tobe = with_data_artifacts(xml_tobe, str((pack or {}).get("text") or text_asis), audit_asis)
+            xml_tobe = artifacts_xml(xml_tobe, str((pack or {}).get("text") or text_asis), audit_asis)
     page = viewer_html(
         xml_asis,
         canvas_height,
@@ -3608,7 +3633,9 @@ def render_assistant() -> None:
 def _apply_engine_choice() -> None:
     """Выбор движка → режим llm_providers на эту сессию и флаг use_llm для генерации, To-Be и ассистента."""
     if "engine_choice" not in st.session_state:
-        st.session_state["engine_choice"] = ENGINE_CLOUD if USE_LLM_ON_OPEN else ENGINE_OFFLINE
+        # Ключи AI Studio заданы — по умолчанию стек партнёра (правило финала), иначе открытые модели Groq.
+        default = ENGINE_YANDEX if llm_providers.yandex_configured() else ENGINE_CLOUD
+        st.session_state["engine_choice"] = default if USE_LLM_ON_OPEN else ENGINE_OFFLINE
     mode, use_llm = ENGINE_CHOICES.get(st.session_state["engine_choice"], ("cloud", True))
     llm_providers.set_session_mode(mode)
     st.session_state["use_llm"] = use_llm

@@ -35,6 +35,7 @@ class TaskType(str, Enum):
 
     USER = "user"
     SCRIPT = "script"
+    MANUAL = "manual"
 
 
 @dataclass
@@ -423,7 +424,9 @@ def analyze_process(regulation_text: str) -> ProcessBlueprint:
                 system=bool(step.system),
                 back_num=step.back_ref,
                 id=f"T{step.num}",
-                task_type=TaskType.SCRIPT if step.system else TaskType.USER,
+                task_type=(
+                    TaskType.SCRIPT if step.system else (TaskType.MANUAL if getattr(step, "manual", False) else TaskType.USER)
+                ),
             )
             for step in steps
             if step.title
@@ -745,7 +748,10 @@ def compile_blueprint(blueprint: ProcessBlueprint) -> tuple:
     code += [f"lane_{index} = lanes[{index}]" for index in range(len(blueprint.roles))]
 
     def emit_task(var: str, task: BlueprintTask, parent: str) -> None:
-        func = "add_script_task" if task.task_type == TaskType.SCRIPT else "add_user_task"
+        func = {
+            TaskType.SCRIPT: "add_script_task",
+            TaskType.MANUAL: "add_manual_task",
+        }.get(task.task_type, "add_user_task")
         code.append(f"{var} = DIAGRAM.{func}({task.title!r}, {parent})")
         if task.hours is not None:
             code.append(f"DIAGRAM.set_sla({var}, {round(float(task.hours), 3)})")

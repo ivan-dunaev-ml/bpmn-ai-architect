@@ -16,6 +16,7 @@ LONG = (ROOT / "stress_tests" / "05_very_long_40_steps.txt").read_text(encoding=
 _ENV = [
     "BPMN_PROVIDER", "BPMN_AI_MODE",
     "YANDEX_API_KEY", "YANDEX_IAM_TOKEN", "YANDEX_FOLDER_ID", "YANDEX_MODEL", "YANDEX_BASE_URL",
+    "YANDEX_REASONING_EFFORT", "YANDEX_FALLBACK_MODEL", "YANDEX_FALLBACK_REASONING_EFFORT",
 ] + [f"{p}_{k}" for p in llm_providers.CLOUD_PREFIXES for k in (
     "API_KEY", "BASE_URL", "MODEL", "REASONING_EFFORT", "INPUT_BUDGET", "MAX_TOKENS",
 )]
@@ -224,3 +225,19 @@ def test_named_stage_becomes_subprocess(env):
     loops = {item["to"] for item in audit["rework_loops"]}
     assert "Комплексная диагностика повреждений" in loops
     assert audit["sla"]["with_rework_hours"] == 12.55
+
+
+def test_yandex_fallback_and_reasoning(env):
+    _yandex(env)
+    env.setenv("YANDEX_MODEL", "gpt-oss-120b/latest")
+    env.setenv("YANDEX_REASONING_EFFORT", "low")
+    env.setenv("YANDEX_FALLBACK_MODEL", "yandexgpt-5.1/latest")
+    env.setenv("BPMN_PROVIDER", "yandex")
+    chain = llm_providers.providers()
+    assert [p.slot for p in chain] == ["yandex", "yandex2"]
+    assert chain[0].model == "gpt://b1gfolder/gpt-oss-120b/latest"
+    assert chain[1].label == "yandex2:yandexgpt-5.1/latest"
+    main = llm_providers.build_payload(chain[0], [{"role": "user", "content": "x"}], 0.1)
+    assert main["reasoning_effort"] == "low"  # gpt-oss в AI Studio: вдвое быстрее
+    backup = llm_providers.build_payload(chain[1], [{"role": "user", "content": "x"}], 0.1)
+    assert "reasoning_effort" not in backup

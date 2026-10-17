@@ -58,12 +58,22 @@ def _best_node(title: str, nodes: List[Tuple[str, str]]) -> Optional[str]:
     return best if score >= 2 or (score >= 1 and len(want) <= 2) else None
 
 
-def _plan(regulation_text: str, audit: Dict[str, Any], nodes: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
-    """Что и к какой задаче привязать: документ — к первому шагу, где он упомянут (там он создаётся)."""
-    try:
-        from ai_generator import normalize_regulation, parse_regulation
+def _plan(
+    regulation_text: str, audit: Dict[str, Any], nodes: List[Tuple[str, str]], limit: int = MAX_OBJECTS
+) -> List[Dict[str, Any]]:
+    """Что и к какой задаче привязать: документ — к первому шагу, где он упомянут.
 
-        steps = {s.num: s.title for s in parse_regulation(normalize_regulation(regulation_text or "")).steps}
+    Если в паспорте шага он во «Входах» (и не в «Выходах») — стрелка в задачу, иначе из задачи.
+    """
+    inputs: Dict[int, set] = {}
+    try:
+        from ai_generator import _passport_artifact_name, normalize_regulation, parse_regulation
+
+        parsed_steps = parse_regulation(normalize_regulation(regulation_text or "")).steps
+        steps = {s.num: s.title for s in parsed_steps}
+        for s in parsed_steps:
+            outs = {_passport_artifact_name(x) for x in s.outputs}
+            inputs[s.num] = {_passport_artifact_name(x) for x in s.inputs} - outs
     except Exception:  # noqa: BLE001
         steps = {}
     plan: List[Dict[str, Any]] = []
@@ -77,23 +87,24 @@ def _plan(regulation_text: str, audit: Dict[str, Any], nodes: List[Tuple[str, st
         for num in item.get("steps") or []:
             host = _best_node(steps.get(num, ""), nodes)
             if host:
-                plan.append({"kind": kind, "name": name, "task": host})
+                direction = "in" if kind == "object" and name in inputs.get(num, set()) else "out"
+                plan.append({"kind": kind, "name": name, "task": host, "direction": direction})
                 used.add(name)
                 break
-        if len(plan) >= MAX_OBJECTS:
+        if len(plan) >= limit:
             break
     return plan
 
 
-def with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) -> str:
+def with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any], limit: int = MAX_OBJECTS) -> str:
     """XML схемы + артефакты данных. Ошибка или нечего добавить — исходный XML без изменений."""
     try:
-        return _with_data_artifacts(xml, regulation_text, audit or {})
+        return _with_data_artifacts(xml, regulation_text, audit or {}, limit)
     except Exception:  # noqa: BLE001 — опциональный слой не должен ломать основную схему
         return xml
 
 
-def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) -> str:
+def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any], limit: int = MAX_OBJECTS) -> str:
     root = ET.fromstring(xml.encode("utf-8"))
     plane = root.find(".//bpmndi:BPMNPlane", NS)
     if plane is None:
@@ -118,7 +129,7 @@ def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) 
                         if _local(inner.tag) in _WORK:
                             host_of[inner.get("id")] = (el, process)
                             named.append((inner.get("id"), inner.get("name") or ""))
-    plan = _plan(regulation_text, audit, named)
+    plan = _plan(regulation_text, audit, named, limit)
     if not plan:
         return xml
 
@@ -214,16 +225,25 @@ def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) 
                 return False
             return not busy(x0, x1, strip_top, y + h + 22.0)
 
-        x = cx - w / 2.0
-        for step in range(0, 61):
+        lb = bounds(item["lane"].get("id"))
+        lane_left = float(lb.get("x")) + 8.0 + span / 2.0 - w / 2.0  # подпись не выходит за левый край дорожки
+        x = max(cx - w / 2.0, lane_left)
+        for step in range(0, 81):
             offsets = (0.0,) if step == 0 else (step * 12.0, -step * 12.0)
-            hit = next((x + off for off in offsets if free(x + off)), None)
+            hit = next((x + off for off in offsets if x + off >= lane_left and free(x + off)), None)
             if hit is not None:
                 x = hit
                 break
         else:
             continue  # места в полосе нет — объект не рисуем, схема важнее
         row.append((x + w / 2.0 - span / 2.0, x + w / 2.0 + span / 2.0))
+        # Узкая схема (3 задачи): объект справа за краем — расширяем дорожки и пул, а не вылезаем за рамку.
+        overflow = x + w / 2.0 + span / 2.0 + 12.0 - (float(lb.get("x")) + float(lb.get("width")))
+        if overflow > 0:
+            for shape in plane.findall("bpmndi:BPMNShape", NS):
+                if shape.get("isHorizontal") == "true":
+                    b = shape.find("dc:Bounds", NS)
+                    b.set("width", f"{float(b.get('width')) + overflow:.1f}")
         ref_id = f"DataRef_{n}"
         assoc_id = f"DataOutputAssociation_{n}"
         process = item["process"]
@@ -241,15 +261,31 @@ def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) 
                 "id": ref_id, "name": item["name"], "dataObjectRef": f"DataObject_{n}",
             }))
             process.insert(at, ET.Element(_q("bpmn", "dataObject"), {"id": f"DataObject_{n}"}))
-        # dataOutputAssociation — после incoming/outgoing хоста (порядок tActivity в XSD).
+        # Связь с задачей в порядке tActivity по XSD: incoming/outgoing → property → dataInput… → dataOutput….
         host = item["host"]
-        pos = 0
-        for i, child in enumerate(list(host)):
-            if _local(child.tag) in ("documentation", "extensionElements", "incoming", "outgoing"):
-                pos = i + 1
-        assoc = ET.Element(_q("bpmn", "dataOutputAssociation"), {"id": assoc_id})
-        ET.SubElement(assoc, _q("bpmn", "targetRef")).text = ref_id
-        host.insert(pos, assoc)
+        incoming_data = item.get("direction") == "in"
+
+        def insert_after(element: ET.Element, tags: Tuple[str, ...]) -> None:
+            pos = 0
+            for i, child in enumerate(list(host)):
+                if _local(child.tag) in tags:
+                    pos = i + 1
+            host.insert(pos, element)
+
+        base = ("documentation", "extensionElements", "incoming", "outgoing", "ioSpecification")
+        if incoming_data:
+            # Вход шага: стрелка из документа в задачу (bpmn-js: targetRef — служебное свойство задачи).
+            prop_id = f"Property_{n}"
+            insert_after(ET.Element(_q("bpmn", "property"), {"id": prop_id, "name": "__targetRef_placeholder"}), base + ("property",))
+            assoc_id = f"DataInputAssociation_{n}"
+            assoc = ET.Element(_q("bpmn", "dataInputAssociation"), {"id": assoc_id})
+            ET.SubElement(assoc, _q("bpmn", "sourceRef")).text = ref_id
+            ET.SubElement(assoc, _q("bpmn", "targetRef")).text = prop_id
+            insert_after(assoc, base + ("property", "dataInputAssociation"))
+        else:
+            assoc = ET.Element(_q("bpmn", "dataOutputAssociation"), {"id": assoc_id})
+            ET.SubElement(assoc, _q("bpmn", "targetRef")).text = ref_id
+            insert_after(assoc, base + ("property", "dataInputAssociation", "dataOutputAssociation"))
         # DI: форма объекта с подписью снизу и ортогональная связь.
         shape = ET.SubElement(plane, _q("bpmndi", "BPMNShape"), {"id": f"{ref_id}_di", "bpmnElement": ref_id})
         ET.SubElement(shape, _q("dc", "Bounds"), {"x": f"{x:.1f}", "y": f"{y:.1f}", "width": f"{w:.0f}", "height": f"{h:.0f}"})
@@ -280,6 +316,8 @@ def _with_data_artifacts(xml: str, regulation_text: str, audit: Dict[str, Any]) 
             mid = strip_top + 4.0
             points += [(sx, mid), (ox, mid)]
         points.append((ox, y))
+        if incoming_data:
+            points.reverse()  # вход: от документа к задаче
         for px, py in points:
             ET.SubElement(edge, _q("di", "waypoint"), {"x": f"{px:.1f}", "y": f"{py:.1f}"})
     body = ET.tostring(root, encoding="unicode")

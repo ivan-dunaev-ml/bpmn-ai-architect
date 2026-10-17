@@ -109,8 +109,10 @@ def validate(path: str) -> List[str]:
     for parent in root.iter():
         for child in parent:
             if child.tag in (_q("bpmn", "dataOutputAssociation"), _q("bpmn", "dataInputAssociation")):
-                target = child.find("bpmn:targetRef", NS)
-                data_links[child.get("id", "")] = (parent.get("id", ""), (target.text or "").strip() if target is not None else "")
+                # Документ на другом конце связи: targetRef у выхода, sourceRef у входа.
+                ref = child.find("bpmn:sourceRef", NS) if child.tag == _q("bpmn", "dataInputAssociation") else None
+                ref = ref if ref is not None else child.find("bpmn:targetRef", NS)
+                data_links[child.get("id", "")] = (parent.get("id", ""), (ref.text or "").strip() if ref is not None else "")
     all_edges = list(root.iter(_q("bpmndi", "BPMNEdge")))
     edges = [e for e in all_edges if e.get("bpmnElement", "") not in data_links]
     data_edges = [e for e in all_edges if e.get("bpmnElement", "") in data_links]

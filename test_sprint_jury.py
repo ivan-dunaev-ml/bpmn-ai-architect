@@ -171,3 +171,91 @@ def test_vanya_223fz_conditional_actions_and_named_return():
     assert xsd_errors_xml(xml) == [] and _validate_xml(xml) == [] and _diagonals(xml) == 0
     _opt, delta = gen.optimize_process_to_be(text, audit)
     assert delta["sla_after_hours"] <= delta["sla_before_hours"]  # параллель не удваивает путь
+
+
+PASSPORT = (ROOT / "examples" / "example_4_access_route_passport.txt").read_text(encoding="utf-8")
+
+
+def _passport_with_word_markup() -> str:
+    """Тот же паспорт, как его копируют из PDF с рецензированием: «Formatted […]», «| » из таблиц."""
+    junk = "Formatted [Иванов И.И.]: Font: 12 pt\nBulleted + Level: 1 + Aligned at: 0.63 cm\nIndent at: 1.27 cm\nNo bullets or numbering\n"
+    text = PASSPORT.replace("Ответственный: ", "Ответственный: | ").replace("Длительность: ", "Длительность: | ")
+    lines = text.splitlines()
+    return "\n".join(lines[:3] + junk.splitlines() + lines[3:]) + "\n"
+
+
+@pytest.mark.parametrize("text", [PASSPORT, _passport_with_word_markup()], ids=["clean", "word-markup"])
+def test_customer_passport_regulation(text):
+    """Пример кейсодателя (Шаг 4.1–4.3 + поля): 3 дорожки, 3 задачи по 16 ч, КП 48 ч, ИС1/ИС3, документы, QS ≥ 90."""
+    parsed = gen.parse_regulation(gen.normalize_regulation(text))
+    assert len(parsed.steps) == 3
+    assert [s.hours for s in parsed.steps] == [16.0, 16.0, 16.0]
+    assert parsed.steps[0].title.startswith("Установить ответственного")
+    assert parsed.steps[1].title.startswith("Подготовить и согласовать запрос")
+    assert parsed.steps[2].title.startswith("Исполнить запрос")
+    stop = {"входы", "выходы", "длительность", "участвуют", "ответственный", "основание", "результат", "срок"}
+    assert len(parsed.roles) == 3 and not {r.lower() for r in parsed.roles} & stop
+    assert parsed.roles[0] == "Менеджер процесса" and all("|" not in r for r in parsed.roles)
+    assert parsed.steps[0].participants and parsed.steps[0].inputs and parsed.steps[0].outputs
+    xml, audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not err, err
+    assert audit["sla"]["critical_path_hours"] == 48.0
+    assert len(audit["lane_load"]) == 3 and audit["stats"]["work_items"] == 3
+    assert int(audit["methodology"]["score"]) >= 90
+    systems = {item["name"] for item in audit["it_systems"]}
+    assert {"ИС1", "ИС3"} <= systems
+    documents = " ".join(item["name"] for item in audit["artifacts"])
+    assert "Корпоративное письмо" in documents and "Запрос на изменение маршрута" in documents
+    assert xsd_errors_xml(xml) == []
+
+
+def test_passport_participants_are_consulted_in_raci():
+    parsed = gen.parse_regulation(gen.normalize_regulation(PASSPORT))
+    matrix = gen.generate_raci_matrix(parsed.steps, parsed.roles)
+    first = matrix[0]["assignments"]
+    assert "R" in first["Менеджер процесса"]
+    assert "C" in first["Работник Центра информационных технологий"]
+
+
+def test_passport_artifacts_layer_and_tobe_keep_fields_out():
+    from app import artifacts_xml, regulation_has_io
+
+    assert regulation_has_io(PASSPORT)
+    xml, audit, err = gen.generate_bpmn_from_text(PASSPORT, use_llm=False)
+    layered = artifacts_xml(xml, PASSPORT, audit)
+    assert layered.count("<bpmn:dataObjectReference") >= 6 and "<bpmn:dataInputAssociation" in layered
+    assert xsd_errors_xml(layered) == [] and _validate_xml(layered) == [] and _diagonals(layered) == 0
+    _opt, delta = gen.optimize_process_to_be(PASSPORT, audit)
+    tobe_roles = {item["role"] for item in (delta["tobe_audit"].get("lane_load") or [])}
+    assert not {r.lower() for r in tobe_roles} & {"входы", "выходы", "длительность"}
+    # ЭДО — только для шага, где согласование — действие («Подготовить и согласовать»), не слово объекта.
+    edo = [a for a in delta["actions"] if a.get("kind") == "edo_approval" or a.get("type") == "edo_approval"]
+    assert len(edo) == 1 and "Шаг 2" in edo[0]["detail"]
+
+
+def test_docx_table_reader_has_no_pipes_or_duplicates(tmp_path):
+    docx = pytest.importorskip("docx")
+    doc = docx.Document()
+    table = doc.add_table(rows=4, cols=2)
+    head = table.cell(0, 0).merge(table.cell(0, 1))
+    head.text = "Шаг 1.1 Проверка комплектности заявки"
+    table.cell(1, 0).text, table.cell(1, 1).text = "Ответственный:", "Диспетчер"
+    table.cell(2, 0).text, table.cell(2, 1).text = "Длительность:", "2 рабочих часа"
+    table.cell(3, 0).text, table.cell(3, 1).text = "Выходы:", "Проверенная заявка\nЖурнал в ИСЗ"
+    path = tmp_path / "p.docx"
+    doc.save(path)
+    text, err = gen.read_docx_regulation(path.read_bytes())
+    assert not err and "|" not in text
+    assert text.count("Шаг 1.1") == 1  # объединённая ячейка — один раз
+    assert "Выходы: Проверенная заявка; Журнал в ИСЗ" in text
+    assert gen.extract_it_systems(text) == ["ИС3"]  # OCR: «ИСЗ» → ИС3
+
+
+def test_task_types_follow_the_work():
+    xml, _audit, err = gen.generate_bpmn_from_text(EX1, use_llm=False)
+    assert not err
+    manual = re.findall(r'<bpmn:manualTask id="[^"]+" name="([^"]+)"', xml)
+    assert "Выполнить аварийный ремонт оборудования" in manual
+    assert "<bpmn:scriptTask" in xml  # фиксация в журнале системы
+    assert "Принять сообщение об аварийном отключении оборудования ПС 110 кВ" not in manual
+    assert "add_manual_task" in gen.build_prompt(EX1)
