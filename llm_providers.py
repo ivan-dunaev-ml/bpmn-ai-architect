@@ -133,28 +133,44 @@ def _max_output(slot_env: str) -> int:
     return _int_env(f"{slot_env}_MAX_TOKENS", _DEFAULT_MAX_OUTPUT)
 
 
-def yandex_provider() -> Optional[Provider]:
+def yandex_provider(fallback: bool = False) -> Optional[Provider]:
+    """Yandex AI Studio. fallback=True — запасная модель того же каталога (YANDEX_FALLBACK_MODEL).
+
+    AI Studio раздаёт и открытые модели: gpt-oss-120b (та же, что на Groq), qwen3.6, а также YandexGPT.
+    YANDEX_REASONING_EFFORT («low») понимают рассуждающие модели (gpt-oss): ответ вдвое быстрее.
+    """
     key = os.getenv("YANDEX_API_KEY", "").strip()
     iam = os.getenv("YANDEX_IAM_TOKEN", "").strip()
     folder = os.getenv("YANDEX_FOLDER_ID", "").strip()
     if not (key or iam) or not folder:
         return None
     base = os.getenv("YANDEX_BASE_URL", YANDEX_DEFAULT_BASE).rstrip("/")
-    name = os.getenv("YANDEX_MODEL", "yandexgpt/latest").strip() or "yandexgpt/latest"
+    if fallback:
+        name = os.getenv("YANDEX_FALLBACK_MODEL", "").strip()
+        if not name:
+            return None
+        effort = os.getenv("YANDEX_FALLBACK_REASONING_EFFORT", "").strip()
+    else:
+        name = os.getenv("YANDEX_MODEL", "yandexgpt/latest").strip() or "yandexgpt/latest"
+        effort = os.getenv("YANDEX_REASONING_EFFORT", "").strip()
     model = name if name.startswith("gpt://") else f"gpt://{folder}/{name.lstrip('/')}"
     display = re.sub(r"^gpt://[^/]+/", "", model)
     auth = f"Api-Key {key}" if key else f"Bearer {iam}"
     return Provider(
-        slot="yandex",
+        slot="yandex2" if fallback else "yandex",
         kind="yandex",
         base_url=base,
         model=model,
         display_model=display,
         headers={"Authorization": auth, "x-folder-id": folder, "OpenAI-Project": folder},
-        reasoning_effort="",  # AI Studio в режиме OpenAI понимает только temperature / max_tokens / stream / response_format
+        reasoning_effort=effort,
         input_limit=_input_limit("YANDEX", base),
         max_output=_max_output("YANDEX"),
     )
+
+
+def yandex_providers() -> List[Provider]:
+    return [item for item in (yandex_provider(), yandex_provider(fallback=True)) if item is not None]
 
 
 def cloud_providers() -> List[Provider]:
@@ -186,19 +202,18 @@ def providers() -> List[Provider]:
     current = mode()
     if current == "emulator":
         return []
-    yandex = yandex_provider()
+    yandex = yandex_providers()
     if current == "yandex":
-        return [yandex] if yandex else []
+        return yandex
     if current == "cloud":
         return cloud_providers()
-    return ([yandex] if yandex else []) + cloud_providers()
+    return yandex + cloud_providers()
 
 
 def find(slot: str) -> Optional[Provider]:
     """Провайдер по слоту среди настроенных, без учёта режима (для старых вызовов _call_openai(prompt, prefix))."""
     slot = (slot or "").lower()
-    yandex = yandex_provider()
-    return next((item for item in ([yandex] if yandex else []) + cloud_providers() if item.slot == slot), None)
+    return next((item for item in yandex_providers() + cloud_providers() if item.slot == slot), None)
 
 
 def build_payload(
@@ -215,6 +230,10 @@ def build_payload(
     }
     effort = provider.reasoning_effort
     if provider.kind == "yandex":
+        # AI Studio в режиме OpenAI: temperature / max_tokens / stream / response_format;
+        # reasoning_effort — только если задан явно (gpt-oss в AI Studio его понимает: 17.8 → 8.4 с).
+        if effort:
+            payload["reasoning_effort"] = effort
         return payload
     if effort == "none" and "openrouter.ai" in provider.base_url:
         payload["reasoning"] = {"enabled": False}  # OpenRouter: без «размышлений» отвечает вдвое быстрее

@@ -71,7 +71,7 @@ CUSTOM_LABEL = "✍️  Свой текст регламента"
 USE_LLM_ON_OPEN = True
 # Переключатель движка: подпись → (режим llm_providers, ходить ли в модель). Выбор действует на сессию.
 ENGINE_CLOUD = "Облако (Groq / OpenRouter)"
-ENGINE_YANDEX = "YandexGPT (AI Studio)"
+ENGINE_YANDEX = "Yandex AI Studio"
 ENGINE_OFFLINE = "Офлайн-эмулятор"
 ENGINE_CHOICES: Dict[str, Tuple[str, bool]] = {
     ENGINE_CLOUD: ("cloud", True),
@@ -3300,8 +3300,8 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
             list(ENGINE_CHOICES),
             key="engine_choice",
             on_change=_apply_engine_choice,
-            help="Облако — открытые модели через Groq / OpenRouter. YandexGPT — Yandex AI Studio "
-            "(ключи YANDEX_API_KEY и YANDEX_FOLDER_ID). Офлайн-эмулятор — без сети, детерминированный разбор. "
+            help="Облако — открытые модели через Groq / OpenRouter. Yandex AI Studio — стек партнёра: "
+            "gpt-oss-120b / YandexGPT (ключи YANDEX_API_KEY и YANDEX_FOLDER_ID). Офлайн-эмулятор — без сети, детерминированный разбор. "
             "Сборка начинается только по кнопке «Сгенерировать BPMN 2.0».",
         )
         _apply_engine_choice()
@@ -3633,7 +3633,9 @@ def render_assistant() -> None:
 def _apply_engine_choice() -> None:
     """Выбор движка → режим llm_providers на эту сессию и флаг use_llm для генерации, To-Be и ассистента."""
     if "engine_choice" not in st.session_state:
-        st.session_state["engine_choice"] = ENGINE_CLOUD if USE_LLM_ON_OPEN else ENGINE_OFFLINE
+        # Ключи AI Studio заданы — по умолчанию стек партнёра (правило финала), иначе открытые модели Groq.
+        default = ENGINE_YANDEX if llm_providers.yandex_configured() else ENGINE_CLOUD
+        st.session_state["engine_choice"] = default if USE_LLM_ON_OPEN else ENGINE_OFFLINE
     mode, use_llm = ENGINE_CHOICES.get(st.session_state["engine_choice"], ("cloud", True))
     llm_providers.set_session_mode(mode)
     st.session_state["use_llm"] = use_llm
