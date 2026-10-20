@@ -2236,6 +2236,15 @@ class BPMNDiagramBuilder:
 
     # ------------------------------------------------------------------ XML
     def to_bpmn_xml(self, root_process_id: str, root_start_id: str, root_end_id: str) -> str:
+        self.prepare_for_export(root_process_id, root_start_id, root_end_id)
+        return self._export_xml()
+
+    def prepare_for_export(self, root_process_id: str, root_start_id: str, root_end_id: str) -> None:
+        """Граф в итоговом виде (корневые id, свёрнутые сквозные шлюзы) — без раскладки и XML.
+
+        Этого достаточно для аудита: критический путь, циклы и проверка нотации от координат не зависят.
+        Оптимизатор To-Be так сравнивает варианты, а раскладывает на холсте только победителя.
+        """
         if root_process_id and root_process_id != self.process_id:
             previous = self.process_id
             self.process_id = root_process_id
@@ -2262,6 +2271,8 @@ class BPMNDiagramBuilder:
             self.warnings.append(f"root_end_id={root_end_id!r} отсутствует в диаграмме.")
 
         self.collapse_passthrough_gateways()
+
+    def _export_xml(self) -> str:
         start = self.root_start_id if self.root_start_id in self.nodes else next(
             (n.id for n in self.nodes.values() if n.kind == "startEvent" and n.owner_id == self.process_id), None
         )
