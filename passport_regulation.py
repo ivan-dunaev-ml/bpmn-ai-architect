@@ -321,3 +321,101 @@ def split_inline_fields(body: str) -> tuple:
     for match in INLINE_FIELDS_RE.finditer(body[first.start():]):
         found[names[match.group(1).lower()]].extend(_split_items(match.group(2)))
     return core, found
+
+
+# ----------------------------------------------------------------------------- таблицы, одна строка, капс
+_COL_ACTION = re.compile(r"действ|операц|наименован|содержан|мероприят|работ|описан|шаг процесса|этап", re.I)
+_COL_ROLE = re.compile(r"исполнит|ответствен|роль|кто|участник|подразделен|владел", re.I)
+_COL_TIME = re.compile(r"срок|длительн|время|норматив|трудо[её]мк", re.I)
+_COL_NUM = re.compile(r"^(?:№|n|#|п/п|№\s*п/п|шаг|пункт)$", re.I)
+
+
+def _cells(line: str, sep: str) -> List[str]:
+    parts = [p.strip() for p in line.strip().strip("|").split(sep)] if sep == "|" else [p.strip() for p in line.split("\t")]
+    return parts
+
+
+def tables_to_steps(text: str) -> str:
+    """Таблица регламента (Word → «| № | Действие | Исполнитель | Срок |» или через табуляцию) → «N. Роль: действие (срок)».
+
+    Колонки ищем по заголовку. Без заголовка с «Действие» и «Исполнитель» таблицу не трогаем.
+    """
+    lines = (text or "").splitlines()
+    out: List[str] = []
+    i = 0
+    changed = False
+    while i < len(lines):
+        line = lines[i]
+        sep = "|" if line.count("|") >= 2 else ("\t" if line.count("\t") >= 2 else "")
+        if not sep:
+            out.append(line)
+            i += 1
+            continue
+        header = _cells(line, sep)
+        act = next((k for k, h in enumerate(header) if _COL_ACTION.search(h)), None)
+        role = next((k for k, h in enumerate(header) if _COL_ROLE.search(h) and k != act), None)
+        if act is None or role is None:
+            out.append(line)
+            i += 1
+            continue
+        num = next((k for k, h in enumerate(header) if _COL_NUM.match(h.strip())), None)
+        dur = next((k for k, h in enumerate(header) if _COL_TIME.search(h) and k not in (act, role)), None)
+        i += 1
+        n = 0
+        while i < len(lines) and (lines[i].count(sep) >= 2 or re.fullmatch(r"\s*\|?[\s:|-]+\|?\s*", lines[i]) and lines[i].strip()):
+            row = lines[i]
+            i += 1
+            if re.fullmatch(r"\s*\|?[\s:|-]+\|?\s*", row):
+                continue  # разделитель Markdown «|---|---|»
+            cells = _cells(row, sep)
+            get = lambda k: cells[k].strip() if k is not None and k < len(cells) else ""  # noqa: E731
+            action, who = get(act), get(role)
+            if not action:
+                continue
+            n += 1
+            label = get(num) if num is not None and re.fullmatch(r"\d+", get(num) or "") else str(n)
+            when = get(dur)
+            action = action[:1].lower() + action[1:] if re.match(r"^[А-ЯЁ][а-яё]+(?:ть|ти|чь)\b", action) else action
+            step = f"{label}. {who}: {action[:1].upper() + action[1:]}" if who else f"{label}. {action}"
+            if when:
+                step += f" ({when})"
+            out.append(step.rstrip(" .") + ".")
+            changed = True
+    return "\n".join(out) if changed else text
+
+
+def split_inline_numbering(text: str) -> str:
+    """Регламент одной строкой: «Регламент: Х. 1. … 2. …» → по строке на пункт."""
+    src = text or ""
+    if src.count("\n") > 2 or len(re.findall(r"(?:^|[.!?;]\s+)\d{1,3}[.)]\s+\S", src)) < 2:
+        return src
+    src = re.sub(r"(?<=[.!?;])\s+(?=\d{1,3}[.)]\s+\S)", "\n", src)
+    src = re.sub(r"^((?:Регламент|Процесс|Название)\s*[:—–-][^\n]*?[.!?])\s+(?=\S)", r"\1\n", src, flags=re.I)
+    return src
+
+
+# Аббревиатуры, которые в отраслевых регламентах пишутся заглавными; остальное в капсе — просто слова («ГРУЗ»).
+_ABBREVIATIONS = {
+    "ИС", "АС", "АИС", "ГИС", "СЭД", "ЭДО", "ЭТП", "ЕИС", "ТП", "ЛЭП", "ВЛ", "КЛ", "ПС", "КТП", "РП", "РЗА", "ДЭС",
+    "ОТК", "ЦОК", "СОД", "РВБ", "ОМТО", "АСУ", "ФАС", "ЦЗК", "ТК", "СБ", "ТЗ", "ТУ", "КП", "ИТ", "ООО", "ПАО", "ОАО",
+    "АО", "РФ", "ТЭЦ", "ГЭС", "АЭС", "СИЗ", "ЕОЛ", "ПЭО", "НД", "ПТЭ", "SLA", "CRM", "ERP", "SAP", "SCADA", "ОИК",
+}
+
+
+def soften_caps(text: str) -> str:
+    """Регламент капсом: «КЛАДОВЩИК ПРИНИМАЕТ ГРУЗ» → «Кладовщик принимает груз». Аббревиатуры до 4 букв — как есть."""
+    letters = re.findall(r"[А-ЯЁа-яё]", text or "")
+    if len(letters) < 40 or sum(1 for ch in letters if ch.isupper()) / len(letters) < 0.8:
+        return text
+
+    def word(m: "re.Match[str]") -> str:
+        w = m.group(0)
+        return w if w in _ABBREVIATIONS else w.lower()
+
+    lines = []
+    for line in text.splitlines():
+        low = re.sub(r"(?<![\w-])[А-ЯЁA-Z]+(?![\w-])", word, line)  # «ИС3», «110КВ» — с цифрами, не трогаем
+        low = re.sub(r"^(\s*(?:\d+[.)]\s+)?)([а-яёa-z])", lambda m: m.group(1) + m.group(2).upper(), low)
+        low = re.sub(r"([.!?:]\s+)([а-яё])", lambda m: m.group(1) + m.group(2).upper(), low)
+        lines.append(low)
+    return "\n".join(lines)

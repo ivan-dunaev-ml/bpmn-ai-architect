@@ -625,6 +625,15 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
     return applied
 
 
+def _single_numbered_step(regulation_text: str) -> bool:
+    """В тексте ровно один нумерованный пункт, и в нём есть действие («1. Инженер проверяет огнетушители»)."""
+    lines = re.findall(r"(?m)^\s*\d{1,3}[.)]\s+(.{8,})$", normalize_regulation(regulation_text or ""))
+    if len(lines) != 1:
+        return False
+    words = [w.strip(".,;:()«»") for w in lines[0].split()]
+    return any(_is_verb(w) or re.fullmatch(r"[а-яё]{4,}(?:ть|ти)", w.lower() or "") for w in words)
+
+
 def _pin_sla_to_regulation(diagram: BPMNDiagramBuilder, regulation_text: str) -> List[str]:
     """Срок шага — из регламента, а не от модели: модель иногда пишет свой (5 мин → 0.08, 20 мин → 0.5).
 
@@ -743,7 +752,8 @@ def execute_generated_code(
             return "", {}, f"Исполнение кода прервано по таймауту: {exc}"
 
         work_nodes = [n for n in diagram.nodes.values() if n.kind not in ("startEvent", "endEvent")]
-        if len(work_nodes) < 2:
+        if len(work_nodes) < (1 if _single_numbered_step(regulation_text) else 2):
+            # Регламент из одного нумерованного шага — тоже процесс (старт → задача → финал); мусор — нет.
             return "", {}, _UNRECOGNIZED_PROCESS
 
         if hours_source == "units_guess":
@@ -1001,6 +1011,10 @@ VERB_MAP = {
     "выполняет": "выполнить", "составляет": "составить", "подписывает": "подписать", "заключает": "заключить",
     "согласовывает": "согласовать", "согласовывают": "согласовать", "подписывают": "подписать",
     "утверждает": "утвердить", "утверждают": "утвердить",
+    "получает": "получить", "получают": "получить", "начисляет": "начислить", "начисляют": "начислить",
+    "оплачивает": "оплатить", "отправляет": "отправить", "размещает": "разместить", "публикует": "опубликовать",
+    "назначает": "назначить", "уведомляют": "уведомить", "заполняет": "заполнить", "устанавливает": "установить",
+    "выдают": "выдать", "снимает": "снять", "изменяет": "изменить", "обеспечивает": "обеспечить",
     "передаёт": "передать", "передает": "передать", "допускает": "допустить", "выводит": "вывести",
     "восстанавливает": "восстановить", "измеряет": "измерить", "рассчитывает": "рассчитать",
     "регистрирует": "зарегистрировать", "формирует": "сформировать", "фиксирует": "зафиксировать",
@@ -1633,6 +1647,24 @@ def read_docx_regulation(data: bytes) -> Tuple[Optional[str], Optional[str]]:
             parts.append(raw)
 
         def add_table(table: Any) -> None:
+            # Таблица шагов («№ | Действие | Исполнитель | Срок») — сразу в строки «N. Роль: действие (срок)».
+            from passport_regulation import tables_to_steps
+
+            grid: List[str] = []
+            for row in table.rows:
+                seen_cells = set()
+                cells = []
+                for cell in row.cells:
+                    if id(cell._tc) in seen_cells:
+                        continue
+                    seen_cells.add(id(cell._tc))
+                    cells.append(re.sub(r"\s+", " ", cell.text or "").strip())
+                grid.append(" | ".join(cells))
+            joined = "\n".join(grid)
+            steps = tables_to_steps(joined)
+            if steps != joined:
+                parts.extend(line for line in steps.splitlines() if line.strip())
+                return
             for row in table.rows:
                 cells: List[str] = []
                 seen = set()
@@ -1684,9 +1716,15 @@ def _normalize_regulation(text: str) -> str:
     - многоуровневую нумерацию «3.2.1.» переводит в сквозную «1.», «2.» … вместе со ссылками «п. 3.2.5».
     """
     text = text.replace("\r\n", "\n").replace("­", "")
-    from passport_regulation import passport_to_canonical, strip_word_markup
+    from passport_regulation import (
+        passport_to_canonical, soften_caps, split_inline_numbering, strip_word_markup, tables_to_steps,
+    )
 
     text = strip_word_markup(text)
+    # Форматы «как скопировали»: таблица из Word, всё одной строкой, весь текст капсом.
+    text = soften_caps(split_inline_numbering(tables_to_steps(text)))
+    # «службы «Энергосбыт-Сервис», ООО проверяет» — форма собственности часть названия, а не новый шаг с ролью «ООО».
+    text = re.sub(r"([»\"])\s*,\s*(ООО|АО|ПАО|ОАО|ЗАО|ИП|ФГУП|МУП)\b", r"\1 \2", text)
     canonical = passport_to_canonical(text)
     if canonical is not None:
         # Паспорта «Шаг X.Y» с полями: одна карточка — одна строка, нумерация и атомизация не нужны.
@@ -1782,16 +1820,26 @@ def _is_verb(word: str) -> bool:
 
 
 def _subject_before_verb(text: str) -> Optional[Tuple[str, int]]:
-    """Подлежащее — слова перед первым глаголом («Начальник смены» оценивает …)."""
+    """Подлежащее — слова перед первым глаголом («Начальник смены» оценивает …).
+
+    Уточнения роли не мешают: «Ведущий инженер (проектный офис, г. Москва) разрабатывает…» → «Ведущий инженер»,
+    «Руководитель службы «Энергосбыт», ООО проверяет…» → «Руководитель службы «Энергосбыт»».
+    """
     m = _CONNECTORS_RE.match(text)
     offset = m.end() if m else 0
+    # Скобки заменяем пробелами той же длины — позиции в исходном тексте не сдвигаются.
+    text = re.sub(r"\([^()]{0,80}\)", lambda mm: " " * len(mm.group(0)), text)
     tokens = list(re.finditer(r"\S+", text[offset:]))
     for i, tok in enumerate(tokens[:6]):
         if i >= 1 and _is_verb(tok.group()):
             words = [t.group() for t in tokens[:i]]
             while words and words[-1].lower().strip(",") in _ADVERBS:
                 words.pop()
-            if not words or len(words) > 4 or any(re.search(r"[\d:;()«»,]", w) for w in words):
+            if words and "," in " ".join(words):
+                # «…«Энергосбыт», ООО проверяет» — хвост после запятой (форма собственности, город) не роль.
+                head = " ".join(words).split(",")[0].split()
+                words = head if head else words
+            if not words or len(words) > 6 or any(re.search(r"[\d:;()]", w) for w in words):
                 return None
             if all(w.lower().strip(",") in _REL_PRONOUNS for w in words):
                 return None
@@ -1816,8 +1864,13 @@ def _subject_is_artifact(subject: str) -> bool:
 
 
 def _canonical_role(subject: str) -> str:
+    """Каноническое имя роли, только если знакомое слово — голова роли, в начале («Бригада» → «Ремонтная бригада»).
+
+    «Заместитель генерального директора», «Оперативная бригада» — свои роли, их не сводим к «Руководитель» / «Ремонтная бригада».
+    """
     for regex, name in _ROLE_RE:
-        if regex.search(subject):
+        found = regex.search(subject)
+        if found and found.start() == 0:
             return name
     return subject[:1].upper() + subject[1:]
 
@@ -2984,7 +3037,12 @@ def _parse_regulation(text: str) -> ParsedRegulation:
             letter_shift += 1
             sequenced.append((last_assigned, body))
         else:
-            last_assigned = num + letter_shift
+            candidate = num + letter_shift
+            if candidate <= last_assigned:
+                # «3.» дважды или номер меньше прошлого: шаг не затирает соседа, а встаёт следующим.
+                letter_shift += last_assigned + 1 - candidate
+                candidate = last_assigned + 1
+            last_assigned = candidate
             sequenced.append((last_assigned, body))
     raw_steps = sequenced
     for idx, (num, body) in enumerate(raw_steps):
