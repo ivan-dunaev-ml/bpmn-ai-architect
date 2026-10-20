@@ -1401,16 +1401,36 @@ class BPMNDiagramBuilder:
             if len(path) < 2:
                 continue
             segs = list(zip(path, path[1:]))
-            hits = sum(1 for a, b in segs for r in rects if _hits_rect(a, b, r))
-            overlap = sum(_overlap_len(s, p) > 6.0 for s in segs for p in placed)
             length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in segs)
-            cost = (len(path) - 2) * 15.0 + length * 0.02 + overlap * 40.0 + hits * 1000.0
+            # Дешёвая часть стоимости — сначала; задевания (+1000) и наложения (+40) только добавляют,
+            # поэтому кандидата бросаем, как только частичная стоимость не лучше найденной. Выбор маршрута тот же.
+            cost = (len(path) - 2) * 15.0 + length * 0.02
             if is_back:
                 # Компактный loop-back: длинная красная дуга через весь пул дороже короткой U-петли.
                 cost += length * 0.06
                 bottom = max(p[1] for p in path)
                 local_floor = max(src.y + src.height, tgt.y + tgt.height)
                 cost += max(0.0, bottom - local_floor - REWORK_PAD) * 0.45
+            if cost >= best_cost:
+                continue
+            xs = [p[0] for p in path]
+            ys = [p[1] for p in path]
+            lo_x, hi_x, lo_y, hi_y = min(xs), max(xs), min(ys), max(ys)
+            near = [r for r in rects if r[0] <= hi_x and r[2] >= lo_x and r[1] <= hi_y and r[3] >= lo_y]
+            for a, b in segs:
+                for r in near:
+                    if _hits_rect(a, b, r):
+                        cost += 1000.0
+                if cost >= best_cost:
+                    break
+            if cost >= best_cost:
+                continue
+            for seg in segs:
+                for p in placed:
+                    if _overlap_len(seg, p) > 6.0:
+                        cost += 40.0
+                if cost >= best_cost:
+                    break
             if cost < best_cost:
                 best, best_cost = path, cost
         if best is None:

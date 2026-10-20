@@ -1839,8 +1839,13 @@ def render_task_inspector(xml: str, audit: Dict[str, Any], text: str) -> None:
         st.info("В схеме нет именованных задач.")
         return
     labels = [f"{n['name']}  ·  {n.get('lane') or '—'}" for n in tasks]
-    choice = st.selectbox("Задача текущей схемы", labels, key="inspector_choice")
+    # Без выбора по умолчанию: иначе сразу после генерации инспектор спрашивал модель о первой задаче,
+    # а Streamlit рисует все вкладки — страница ждала этот запрос, даже если инспектор никто не открывал.
+    choice = st.selectbox(
+        "Задача текущей схемы", labels, key="inspector_choice", index=None, placeholder="Выберите задачу на схеме…"
+    )
     if not choice:
+        st.caption("Выберите задачу — соберём операционную карточку: допуск, СИЗ, порядок действий, вход и выход.")
         return
     node = tasks[labels.index(choice)]
     ctx = build_process_context(text, xml, audit)
