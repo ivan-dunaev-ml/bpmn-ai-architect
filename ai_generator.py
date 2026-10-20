@@ -623,6 +623,35 @@ def _enrich_sla_from_regulation(diagram: BPMNDiagramBuilder, regulation_text: st
     return applied
 
 
+def _pin_sla_to_regulation(diagram: BPMNDiagramBuilder, regulation_text: str) -> List[str]:
+    """Срок шага — из регламента, а не от модели: модель иногда пишет свой (5 мин → 0.08, 20 мин → 0.5).
+
+    Правим только однозначное совпадение: одна задача сильно похожа на шаг (≥ 60% основ названия),
+    второй такой же нет — иначе модель могла разбить шаг на два, и срок делить нечестно.
+    """
+    try:
+        parsed = parse_regulation(normalize_regulation(regulation_text or ""))
+    except Exception:  # noqa: BLE001
+        return []
+    work = [n for n in diagram.nodes.values() if n.kind in WORK_KINDS]
+    fixed: List[str] = []
+    for step in parsed.steps:
+        if not step.hours or not step.title:
+            continue
+        need = max(2, int(0.6 * len(_sla_stems(step.title)) + 0.999))
+        scored = sorted(((_sla_title_score(step.title, n.name or ""), n) for n in work), key=lambda x: -x[0])
+        if not scored or scored[0][0] < need or (len(scored) > 1 and scored[1][0] == scored[0][0]):
+            continue
+        node = scored[0][1]
+        if node.sla_hours is not None and abs(float(node.sla_hours) - float(step.hours)) > 1.0 / 60.0:
+            fixed.append(
+                f"Срок «{(node.name or '')[:50]}» приведён к регламенту: {_fh(float(node.sla_hours))} → {_fh(float(step.hours))}"
+            )
+            node.sla_hours = float(step.hours)
+            node.sla_source = "regulation"
+    return fixed
+
+
 def _run_diagram_exec(code: Any, namespace: Dict[str, Any]) -> None:
     """Исполняет код DIAGRAM. На любом потоке обрывает зависший цикл по времени и числу событий.
 
@@ -719,6 +748,8 @@ def execute_generated_code(
                     node.sla_source = "units_guess"
         if blueprint is None:
             sla_enriched = _enrich_sla_from_regulation(diagram, regulation_text)
+            if hours_source == "regulation":
+                diagram.healed.extend(_pin_sla_to_regulation(diagram, regulation_text))
             diagram.healed.extend(_insert_missing_gateways(diagram))
             diagram.heal_graph()
             _complete_return_edges(diagram, regulation_text)
@@ -906,7 +937,8 @@ def _call_openai(prompt: str, prefix: str = "OPENAI") -> Tuple[str, str]:
                 messages,
                 _http_json,
                 temperature=0.1,
-                timeout=float(os.getenv("OPENAI_TIMEOUT", "90")),
+                # Один зависший запрос не держит страницу: дальше — запасная модель или эмулятор.
+                timeout=float(os.getenv(f"{prefix.upper()}_TIMEOUT", os.getenv("OPENAI_TIMEOUT", "45"))),
             )
             break
         except Exception as exc:  # noqa: BLE001
@@ -7931,7 +7963,13 @@ def _collect_tobe_actions(old_text: str, new_text: str) -> List[Dict[str, str]]:
 
 
 def _try_llm_optimize_to_be(regulation_text: str, audit_data: dict) -> Optional[str]:
-    """Облачная перепись To-Be, если задан ключ модели. Нет ключа или пустой ответ — эмулятор."""
+    """Облачная перепись To-Be — только при BPMN_TOBE_LLM=1. По умолчанию To-Be строит локальный оптимизатор.
+
+    Замер 20.10 (пример 1): облачный вариант — два запроса к модели (перепись + сборка), ~12 с из 15 с To-Be,
+    при этом его вариант чаще проигрывал локальному или был нечестным (паспорт: «48 → 4 ч» с потерей роли).
+    """
+    if os.getenv("BPMN_TOBE_LLM", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
     if os.getenv("BPMN_AI_MODE", "auto").lower() == "emulator":
         return None
     if not _cloud_prefixes():

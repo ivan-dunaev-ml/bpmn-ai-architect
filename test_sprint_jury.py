@@ -259,3 +259,26 @@ def test_task_types_follow_the_work():
     assert "<bpmn:scriptTask" in xml  # фиксация в журнале системы
     assert "Принять сообщение об аварийном отключении оборудования ПС 110 кВ" not in manual
     assert "add_manual_task" in gen.build_prompt(EX1)
+
+
+def test_speed_cloud_tobe_is_opt_in_and_inspector_is_lazy(monkeypatch):
+    """Скорость: облачный To-Be (два запроса к модели, ~12 с) — только по BPMN_TOBE_LLM=1; инспектор не зовёт модель сам."""
+    monkeypatch.delenv("BPMN_AI_MODE", raising=False)
+    monkeypatch.delenv("BPMN_TOBE_LLM", raising=False)
+    monkeypatch.setattr(gen, "_chat_llm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("облако не нужно")))
+    audit = {"generation": {"engine": "openai:openai/gpt-oss-120b"}}
+    assert gen._try_llm_optimize_to_be(EX1, audit) is None
+    app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'key="inspector_choice", index=None' in app_src
+
+
+def test_model_sla_is_pinned_to_regulation():
+    from process_blueprint import analyze_process, compile_blueprint
+
+    code, _ = compile_blueprint(analyze_process(EX1))
+    drifted = code.replace("DIAGRAM.set_sla(n0, 0.083)", "DIAGRAM.set_sla(n0, 0.5)")
+    assert drifted != code
+    _xml, audit, err = gen.execute_generated_code(drifted, "x", regulation_text=EX1)
+    assert not err
+    assert audit["sla"]["critical_path_hours"] == 9.7  # 30 мин модели → 5 мин регламента
+    assert any("приведён к регламенту" in line for line in audit["auto_healed"])
