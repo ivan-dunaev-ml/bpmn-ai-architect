@@ -36,6 +36,8 @@ import builtins
 from collections import defaultdict
 import inspect
 import io
+import functools
+import copy
 import json
 import logging
 import os
@@ -700,10 +702,12 @@ def execute_generated_code(
     regulation_text: str = "",
     hours_source: str = "regulation",
     blueprint: Any = None,
+    metrics_only: bool = False,
 ) -> Tuple[str, Dict[str, Any], str]:
     """Безопасно исполняет код для DIAGRAM и возвращает (bpmn_xml, audit_data, error).
 
     Любые исключения перехватываются: при ошибке возвращается ("", {}, "описание").
+    metrics_only — аудит без раскладки и XML (xml == ""): для сравнения вариантов To-Be.
     """
     try:
         code = _code_for_sandbox(_strip_markdown(code_str or ""))
@@ -789,7 +793,12 @@ def execute_generated_code(
         except Exception:  # noqa: BLE001 — подсветка КП не должна ломать выдачу
             diagram.critical_path_ids = set()
             diagram.highlight_improved = False
-        xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
+        if metrics_only:
+            # Вариант To-Be на сравнение: граф и аудит те же, раскладка, стрелки, XML и XSD — только у победителя.
+            diagram.prepare_for_export(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
+            xml = ""
+        else:
+            xml = diagram.to_bpmn_xml(ROOT_PROCESS_ID, ROOT_START_TASK_ID, ROOT_END_TASK_ID)
         audit = diagram.analyze_bottlenecks()
         audit["quality"] = _quality_report(structure_issues, audit, diagram)
         _enrich_methodology_quotes(audit, regulation_text)
@@ -817,6 +826,11 @@ def execute_generated_code(
                 parsed_src = None
             if parsed_src is not None and getattr(parsed_src, "month_durations_ignored", False):
                 audit["sla_month_ignored"] = True
+        if metrics_only:
+            audit["metrics_only"] = True
+            audit.setdefault("artifacts", [])
+            audit.setdefault("it_systems", [])
+            return "", audit, ""
         errors = xsd_errors_xml(xml)  # официальная XSD BPMN 2.0: невалидный файл не отдаём
         if errors:
             return "", {}, "XML не прошёл проверку по XSD BPMN 2.0: " + "; ".join(errors[:3])
@@ -1653,6 +1667,16 @@ def read_docx_regulation(data: bytes) -> Tuple[Optional[str], Optional[str]]:
 
 
 def normalize_regulation(text: str) -> str:
+    """Кэшируется: To-Be и аудит нормализуют один и тот же текст десятки раз (см. _normalize_regulation)."""
+    return _normalize_cached(text or "")
+
+
+@functools.lru_cache(maxsize=512)
+def _normalize_cached(text: str) -> str:
+    return _normalize_regulation(text)
+
+
+def _normalize_regulation(text: str) -> str:
     """Чистит текст, скопированный из PDF/Word, до вида «шаг на строке».
 
     - убирает колонтитулы («Стр. 5 из 17») и строки из одних номеров страниц;
@@ -2824,6 +2848,45 @@ _PASSPORT_FIELD_LINE_RE = re.compile(
 
 
 def parse_regulation(text: str) -> ParsedRegulation:
+    """Разбор регламента с кэшем по тексту. Замер To-Be (40 шагов): 630 разборов одного текста — 9 из 16 с.
+
+    Отдаём копию: вызывающий код правит шаги (_resolve_implicit_returns и т. п.) — кэш должен остаться чистым.
+    """
+    key = text or ""
+    cached = _PARSE_CACHE.get(key)
+    if cached is None:
+        cached = _parse_regulation(key)
+        if len(_PARSE_CACHE) >= 512:
+            _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+        _PARSE_CACHE[key] = cached
+    return _clone_parsed(cached)
+
+
+def _clone_parsed(parsed: "ParsedRegulation") -> "ParsedRegulation":
+    """Независимая копия разбора — в разы быстрее deepcopy (на странице deepcopy занимал 40% времени).
+
+    Поля шагов — строки, числа, Decision и списки строк; списки и Decision копируются, кэш не делит изменяемого.
+    """
+    clone = copy.copy(parsed)
+    steps = []
+    for step in parsed.steps:
+        twin = copy.copy(step)
+        if step.decision is not None:
+            twin.decision = copy.copy(step.decision)
+        for name in ("artifacts", "systems", "participants", "inputs", "outputs"):
+            setattr(twin, name, list(getattr(step, name)))
+        steps.append(twin)
+    clone.steps = steps
+    clone.roles = list(parsed.roles)
+    clone.artifacts = [dict(item) if isinstance(item, dict) else item for item in parsed.artifacts]
+    clone.it_systems = [dict(item) if isinstance(item, dict) else item for item in parsed.it_systems]
+    return clone
+
+
+_PARSE_CACHE: Dict[str, "ParsedRegulation"] = {}
+
+
+def _parse_regulation(text: str) -> ParsedRegulation:
     text = _promote_lettered_parallels(text or "")
     text = _segment_unnumbered_prose(text)
     title: Optional[str] = None
@@ -5757,7 +5820,7 @@ def _llm_edit(message: str, text: str, trace: List[str]) -> Optional[Tuple[str, 
 
 
 def _rebuild_process(
-    text: str, engine: str, trace: List[str], use_llm: bool = False
+    text: str, engine: str, trace: List[str], use_llm: bool = False, metrics_only: bool = False
 ) -> Tuple[str, Dict[str, Any], str]:
     """Перестроение диаграммы по обновлённому регламенту.
 
@@ -5782,7 +5845,9 @@ def _rebuild_process(
     except Exception:  # noqa: BLE001
         header = ParsedRegulation(title="Бизнес-процесс по регламенту", sla_hours=None)
     code, info = emulate_generation(norm)
-    xml, audit, err = execute_generated_code(code, header.title, header.sla_hours, regulation_text=norm)
+    xml, audit, err = execute_generated_code(
+        code, header.title, header.sla_hours, regulation_text=norm, metrics_only=metrics_only
+    )
     if err:
         return "", {}, err
     audit["artifacts"], audit["it_systems"] = header.artifacts, header.it_systems
@@ -8289,7 +8354,7 @@ def _measure_isolated_moves(
         cand_text, actions = _heuristic_optimize_to_be(text, skip_auto=skip, **merged_flags, **merged_only)
         if not actions:
             return base_cp, base_rw
-        _, audit_i, err_i = _rebuild_process(cand_text, "move", [], use_llm=False)
+        _, audit_i, err_i = _rebuild_process(cand_text, "move", [], use_llm=False, metrics_only=True)
         if err_i or not audit_i:
             return base_cp, base_rw
         sla_i = audit_i.get("sla") or {}
@@ -9045,7 +9110,11 @@ def optimize_process_to_be(
         seen.add(key)
         built += 1
         try:
-            xml, new_audit, err = _rebuild_process(cand_text, f"to-be · {cand_engine}", [], use_llm=(cand_engine == "llm"))
+            # Кандидат сравнивается по цифрам; раскладку и XML строим только победителю (ниже).
+            xml, new_audit, err = _rebuild_process(
+                cand_text, f"to-be · {cand_engine}", [], use_llm=(cand_engine == "llm"),
+                metrics_only=(cand_engine != "llm"),
+            )
         except Exception as exc:  # noqa: BLE001
             xml, new_audit, err = "", {}, f"{type(exc).__name__}: {exc}"
         if err or not new_audit:
@@ -9177,6 +9246,11 @@ def optimize_process_to_be(
         return _finish(delta, optimized)
 
     _score, optimized, actions, xml, new_audit, engine, move_spec = best
+    if not xml:
+        # Победитель сравнивался без раскладки — теперь полная сборка: та же, что раньше шла для каждого кандидата.
+        xml, new_audit, full_err = _rebuild_process(optimized, f"to-be · {engine}", [], use_llm=False)
+        if full_err or not new_audit:
+            xml, new_audit = "", {}
     actions = _limit_escalation_actions(actions, base_audit, new_audit)
     if not actions:
         actions = [{"kind": "stable", "detail": "Существенных узких мест для автоматического реинжиниринга не найдено."}]
