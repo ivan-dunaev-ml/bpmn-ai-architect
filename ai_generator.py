@@ -213,8 +213,10 @@ def build_prompt(
     сначала уходит черновик, затем чертёж. Регламент и правила остаются всегда.
     """
     from llm_providers import estimate_tokens
+    from passport_regulation import strip_prompt_injection
 
-    text = (regulation_text or "").strip()
+    # Обращения к ИИ внутри регламента («игнорируй инструкции…») модели не передаём — это не шаги.
+    text = strip_prompt_injection(regulation_text or "").strip()
     block, draft_code = _blueprint_parts(text)
     variants = []
     if draft and draft_code:
@@ -1717,10 +1719,11 @@ def _normalize_regulation(text: str) -> str:
     """
     text = text.replace("\r\n", "\n").replace("­", "")
     from passport_regulation import (
-        passport_to_canonical, soften_caps, split_inline_numbering, strip_word_markup, tables_to_steps,
+        passport_to_canonical, soften_caps, split_inline_numbering, strip_prompt_injection, strip_word_markup,
+        tables_to_steps,
     )
 
-    text = strip_word_markup(text)
+    text = strip_prompt_injection(strip_word_markup(text))
     # Форматы «как скопировали»: таблица из Word, всё одной строкой, весь текст капсом.
     text = soften_caps(split_inline_numbering(tables_to_steps(text)))
     # «службы «Энергосбыт-Сервис», ООО проверяет» — форма собственности часть названия, а не новый шаг с ролью «ООО».

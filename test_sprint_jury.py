@@ -328,3 +328,14 @@ def test_docx_steps_table_becomes_steps(tmp_path):
     assert "1. Сотрудник: Подать заявку на пропуск (15 минут)." in text
     parsed = gen.parse_regulation(gen.normalize_regulation(text))
     assert [s.role for s in parsed.steps] == ["Сотрудник", "Служба безопасности"]
+
+
+def test_prompt_injection_is_not_a_step_and_not_sent_to_model():
+    text = (ROOT / "stress_tests" / "35_prompt_injection.txt").read_text(encoding="utf-8")
+    xml, audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not err
+    names = re.findall(r'<bpmn:\w*[tT]ask id="[^"]+" name="([^"]+)"', xml)
+    assert names == ["Снять показания счётчика", "Внести показания в биллинг", "Проверить отчёт"]
+    prompt = gen.build_prompt(text)
+    assert "import os" not in prompt and "Игнорируй" not in prompt
+    assert "Контролёр вносит показания в биллинг" in prompt  # остальной текст шага на месте
