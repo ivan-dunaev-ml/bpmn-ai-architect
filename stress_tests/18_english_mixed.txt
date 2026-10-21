@@ -1,0 +1,5 @@
+Process: Incident handling
+1. Service Desk registers incident in Jira (15 min).
+2. Инженер второй линии анализирует логи (2 часа).
+3. If root cause found — go to step 4, else escalate to vendor and finish.
+4. DevOps engineer deploys hotfix (1 hour).

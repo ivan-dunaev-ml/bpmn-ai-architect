@@ -282,3 +282,60 @@ def test_model_sla_is_pinned_to_regulation():
     assert not err
     assert audit["sla"]["critical_path_hours"] == 9.7  # 30 мин модели → 5 мин регламента
     assert any("приведён к регламенту" in line for line in audit["auto_healed"])
+
+
+@pytest.mark.parametrize("name,roles,tasks", [
+    ("13_word_table_pipes", ["Инициатор", "Закупочная служба", "Тендерный комитет", "Юридическая служба"], 5),
+    ("14_tab_table", ["Сотрудник", "Служба безопасности", "Бюро пропусков"], 4),
+    ("19_all_caps", ["Кладовщик", "Бухгалтерия"], 3),
+    ("31_one_line", ["Сотрудник", "Руководитель", "Отдел кадров", "Бухгалтерия"], 4),
+    ("30_roles_with_punctuation", ["Ведущий инженер", "Руководитель", "Заместитель генерального директора по развитию"], 3),
+    ("22_skipped_numbers", ["Заявитель", "Диспетчер", "Мастер", "Ремонтная бригада"], 4),
+    ("21_single_step", ["Служба охраны труда"], 1),
+])
+def test_wild_formats_parse_like_a_human(name, roles, tasks):
+    """Как жюри вставит текст: таблица Word, капс, одной строкой, роли с уточнениями, дубль номера, один шаг."""
+    text = (ROOT / "stress_tests" / f"{name}.txt").read_text(encoding="utf-8")
+    xml, audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not err, err
+    assert [item["role"] for item in audit["lane_load"]] == roles or sorted(r["role"] for r in audit["lane_load"]) == sorted(roles)
+    assert audit["stats"]["work_items"] == tasks
+    assert xsd_errors_xml(xml) == [] and _validate_xml(xml) == []
+    assert int(audit["methodology"]["score"]) == 100
+
+
+@pytest.mark.parametrize("name", ["06_garbage", "34_title_only"])
+def test_garbage_gets_clear_error_not_a_fake_diagram(name):
+    text = (ROOT / "stress_tests" / f"{name}.txt").read_text(encoding="utf-8")
+    xml, _audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not xml and "Не удалось распознать" in err
+
+
+def test_docx_steps_table_becomes_steps(tmp_path):
+    docx = pytest.importorskip("docx")
+    doc = docx.Document()
+    doc.add_paragraph("Регламент: Выдача пропуска")
+    table = doc.add_table(rows=3, cols=4)
+    for c, h in enumerate(["№", "Действие", "Исполнитель", "Срок"]):
+        table.cell(0, c).text = h
+    for r, row in enumerate([["1", "Подать заявку на пропуск", "Сотрудник", "15 минут"], ["2", "Проверить данные сотрудника", "Служба безопасности", "2 часа"]], start=1):
+        for c, v in enumerate(row):
+            table.cell(r, c).text = v
+    path = tmp_path / "t.docx"
+    doc.save(path)
+    text, err = gen.read_docx_regulation(path.read_bytes())
+    assert not err and "|" not in text
+    assert "1. Сотрудник: Подать заявку на пропуск (15 минут)." in text
+    parsed = gen.parse_regulation(gen.normalize_regulation(text))
+    assert [s.role for s in parsed.steps] == ["Сотрудник", "Служба безопасности"]
+
+
+def test_prompt_injection_is_not_a_step_and_not_sent_to_model():
+    text = (ROOT / "stress_tests" / "35_prompt_injection.txt").read_text(encoding="utf-8")
+    xml, audit, err = gen.generate_bpmn_from_text(text, use_llm=False)
+    assert not err
+    names = re.findall(r'<bpmn:\w*[tT]ask id="[^"]+" name="([^"]+)"', xml)
+    assert names == ["Снять показания счётчика", "Внести показания в биллинг", "Проверить отчёт"]
+    prompt = gen.build_prompt(text)
+    assert "import os" not in prompt and "Игнорируй" not in prompt
+    assert "Контролёр вносит показания в биллинг" in prompt  # остальной текст шага на месте
