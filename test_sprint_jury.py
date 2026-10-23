@@ -339,3 +339,19 @@ def test_prompt_injection_is_not_a_step_and_not_sent_to_model():
     prompt = gen.build_prompt(text)
     assert "import os" not in prompt and "Игнорируй" not in prompt
     assert "Контролёр вносит показания в биллинг" in prompt  # остальной текст шага на месте
+
+
+def test_ui_defaults_to_yandex_and_custom_text_is_kept():
+    """Жюри: первый запрос — в Yandex AI Studio; свой текст в поле переключает селектор и не откатывается."""
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120).run()
+    assert [r.value for r in at.radio if r.label == "Движок генерации"] == ["Yandex AI Studio"]
+    mine = "Регламент: Мой процесс\n1. Кассир принимает оплату (5 минут).\n2. Бухгалтер проводит платёж в 1С (10 минут).\n"
+    at.text_area(key="reg_text").set_value(mine).run()
+    assert at.session_state["example_choice"].endswith("Свой текст регламента")
+    assert at.session_state["reg_text"] == mine
+    [b for b in at.button if "Сгенерировать" in b.label][0].click().run()
+    assert not at.exception
+    assert "Кассир" in str(at.session_state["result"]["xml"])
+    assert at.session_state["reg_text"] == mine

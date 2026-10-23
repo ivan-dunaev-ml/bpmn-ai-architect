@@ -2547,6 +2547,24 @@ def on_example_change() -> None:
     _clear_demo_mode()
 
 
+def _on_text_edit() -> None:
+    """Текст правят руками или вставляют свой — селектор встаёт на «Свой текст», введённое не откатывается."""
+    examples = load_examples()
+    choice = st.session_state.get("example_choice")
+    text = str(st.session_state.get("reg_text") or "")
+    if choice in examples and text.strip() == str(examples[choice]["text"]).strip():
+        return  # текст совпадает с выбранным примером — ничего не меняем
+    if choice == CUSTOM_LABEL:
+        return
+    st.session_state["example_choice"] = CUSTOM_LABEL
+    st.session_state["applied_example"] = CUSTOM_LABEL
+    st.session_state["_keep_custom_text"] = True
+    st.session_state["file_stem"] = "custom_process"
+    st.session_state.pop("result", None)  # схема старого примера к новому тексту не относится
+    st.session_state.pop("tobe_pack", None)
+    st.session_state.pop("gen_fingerprint", None)
+
+
 def _align_choice_text() -> None:
     """Новый пример в сессии подставляет свой текст до отрисовки старой схемы."""
     if st.session_state.get("example_choice") == st.session_state.get("applied_example"):
@@ -3297,6 +3315,7 @@ def render_input_panel(labels: List[str], compact: bool = False, rail: bool = Fa
             "Текст регламента",
             key="reg_text",
             height=text_h,
+            on_change=_on_text_edit,
         )
 
     def _gen_controls() -> None:
@@ -3638,9 +3657,8 @@ def render_assistant() -> None:
 def _apply_engine_choice() -> None:
     """Выбор движка → режим llm_providers на эту сессию и флаг use_llm для генерации, To-Be и ассистента."""
     if "engine_choice" not in st.session_state:
-        # Ключи AI Studio заданы — по умолчанию стек партнёра (правило финала), иначе открытые модели Groq.
-        default = ENGINE_YANDEX if llm_providers.yandex_configured() else ENGINE_CLOUD
-        st.session_state["engine_choice"] = default if USE_LLM_ON_OPEN else ENGINE_OFFLINE
+        # По умолчанию — стек партнёра (как в презентации и видео): первый запрос жюри уходит в Yandex AI Studio.
+        st.session_state["engine_choice"] = ENGINE_YANDEX if USE_LLM_ON_OPEN else ENGINE_OFFLINE
     mode, use_llm = ENGINE_CHOICES.get(st.session_state["engine_choice"], ("cloud", True))
     llm_providers.set_session_mode(mode)
     st.session_state["use_llm"] = use_llm
